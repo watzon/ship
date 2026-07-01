@@ -3,6 +3,12 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -68,7 +74,11 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+          fi
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building ship $VERSION for ${{ matrix.goos }}/${{ matrix.goarch }}"
@@ -178,6 +188,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           files: |
             dist/ship_*.tar.gz
             dist/checksums.txt
@@ -189,7 +200,7 @@ jobs:
           {
             echo "## Release artifacts"
             echo ""
-            echo "Attached to **${{ github.event.release.tag_name }}**:"
+            echo "Attached to **${{ github.event.release.tag_name || github.event.inputs.tag }}**:"
             echo ""
             ls -1 dist/ship_*.tar.gz | sed 's/^/- /'
           } >> "$GITHUB_STEP_SUMMARY"
