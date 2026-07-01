@@ -25,8 +25,11 @@ import (
 	"github.com/watzon/ship/internal/state"
 )
 
+// AgentVersion is the ship CLI and agent release version. Release builds override
+// this via -ldflags "-X github.com/watzon/ship/internal/agent.AgentVersion=...".
+var AgentVersion = "0.4.0"
+
 const (
-	AgentVersion         = "0.4.0"
 	AgentMinProtocol     = 1
 	AgentProtocol        = 2
 	defaultCaddyfilePath = "/etc/caddy/Caddyfile"

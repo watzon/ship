@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  GO_MODULE: github.com/watzon/ship
+  BINARY: ship
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            sign: false
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            sign: false
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+            sign: true
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            sign: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building ship $VERSION for ${{ matrix.goos }}/${{ matrix.goarch }}"
+
+      - name: Import signing certificate
+        if: matrix.sign && secrets.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kc_pw="$(openssl rand -base64 24)"
+          echo "::add-mask::$kc_pw"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          certpath="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certpath"
+          security create-keychain -p "$kc_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pw" "$keychain"
+          security import "$certpath" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$keychain"
+          existing="$(security list-keychains -d user | sed -e 's/[\" ]//g')"
+          security list-keychains -d user -s "$keychain" $existing
+          rm -f "$certpath"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X ${GO_MODULE}/internal/agent.AgentVersion=${VERSION}" \
+            -o "dist/${BINARY}" \
+            ./cmd/ship
+          chmod +x "dist/${BINARY}"
+          "dist/${BINARY}" version
+
+      - name: Sign and notarize macOS binary
+        if: matrix.sign && secrets.APPLE_SIGNING_IDENTITY != ''
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          chmod +x ./scripts/sign-macos-binary.sh
+          ./scripts/sign-macos-binary.sh "dist/${BINARY}"
+
+      - name: Package archive
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE="dist/${BINARY}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
+          tar -C dist -czf "$ARCHIVE" "${BINARY}"
+          sha256sum "$ARCHIVE" | tee "dist/${BINARY}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ship-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: ship-*
+          merge-multiple: true
+
+      - name: Create checksum manifest
+        run: |
+          cd dist
+          ls -1 ship_*.tar.gz > checksums.txt
+          sha256sum ship_*.tar.gz | tee -a checksums.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ship_*.tar.gz
+            dist/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release artifacts"
+            echo ""
+            echo "Attached to **${{ github.event.release.tag_name }}**:"
+            echo ""
+            ls -1 dist/ship_*.tar.gz | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
