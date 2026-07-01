@@ -1,0 +1,4 @@
+.ship/
+/ship
+dist/
+coverage.out

@@ -1,0 +1,1066 @@
+package agent
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/docker"
+	"github.com/watzon/ship/internal/state"
+)
+
+const (
+	AgentVersion         = "0.4.0"
+	AgentMinProtocol     = 1
+	AgentProtocol        = 2
+	defaultCaddyfilePath = "/etc/caddy/Caddyfile"
+)
+
+const (
+	ErrorInvalidJSON          = "invalid_json"
+	ErrorInvalidParams        = "invalid_params"
+	ErrorUnknownMethod        = "unknown_method"
+	ErrorInternal             = "internal_error"
+	ErrorDocker               = "docker_error"
+	ErrorCommandFailed        = "command_failed"
+	ErrorFileOperation        = "file_operation_failed"
+	ErrorHealthCheckFailed    = "health_check_failed"
+	ErrorLock                 = "lock_failed"
+	ErrorReleaseState         = "release_state_error"
+	ErrorIncompatibleProtocol = "incompatible_protocol"
+)
+
+type Request struct {
+	ID              string          `json:"id,omitempty"`
+	Method          string          `json:"method"`
+	Params          json.RawMessage `json:"params,omitempty"`
+	ProtocolVersion int             `json:"protocol_version,omitempty"`
+}
+
+type Response struct {
+	ID        string          `json:"id,omitempty"`
+	OK        bool            `json:"ok"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	ErrorCode string          `json:"error_code,omitempty"`
+}
+
+type Status struct {
+	Hostname         string   `json:"hostname"`
+	StateDir         string   `json:"state_dir"`
+	DockerOK         bool     `json:"docker_ok"`
+	AgentVersion     string   `json:"agent_version"`
+	ProtocolVersion  int      `json:"protocol_version"`
+	SupportedMethods []string `json:"supported_methods,omitempty"`
+}
+
+type NegotiateParams struct {
+	ClientVersion      string `json:"client_version,omitempty"`
+	MinProtocolVersion int    `json:"min_protocol_version,omitempty"`
+	MaxProtocolVersion int    `json:"max_protocol_version,omitempty"`
+}
+
+type NegotiateResult struct {
+	AgentVersion     string   `json:"agent_version"`
+	ProtocolVersion  int      `json:"protocol_version"`
+	SupportedMethods []string `json:"supported_methods"`
+}
+
+type RunContainerParams struct {
+	Name    string            `json:"name"`
+	Image   string            `json:"image"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args"`
+	Labels  map[string]string `json:"labels,omitempty"`
+}
+
+type LogsParams struct {
+	Name  string `json:"name"`
+	Lines int    `json:"lines"`
+}
+
+type DockerInspectParams struct {
+	Name string `json:"name"`
+}
+
+type DockerInspectResult struct {
+	Inspect json.RawMessage `json:"inspect"`
+}
+
+type HealthCheckParams struct {
+	Command        string `json:"command,omitempty"`
+	URL            string `json:"url,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
+type HealthCheckResult struct {
+	OK         bool   `json:"ok"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Output     string `json:"output,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+type WriteFileParams struct {
+	Path     string `json:"path"`
+	Content  string `json:"content"`
+	Encoding string `json:"encoding,omitempty"`
+	Mode     uint32 `json:"mode,omitempty"`
+}
+
+type WriteFileResult struct {
+	Path  string `json:"path"`
+	Bytes int    `json:"bytes"`
+}
+
+type ReadReleaseStateParams struct {
+	Environment string `json:"environment,omitempty"`
+	ID          string `json:"id,omitempty"`
+}
+
+type WriteReleaseStateParams struct {
+	Release state.Release `json:"release"`
+}
+
+type CaddyReloadParams struct {
+	Path     string `json:"path,omitempty"`
+	Config   string `json:"config,omitempty"`
+	Validate bool   `json:"validate,omitempty"`
+	Clear    bool   `json:"clear,omitempty"`
+}
+
+type CommandResult struct {
+	Output string `json:"output,omitempty"`
+}
+
+type AccessoryCommandParams struct {
+	Name           string `json:"name"`
+	Command        string `json:"command"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
+type EnsureVolumeParams struct {
+	Name  string `json:"name"`
+	Owner string `json:"owner,omitempty"`
+}
+
+type InstallBinaryParams struct {
+	Path          string `json:"path,omitempty"`
+	ContentBase64 string `json:"content_base64"`
+	SHA256        string `json:"sha256,omitempty"`
+	Mode          uint32 `json:"mode,omitempty"`
+}
+
+type InstallBinaryResult struct {
+	Path      string `json:"path"`
+	Installed bool   `json:"installed"`
+	SHA256    string `json:"sha256"`
+}
+
+type MigrateStateDirParams struct {
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+}
+
+type MigrateStateDirResult struct {
+	From     string `json:"from,omitempty"`
+	To       string `json:"to"`
+	Migrated bool   `json:"migrated"`
+}
+
+type DockerOps interface {
+	Available(ctx context.Context) error
+	Pull(ctx context.Context, image string) error
+	PruneShipImages(ctx context.Context) error
+	Run(ctx context.Context, name, image, command string, args ...string) error
+	StopRemove(ctx context.Context, name string) error
+	Logs(ctx context.Context, name string, lines int) (string, error)
+	Inspect(ctx context.Context, name string) (json.RawMessage, error)
+	ListShipContainers(ctx context.Context) ([]docker.ContainerSummary, error)
+}
+
+type CommandRunner func(ctx context.Context, name string, args ...string) (string, error)
+
+type Server struct {
+	Docker        DockerOps
+	CommandRunner CommandRunner
+	HTTPClient    *http.Client
+	StateDir      string
+	Hostname      func() (string, error)
+}
+
+type rpcError struct {
+	code    string
+	message string
+	err     error
+}
+
+func (e rpcError) Error() string {
+	if e.message != "" {
+		return e.message
+	}
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return e.code
+}
+
+func (e rpcError) Unwrap() error {
+	return e.err
+}
+
+func Serve(ctx context.Context, in io.Reader, out io.Writer) error {
+	server := NewServer()
+	reader := bufio.NewReader(in)
+	encoder := json.NewEncoder(out)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			if err := serveLine(ctx, server, encoder, line); err != nil {
+				return err
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func serveLine(ctx context.Context, server Server, encoder *json.Encoder, line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	var req Request
+	var resp Response
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		resp = failure("", ErrorInvalidJSON, fmt.Errorf("invalid JSON request: %w", err))
+	} else {
+		resp = server.Handle(ctx, req)
+	}
+	return encoder.Encode(resp)
+}
+
+func NewServer() Server {
+	return Server{
+		Docker:        docker.Client{},
+		CommandRunner: defaultCommandRunner,
+		HTTPClient:    http.DefaultClient,
+		StateDir:      config.RemoteStateDir,
+		Hostname:      os.Hostname,
+	}
+}
+
+func (s Server) Handle(ctx context.Context, req Request) Response {
+	switch req.Method {
+	case "negotiate":
+		return s.negotiate(req)
+	case "status":
+		return s.status(ctx, req)
+	case "pull":
+		return s.withHostLock(req, "pull", func() Response {
+			var p struct {
+				Image string `json:"image"`
+			}
+			if err := decode(req.Params, &p); err != nil {
+				return failure(req.ID, ErrorInvalidParams, err)
+			}
+			if strings.TrimSpace(p.Image) == "" {
+				return failure(req.ID, ErrorInvalidParams, errors.New("image is required"))
+			}
+			return empty(req.ID, ErrorDocker, s.docker().Pull(ctx, p.Image))
+		})
+	case "prune_images":
+		return s.withHostLock(req, "prune_images", func() Response {
+			return empty(req.ID, ErrorDocker, s.docker().PruneShipImages(ctx))
+		})
+	case "run_container":
+		return s.withHostLock(req, "run_container", func() Response {
+			var p RunContainerParams
+			if err := decode(req.Params, &p); err != nil {
+				return failure(req.ID, ErrorInvalidParams, err)
+			}
+			if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Image) == "" {
+				return failure(req.ID, ErrorInvalidParams, errors.New("name and image are required"))
+			}
+			if _, err := s.docker().Inspect(ctx, p.Name); err == nil {
+				if err := s.docker().StopRemove(ctx, p.Name); err != nil {
+					return failure(req.ID, ErrorDocker, fmt.Errorf("replace container %q: %w", p.Name, err))
+				}
+			}
+			args := append(labelArgs(p.Labels), p.Args...)
+			return empty(req.ID, ErrorDocker, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...))
+		})
+	case "stop_container":
+		return s.withHostLock(req, "stop_container", func() Response {
+			var p struct {
+				Name string `json:"name"`
+			}
+			if err := decode(req.Params, &p); err != nil {
+				return failure(req.ID, ErrorInvalidParams, err)
+			}
+			if strings.TrimSpace(p.Name) == "" {
+				return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
+			}
+			return empty(req.ID, ErrorDocker, s.docker().StopRemove(ctx, p.Name))
+		})
+	case "logs":
+		var p LogsParams
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		logs, err := s.docker().Logs(ctx, p.Name, p.Lines)
+		if err != nil {
+			return failure(req.ID, ErrorDocker, err)
+		}
+		return result(req.ID, map[string]string{"logs": logs})
+	case "docker_inspect":
+		var p DockerInspectParams
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		inspect, err := s.docker().Inspect(ctx, p.Name)
+		if err != nil {
+			return failure(req.ID, ErrorDocker, err)
+		}
+		return result(req.ID, DockerInspectResult{Inspect: inspect})
+	case "list_ship_containers":
+		containers, err := s.docker().ListShipContainers(ctx)
+		if err != nil {
+			return failure(req.ID, ErrorDocker, err)
+		}
+		return result(req.ID, containers)
+	case "health_check":
+		return s.healthCheck(ctx, req)
+	case "write_file":
+		return s.withHostLock(req, "write_file", func() Response {
+			return s.writeFile(req)
+		})
+	case "read_release_state":
+		return s.readReleaseState(req)
+	case "write_release_state":
+		return s.withHostLock(req, "write_release_state", func() Response {
+			return s.writeReleaseState(req)
+		})
+	case "caddy_reload":
+		return s.withHostLock(req, "caddy_reload", func() Response {
+			return s.caddyReload(ctx, req)
+		})
+	case "accessory_backup":
+		return s.withHostLock(req, "accessory_backup", func() Response {
+			return s.accessoryCommand(ctx, req)
+		})
+	case "accessory_restore":
+		return s.withHostLock(req, "accessory_restore", func() Response {
+			return s.accessoryCommand(ctx, req)
+		})
+	case "ensure_volume":
+		return s.withHostLock(req, "ensure_volume", func() Response {
+			return s.ensureVolume(ctx, req)
+		})
+	case "install_binary":
+		return s.withHostLock(req, "install_binary", func() Response {
+			return s.installBinary(req)
+		})
+	case "migrate_state_dir":
+		return s.withHostLock(req, "migrate_state_dir", func() Response {
+			return s.migrateStateDir(req)
+		})
+	default:
+		return failure(req.ID, ErrorUnknownMethod, fmt.Errorf("unknown method %q", req.Method))
+	}
+}
+
+func ServeStdio(ctx context.Context) error {
+	return Serve(ctx, os.Stdin, os.Stdout)
+}
+
+func (s Server) negotiate(req Request) Response {
+	var p NegotiateParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	minVersion := p.MinProtocolVersion
+	maxVersion := p.MaxProtocolVersion
+	if minVersion == 0 {
+		minVersion = AgentMinProtocol
+	}
+	if maxVersion == 0 {
+		maxVersion = AgentProtocol
+	}
+	selected := AgentProtocol
+	if selected > maxVersion {
+		selected = maxVersion
+	}
+	if selected < minVersion || selected < AgentMinProtocol {
+		return failure(req.ID, ErrorIncompatibleProtocol, fmt.Errorf("agent supports protocol %d-%d, client requested %d-%d", AgentMinProtocol, AgentProtocol, minVersion, maxVersion))
+	}
+	return result(req.ID, NegotiateResult{
+		AgentVersion:     AgentVersion,
+		ProtocolVersion:  selected,
+		SupportedMethods: supportedMethods(),
+	})
+}
+
+func (s Server) status(ctx context.Context, req Request) Response {
+	hostname, err := s.hostname()
+	if err != nil {
+		hostname = ""
+	}
+	dockerErr := s.docker().Available(ctx)
+	return result(req.ID, Status{
+		Hostname:         hostname,
+		StateDir:         s.stateDir(),
+		DockerOK:         dockerErr == nil,
+		AgentVersion:     AgentVersion,
+		ProtocolVersion:  AgentProtocol,
+		SupportedMethods: supportedMethods(),
+	})
+}
+
+func (s Server) healthCheck(ctx context.Context, req Request) Response {
+	var p HealthCheckParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if strings.TrimSpace(p.Command) == "" && strings.TrimSpace(p.URL) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("command or url is required"))
+	}
+	timeout := time.Duration(p.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	if p.Command != "" {
+		out, err := s.command()(checkCtx, "sh", "-lc", p.Command)
+		if err != nil {
+			return failure(req.ID, ErrorHealthCheckFailed, fmt.Errorf("health command failed: %w", err))
+		}
+		return result(req.ID, HealthCheckResult{OK: true, Output: trimOutput(out), DurationMS: time.Since(start).Milliseconds()})
+	}
+	httpClient := s.httpClient()
+	httpClient.Timeout = timeout
+	res, err := httpClient.Get(p.URL)
+	if err != nil {
+		return failure(req.ID, ErrorHealthCheckFailed, fmt.Errorf("health request failed: %w", err))
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
+	if res.StatusCode < 200 || res.StatusCode >= 400 {
+		return failure(req.ID, ErrorHealthCheckFailed, fmt.Errorf("health request returned HTTP %d", res.StatusCode))
+	}
+	return result(req.ID, HealthCheckResult{OK: true, StatusCode: res.StatusCode, Output: trimOutput(string(body)), DurationMS: time.Since(start).Milliseconds()})
+}
+
+func (s Server) writeFile(req Request) Response {
+	var p WriteFileParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	data, err := contentBytes(p.Content, p.Encoding)
+	if err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	mode := os.FileMode(0o644)
+	if p.Mode != 0 {
+		mode = os.FileMode(p.Mode)
+	}
+	if err := atomicWriteFile(p.Path, data, mode); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	return result(req.ID, WriteFileResult{Path: p.Path, Bytes: len(data)})
+}
+
+func (s Server) readReleaseState(req Request) Response {
+	var p ReadReleaseStateParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	store := state.NewStore(s.stateDir())
+	var (
+		release state.Release
+		err     error
+	)
+	if strings.TrimSpace(p.ID) != "" {
+		release, err = store.ReadRelease(p.ID)
+	} else {
+		release, err = store.CurrentRelease(p.Environment)
+	}
+	if err != nil {
+		return failure(req.ID, ErrorReleaseState, err)
+	}
+	return result(req.ID, release)
+}
+
+func (s Server) writeReleaseState(req Request) Response {
+	var p WriteReleaseStateParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	store := state.NewStore(s.stateDir())
+	if err := store.SaveReleaseRecord(p.Release); err != nil {
+		return failure(req.ID, ErrorReleaseState, err)
+	}
+	release, err := store.ReadRelease(p.Release.ID)
+	if err != nil {
+		return failure(req.ID, ErrorReleaseState, err)
+	}
+	if release.Status == state.ReleaseStatusHealthy && release.Healthy {
+		if err := store.PromoteRelease(release.ID); err != nil {
+			return failure(req.ID, ErrorReleaseState, err)
+		}
+	}
+	return result(req.ID, release)
+}
+
+func (s Server) caddyReload(ctx context.Context, req Request) Response {
+	var p CaddyReloadParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	path := p.Path
+	if path == "" {
+		path = defaultCaddyfilePath
+	}
+	if p.Config != "" || p.Clear {
+		return s.writeValidateReloadCaddy(ctx, req.ID, path, []byte(p.Config), p.Validate)
+	}
+	if p.Validate {
+		if _, err := s.command()(ctx, "caddy", "validate", "--config", path); err != nil {
+			return failure(req.ID, ErrorCommandFailed, fmt.Errorf("caddy validate failed: %w", err))
+		}
+	}
+	out, err := s.command()(ctx, "caddy", "reload", "--config", path)
+	if err != nil {
+		return failure(req.ID, ErrorCommandFailed, fmt.Errorf("caddy reload failed: %w", err))
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
+func (s Server) writeValidateReloadCaddy(ctx context.Context, id, path string, data []byte, validate bool) Response {
+	if strings.TrimSpace(path) == "" {
+		return failure(id, ErrorFileOperation, errors.New("path is required"))
+	}
+	if !filepath.IsAbs(path) {
+		return failure(id, ErrorFileOperation, fmt.Errorf("path %q must be absolute", path))
+	}
+	previous, previousMode, hadPrevious, err := fileSnapshot(path)
+	if err != nil {
+		return failure(id, ErrorFileOperation, err)
+	}
+	stagePath, err := writeTempFile(filepath.Dir(path), data, 0o644)
+	if err != nil {
+		return failure(id, ErrorFileOperation, err)
+	}
+	defer os.Remove(stagePath)
+	if validate {
+		if _, err := s.command()(ctx, "caddy", caddyfileCommandArgs("validate", stagePath)...); err != nil {
+			return failure(id, ErrorCommandFailed, fmt.Errorf("caddy validate failed: %w", err))
+		}
+	}
+	if err := atomicWriteFile(path, data, 0o644); err != nil {
+		return failure(id, ErrorFileOperation, err)
+	}
+	out, err := s.command()(ctx, "caddy", caddyfileCommandArgs("reload", path)...)
+	if err != nil {
+		rollbackErr := restoreFileSnapshot(path, previous, previousMode, hadPrevious)
+		if rollbackErr == nil && hadPrevious {
+			_, _ = s.command()(ctx, "caddy", caddyfileCommandArgs("reload", path)...)
+		}
+		if rollbackErr != nil {
+			return failure(id, ErrorCommandFailed, fmt.Errorf("caddy reload failed: %w; rollback failed: %v", err, rollbackErr))
+		}
+		return failure(id, ErrorCommandFailed, fmt.Errorf("caddy reload failed: %w", err))
+	}
+	return result(id, CommandResult{Output: trimOutput(out)})
+}
+
+func caddyfileCommandArgs(command, path string) []string {
+	return []string{command, "--config", path, "--adapter", "caddyfile"}
+}
+
+func (s Server) accessoryCommand(ctx context.Context, req Request) Response {
+	var p AccessoryCommandParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if strings.TrimSpace(p.Command) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("command is required"))
+	}
+	timeout := time.Duration(p.TimeoutSeconds) * time.Second
+	commandCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		commandCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	out, err := s.command()(commandCtx, "sh", "-lc", p.Command)
+	if err != nil {
+		return failure(req.ID, ErrorCommandFailed, fmt.Errorf("accessory %q command failed: %w", p.Name, err))
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
+func (s Server) ensureVolume(ctx context.Context, req Request) Response {
+	var p EnsureVolumeParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if !validDockerVolumeName(p.Name) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("invalid volume name %q", p.Name))
+	}
+	out, err := s.command()(ctx, "docker", "volume", "create", p.Name)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, fmt.Errorf("create volume %q: %w", p.Name, err))
+	}
+	if strings.TrimSpace(p.Owner) != "" {
+		if !validVolumeOwner(p.Owner) {
+			return failure(req.ID, ErrorInvalidParams, fmt.Errorf("invalid volume owner %q", p.Owner))
+		}
+		if _, err := s.command()(ctx, "docker", "run", "--rm", "-v", p.Name+":/ship-volume", "busybox:1.36", "chown", "-R", p.Owner, "/ship-volume"); err != nil {
+			return failure(req.ID, ErrorDocker, fmt.Errorf("set owner on volume %q: %w", p.Name, err))
+		}
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
+func (s Server) installBinary(req Request) Response {
+	var p InstallBinaryParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	path := p.Path
+	if path == "" {
+		path = config.RemoteBinaryPath
+	}
+	data, err := base64.StdEncoding.DecodeString(p.ContentBase64)
+	if err != nil {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("decode binary content: %w", err))
+	}
+	sum := sha256.Sum256(data)
+	digest := hex.EncodeToString(sum[:])
+	if p.SHA256 != "" && !strings.EqualFold(p.SHA256, digest) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("binary checksum mismatch"))
+	}
+	mode := os.FileMode(0o755)
+	if p.Mode != 0 {
+		mode = os.FileMode(p.Mode)
+	}
+	if current, err := os.ReadFile(path); err == nil {
+		currentSum := sha256.Sum256(current)
+		if hex.EncodeToString(currentSum[:]) == digest {
+			if err := os.Chmod(path, mode); err != nil {
+				return failure(req.ID, ErrorFileOperation, err)
+			}
+			return result(req.ID, InstallBinaryResult{Path: path, Installed: false, SHA256: digest})
+		}
+	}
+	if err := atomicWriteFile(path, data, mode); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	return result(req.ID, InstallBinaryResult{Path: path, Installed: true, SHA256: digest})
+}
+
+func (s Server) migrateStateDir(req Request) Response {
+	var p MigrateStateDirParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	to := p.To
+	if to == "" {
+		to = s.stateDir()
+	}
+	if err := os.MkdirAll(to, 0o755); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	migrated := false
+	if p.From != "" && filepath.Clean(p.From) != filepath.Clean(to) {
+		if err := copyDirIfExists(p.From, to); err != nil {
+			return failure(req.ID, ErrorFileOperation, err)
+		}
+		migrated = true
+	}
+	return result(req.ID, MigrateStateDirResult{From: p.From, To: to, Migrated: migrated})
+}
+
+func (s Server) withHostLock(req Request, operation string, fn func() Response) Response {
+	unlock, err := acquireHostLock(s.stateDir())
+	if err != nil {
+		return failure(req.ID, ErrorLock, fmt.Errorf("%s lock: %w", operation, err))
+	}
+	defer unlock()
+	return fn()
+}
+
+func (s Server) docker() DockerOps {
+	if s.Docker != nil {
+		return s.Docker
+	}
+	return docker.Client{}
+}
+
+func (s Server) command() CommandRunner {
+	if s.CommandRunner != nil {
+		return s.CommandRunner
+	}
+	return defaultCommandRunner
+}
+
+func (s Server) httpClient() *http.Client {
+	base := s.HTTPClient
+	if base == nil {
+		base = http.DefaultClient
+	}
+	copy := *base
+	return &copy
+}
+
+func (s Server) stateDir() string {
+	if strings.TrimSpace(s.StateDir) != "" {
+		return s.StateDir
+	}
+	return config.RemoteStateDir
+}
+
+func (s Server) hostname() (string, error) {
+	if s.Hostname != nil {
+		return s.Hostname()
+	}
+	return os.Hostname()
+}
+
+func defaultCommandRunner(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("%s failed: %s", name, msg)
+	}
+	return string(out), nil
+}
+
+func acquireHostLock(stateDir string) (func(), error) {
+	lockDir := filepath.Join(stateDir, "locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(lockDir, "host.lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, nil
+}
+
+func decode(data json.RawMessage, out any) error {
+	if len(data) == 0 {
+		data = []byte("{}")
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("decode params: %w", err)
+	}
+	return nil
+}
+
+func result(id string, value any) Response {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return failure(id, ErrorInternal, err)
+	}
+	return Response{ID: id, OK: true, Result: data}
+}
+
+func empty(id string, code string, err error) Response {
+	if err != nil {
+		return failure(id, code, err)
+	}
+	return Response{ID: id, OK: true}
+}
+
+func failure(id string, code string, err error) Response {
+	if err == nil {
+		err = errors.New("unknown error")
+	}
+	var coded rpcError
+	if errors.As(err, &coded) && coded.code != "" {
+		code = coded.code
+	}
+	if code == "" {
+		code = ErrorInternal
+	}
+	return Response{ID: id, OK: false, Error: err.Error(), ErrorCode: code}
+}
+
+func supportedMethods() []string {
+	methods := []string{
+		"accessory_backup",
+		"accessory_restore",
+		"caddy_reload",
+		"docker_inspect",
+		"health_check",
+		"ensure_volume",
+		"install_binary",
+		"list_ship_containers",
+		"logs",
+		"migrate_state_dir",
+		"negotiate",
+		"pull",
+		"prune_images",
+		"read_release_state",
+		"run_container",
+		"status",
+		"stop_container",
+		"write_file",
+		"write_release_state",
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+func validDockerVolumeName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		allowed := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == '.' || r == '-'
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func validVolumeOwner(owner string) bool {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false
+	}
+	for _, r := range owner {
+		allowed := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == ':' || r == '.'
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+func labelArgs(labels map[string]string) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	args := make([]string, 0, len(keys)*2)
+	for _, key := range keys {
+		value := labels[key]
+		if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+			continue
+		}
+		args = append(args, "--label", key+"="+value)
+	}
+	return args
+}
+
+func contentBytes(content, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "plain", "text":
+		return []byte(content), nil
+	case "base64":
+		data, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			return nil, fmt.Errorf("decode base64 content: %w", err)
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf("unsupported content encoding %q", encoding)
+	}
+}
+
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("path is required")
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("path %q must be absolute", path)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".ship-write-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func writeTempFile(dir string, data []byte, mode os.FileMode) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(dir, ".ship-caddy-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return "", err
+	}
+	return tmpName, nil
+}
+
+func fileSnapshot(path string) ([]byte, os.FileMode, bool, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0o644, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, 0, false, fmt.Errorf("%s is not a regular file", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return data, info.Mode(), true, nil
+}
+
+func restoreFileSnapshot(path string, data []byte, mode os.FileMode, exists bool) error {
+	if exists {
+		return atomicWriteFile(path, data, mode)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func copyDirIfExists(from, to string) error {
+	info, err := os.Stat(from)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", from)
+	}
+	return filepath.WalkDir(from, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(from, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		target := filepath.Join(to, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		if _, err := os.Stat(target); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return atomicWriteFile(target, data, info.Mode())
+	})
+}
+
+func trimOutput(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 4096 {
+		return value
+	}
+	return value[:4096]
+}
