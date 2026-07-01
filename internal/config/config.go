@@ -18,6 +18,7 @@ const (
 	RemoteBinaryPath  = "/usr/local/bin/ship"
 
 	ProviderHetzner = "hetzner"
+	ProviderVultr   = "vultr"
 )
 
 type Config struct {
@@ -36,6 +37,7 @@ type Environment struct {
 
 type ProviderConfig struct {
 	Hetzner *HetznerConfig `yaml:"hetzner"`
+	Vultr   *VultrConfig   `yaml:"vultr"`
 	Unknown []string       `yaml:"-"`
 }
 
@@ -44,6 +46,16 @@ type HetznerConfig struct {
 	ServerType string   `yaml:"server_type"`
 	Image      string   `yaml:"image"`
 	SSHKeys    []string `yaml:"ssh_keys"`
+}
+
+type VultrConfig struct {
+	Region     string   `yaml:"region"`
+	Plan       string   `yaml:"plan"`
+	OSID       int      `yaml:"os_id"`
+	ImageID    string   `yaml:"image_id"`
+	SnapshotID string   `yaml:"snapshot_id"`
+	AppID      int      `yaml:"app_id"`
+	SSHKeyIDs  []string `yaml:"ssh_key_ids"`
 }
 
 func (p *ProviderConfig) UnmarshalYAML(value *yaml.Node) error {
@@ -60,7 +72,7 @@ func (p *ProviderConfig) UnmarshalYAML(value *yaml.Node) error {
 	for i := 0; i+1 < len(value.Content); i += 2 {
 		name := value.Content[i].Value
 		switch name {
-		case ProviderHetzner:
+		case ProviderHetzner, ProviderVultr:
 		default:
 			p.Unknown = append(p.Unknown, name)
 		}
@@ -72,6 +84,9 @@ func (p *ProviderConfig) UnmarshalYAML(value *yaml.Node) error {
 func (p ProviderConfig) Name() string {
 	if p.Hetzner != nil {
 		return ProviderHetzner
+	}
+	if p.Vultr != nil {
+		return ProviderVultr
 	}
 	return ""
 }
@@ -99,6 +114,18 @@ func (p ProviderConfig) Validate(envName string) []string {
 			errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.image is required", envName))
 		}
 	}
+	if p.Vultr != nil {
+		if p.Vultr.Region == "" {
+			errs = append(errs, fmt.Sprintf("environment %q provider.vultr.region is required", envName))
+		}
+		if p.Vultr.Plan == "" {
+			errs = append(errs, fmt.Sprintf("environment %q provider.vultr.plan is required", envName))
+		}
+		sources := p.Vultr.sourceBlocks()
+		if len(sources) != 1 {
+			errs = append(errs, fmt.Sprintf("environment %q provider.vultr must define exactly one source (found %s)", envName, strings.Join(sources, ", ")))
+		}
+	}
 	return errs
 }
 
@@ -107,8 +134,28 @@ func (p ProviderConfig) blocks() []string {
 	if p.Hetzner != nil {
 		blocks = append(blocks, ProviderHetzner)
 	}
+	if p.Vultr != nil {
+		blocks = append(blocks, ProviderVultr)
+	}
 	blocks = append(blocks, p.Unknown...)
 	sort.Strings(blocks)
+	return blocks
+}
+
+func (v VultrConfig) sourceBlocks() []string {
+	var blocks []string
+	if v.OSID != 0 {
+		blocks = append(blocks, "os_id")
+	}
+	if v.ImageID != "" {
+		blocks = append(blocks, "image_id")
+	}
+	if v.SnapshotID != "" {
+		blocks = append(blocks, "snapshot_id")
+	}
+	if v.AppID != 0 {
+		blocks = append(blocks, "app_id")
+	}
 	return blocks
 }
 

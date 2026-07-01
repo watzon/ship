@@ -121,6 +121,28 @@ func TestRunUsesProviderCredentialChecks(t *testing.T) {
 	assertCheck(t, report, "fake token", StatusFail, "missing FAKE_TOKEN")
 }
 
+func TestRunChecksVultrCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Vultr: &config.VultrConfig{Region: "ewr", Plan: "vc2-2c-4gb", OSID: 2284}},
+		Hosts:    config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "VULTR_API_KEY")
+	if err := os.Unsetenv("VULTR_API_KEY"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "vultr token", StatusFail, "missing VULTR_API_KEY")
+}
+
 func TestRunReportsMissingSecretsByName(t *testing.T) {
 	secretName := "SHIP_DOCTOR_TEST_MISSING_SECRET"
 	restoreEnv(t, secretName)

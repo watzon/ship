@@ -6,7 +6,7 @@ The v1 shape is intentionally small:
 
 - one `ship` Go binary
 - YAML config in `ship.yml`
-- Hetzner Cloud provisioning
+- Hetzner Cloud and Vultr provisioning
 - Docker Engine on hosts
 - SSH-framed agent RPC, with no open agent port
 - deterministic service placement across host pools
@@ -29,7 +29,7 @@ From a blank application repo:
 ```bash
 ship init
 
-# Edit ship.yml for your registry, Hetzner location/server type, host pools,
+# Edit ship.yml for your registry, provider settings, host pools,
 # service image build/ref, health checks, ingress domains, accessories, and secrets.
 ship doctor
 ship provision plan production
@@ -42,7 +42,9 @@ ship --dry-run deploy production
 When the dry-run output looks right and credentials are present:
 
 ```bash
-export HCLOUD_TOKEN=...
+export HCLOUD_TOKEN=...     # Hetzner
+# or
+export VULTR_API_KEY=...    # Vultr
 ship provision apply production --yes
 ship agent install production
 ship secrets verify
@@ -76,6 +78,7 @@ The normal test suite references this fixture without requiring Docker.
 Ship reads `ship.yml` from the current directory by default. The generated starter config includes:
 
 - `environments.production.provider.hetzner`
+- `environments.production.provider.vultr` is also supported
 - host pools for `web`, `worker`, and `ingress`
 - stateless `web` and `worker` services
 - a single-primary `postgres` accessory
@@ -90,9 +93,41 @@ ship secrets verify
 ship secrets render production --dry-run
 ```
 
+Hetzner provider example:
+
+```yaml
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_keys:
+          - ship-key
+```
+
+Vultr provider example:
+
+```yaml
+environments:
+  production:
+    provider:
+      vultr:
+        region: ewr
+        plan: vc2-2c-4gb
+        os_id: 2284
+        ssh_key_ids:
+          - your-vultr-ssh-key-id
+```
+
+Vultr requires `region`, `plan`, and exactly one of `os_id`, `image_id`, `snapshot_id`, or `app_id`. Set `HCLOUD_TOKEN` for Hetzner environments and `VULTR_API_KEY` for Vultr environments.
+
+See [docs/providers.md](docs/providers.md) for the provider implementation contract.
+
 ## Deploy And Operate
 
-Provisioning reconciles Hetzner servers by Ship labels, writes local host facts, waits for SSH, installs Docker prerequisites, uploads the local `ship` binary, and enables the Ship agent service. It does not delete extra servers during apply; cleanup is an explicit decommission command.
+Provisioning reconciles provider servers by Ship ownership metadata, writes local host facts, waits for SSH, installs Docker prerequisites, uploads the local `ship` binary, and enables the Ship agent service. It does not delete extra servers during apply; cleanup is an explicit decommission command.
 
 ```bash
 ship provision apply production --yes
@@ -100,7 +135,7 @@ ship --dry-run agent install production
 ship agent install production
 ```
 
-To remove Ship-managed Hetzner servers for an environment:
+To remove Ship-managed provider servers for an environment:
 
 ```bash
 ship --dry-run provision decommission production

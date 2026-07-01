@@ -55,6 +55,20 @@ func TestValidateAcceptsHetznerProvider(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsVultrProvider(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Environments["production"] = Environment{
+		Provider: ProviderConfig{Vultr: &VultrConfig{Region: "ewr", Plan: "vc2-2c-4gb", OSID: 2284}},
+		Hosts:    HostsConfig{Pools: map[string]Pool{"web": {Count: 1}}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+	if got := cfg.Environments["production"].Provider.Name(); got != ProviderVultr {
+		t.Fatalf("provider name = %q, want %q", got, ProviderVultr)
+	}
+}
+
 func TestValidateRequiresProvider(t *testing.T) {
 	cfg := minimalValidConfig()
 	cfg.Environments["production"] = Environment{
@@ -63,6 +77,39 @@ func TestValidateRequiresProvider(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), `environment "production" must define exactly one provider`) {
 		t.Fatalf("expected missing provider error, got %v", err)
+	}
+}
+
+func TestValidateRequiresVultrFields(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Environments["production"] = Environment{
+		Provider: ProviderConfig{Vultr: &VultrConfig{}},
+		Hosts:    HostsConfig{Pools: map[string]Pool{"web": {Count: 1}}},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	for _, needle := range []string{
+		`provider.vultr.region is required`,
+		`provider.vultr.plan is required`,
+		`provider.vultr must define exactly one source`,
+	} {
+		if !strings.Contains(err.Error(), needle) {
+			t.Fatalf("validation error missing %q: %v", needle, err)
+		}
+	}
+}
+
+func TestValidateRequiresExactlyOneVultrSource(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Environments["production"] = Environment{
+		Provider: ProviderConfig{Vultr: &VultrConfig{Region: "ewr", Plan: "vc2-2c-4gb", OSID: 2284, ImageID: "image-abc"}},
+		Hosts:    HostsConfig{Pools: map[string]Pool{"web": {Count: 1}}},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), `provider.vultr must define exactly one source`) {
+		t.Fatalf("expected source validation error, got %v", err)
 	}
 }
 
