@@ -17,9 +17,29 @@ The model is Kamal-like: you define host pools, services, and accessories in YAM
 
 ## Install
 
+Requires [Go](https://go.dev/dl/) 1.26+ and Docker for deploys.
+
+Install the CLI with `go install`:
+
 ```bash
+go install github.com/watzon/ship/cmd/ship@latest
+```
+
+Pin a branch or tag with `@main` (or `@v0.1.0` once releases are tagged) instead of `@latest`.
+
+Working from a clone:
+
+```bash
+git clone https://github.com/watzon/ship.git
+cd ship
 go install ./cmd/ship
+```
+
+Ensure `$(go env GOPATH)/bin` is on your `PATH` (or set `GOBIN`), then verify:
+
+```bash
 ship --help
+ship version
 ```
 
 ## First deploy
