@@ -41,10 +41,11 @@ func (p Plan) String() string {
 }
 
 func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
-	env, err := cfg.Environment(envName)
+	resolved, env, err := cfg.ResolveEnvironment(envName)
 	if err != nil {
 		return Plan{}, err
 	}
+	cfg = resolved
 	placements, err := scheduler.PlaceServices(cfg, env)
 	if err != nil {
 		return Plan{}, err
@@ -95,7 +96,7 @@ func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
 }
 
 func ProvisionPlan(cfg *config.Config, envName string) (Plan, error) {
-	env, err := cfg.Environment(envName)
+	_, env, err := cfg.ResolveEnvironment(envName)
 	if err != nil {
 		return Plan{}, err
 	}

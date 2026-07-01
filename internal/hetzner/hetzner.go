@@ -40,18 +40,41 @@ type Client struct {
 type ServerPlan = provider.HostPlan
 
 type Server struct {
-	ID        int64             `json:"id"`
-	Name      string            `json:"name"`
-	Labels    map[string]string `json:"labels"`
-	PublicNet PublicNet         `json:"public_net"`
+	ID         int64             `json:"id"`
+	Name       string            `json:"name"`
+	Labels     map[string]string `json:"labels"`
+	PublicNet  PublicNet         `json:"public_net"`
+	PrivateNet []PrivateNet      `json:"private_net"`
+}
+
+type Network struct {
+	ID     int64             `json:"id"`
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+}
+
+type Firewall struct {
+	ID     int64             `json:"id"`
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
 }
 
 type PublicNet struct {
-	IPv4 PublicIPv4 `json:"ipv4"`
+	IPv4      PublicIPv4       `json:"ipv4"`
+	Firewalls []ServerFirewall `json:"firewalls"`
 }
 
 type PublicIPv4 struct {
 	IP string `json:"ip"`
+}
+
+type PrivateNet struct {
+	Network int64 `json:"network"`
+}
+
+type ServerFirewall struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status"`
 }
 
 type Action struct {
@@ -138,12 +161,44 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, sshKeys: env.Provider.Hetzner.SSHKeys})
+	var networkID int64
+	if env.Provider.Hetzner.Network.EnabledValue(true) {
+		network, err := c.EnsureNetwork(ctx, project, environment, *env.Provider.Hetzner)
+		if err != nil {
+			return provider.ReconcileResult{}, err
+		}
+		networkID = network.ID
+	}
+	var firewallID int64
+	if env.Provider.Hetzner.Firewall.EnabledValue(true) {
+		firewall, err := c.EnsureFirewall(ctx, project, environment, *env.Provider.Hetzner)
+		if err != nil {
+			return provider.ReconcileResult{}, err
+		}
+		firewallID = firewall.ID
+	}
+
+	var err error
+	result, err = provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+		client:     c,
+		sshKeys:    env.Provider.Hetzner.SSHKeys,
+		networkID:  networkID,
+		firewallID: firewallID,
+	})
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	if err := c.EnsureHostAttachments(ctx, result.Existing, networkID, firewallID); err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return result, nil
 }
 
 type reconcileBackend struct {
-	client  Client
-	sshKeys []string
+	client     Client
+	sshKeys    []string
+	networkID  int64
+	firewallID int64
 }
 
 func (b reconcileBackend) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
@@ -151,7 +206,11 @@ func (b reconcileBackend) List(ctx context.Context, project, environment string)
 }
 
 func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (provider.Host, error) {
-	server, err := b.client.CreateServer(ctx, plan, b.sshKeys)
+	server, err := b.client.CreateServer(ctx, plan, createServerOptions{
+		SSHKeys:    b.sshKeys,
+		NetworkID:  b.networkID,
+		FirewallID: b.firewallID,
+	})
 	if err != nil {
 		return provider.Host{}, err
 	}
@@ -205,7 +264,13 @@ func (c Client) ListServers(ctx context.Context, project, environment string) ([
 	return servers, nil
 }
 
-func (c Client) CreateServer(ctx context.Context, plan provider.HostPlan, sshKeys []string) (Server, error) {
+type createServerOptions struct {
+	SSHKeys    []string
+	NetworkID  int64
+	FirewallID int64
+}
+
+func (c Client) CreateServer(ctx context.Context, plan provider.HostPlan, opts createServerOptions) (Server, error) {
 	if !c.TokenPresent() {
 		return Server{}, fmt.Errorf("HCLOUD_TOKEN is required")
 	}
@@ -217,8 +282,14 @@ func (c Client) CreateServer(ctx context.Context, plan provider.HostPlan, sshKey
 		"location":    plan.Location,
 		"labels":      labels,
 	}
-	if len(sshKeys) > 0 {
-		body["ssh_keys"] = sshKeys
+	if len(opts.SSHKeys) > 0 {
+		body["ssh_keys"] = opts.SSHKeys
+	}
+	if opts.NetworkID != 0 {
+		body["networks"] = []int64{opts.NetworkID}
+	}
+	if opts.FirewallID != 0 {
+		body["firewalls"] = []map[string]int64{{"firewall": opts.FirewallID}}
 	}
 	if c.DryRun {
 		return Server{Name: plan.Name, Labels: labels}, nil
@@ -330,6 +401,212 @@ func (c Client) DeleteServer(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (c Client) EnsureHostAttachments(ctx context.Context, hosts []provider.Host, networkID, firewallID int64) error {
+	for _, host := range hosts {
+		serverID, err := strconv.ParseInt(host.ID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("server id for %s must be numeric: %w", host.Name, err)
+		}
+		if networkID != 0 && !containsInt64(host.NetworkIDs, networkID) {
+			if err := c.AttachServerToNetwork(ctx, serverID, networkID); err != nil {
+				return fmt.Errorf("attach %s to network %d: %w", host.Name, networkID, err)
+			}
+		}
+		if firewallID != 0 && !containsInt64(host.FirewallIDs, firewallID) {
+			if err := c.ApplyFirewallToServer(ctx, firewallID, serverID); err != nil {
+				return fmt.Errorf("apply firewall %d to %s: %w", firewallID, host.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (c Client) AttachServerToNetwork(ctx context.Context, serverID, networkID int64) error {
+	if !c.TokenPresent() {
+		return fmt.Errorf("HCLOUD_TOKEN is required")
+	}
+	if serverID == 0 {
+		return fmt.Errorf("server id is required")
+	}
+	if networkID == 0 {
+		return fmt.Errorf("network id is required")
+	}
+	if c.DryRun {
+		return nil
+	}
+	body := map[string]any{"network": networkID}
+	var out serverActionResponse
+	path := fmt.Sprintf("/servers/%d/actions/attach_to_network", serverID)
+	if err := c.request(ctx, http.MethodPost, path, body, &out); err != nil {
+		return err
+	}
+	return c.WaitAction(ctx, out.Action.ID)
+}
+
+func (c Client) ApplyFirewallToServer(ctx context.Context, firewallID, serverID int64) error {
+	if !c.TokenPresent() {
+		return fmt.Errorf("HCLOUD_TOKEN is required")
+	}
+	if firewallID == 0 {
+		return fmt.Errorf("firewall id is required")
+	}
+	if serverID == 0 {
+		return fmt.Errorf("server id is required")
+	}
+	if c.DryRun {
+		return nil
+	}
+	body := map[string]any{
+		"apply_to": []map[string]any{{
+			"type":   "server",
+			"server": map[string]int64{"id": serverID},
+		}},
+	}
+	var out firewallActionsResponse
+	path := fmt.Sprintf("/firewalls/%d/actions/apply_to_resources", firewallID)
+	if err := c.request(ctx, http.MethodPost, path, body, &out); err != nil {
+		return err
+	}
+	for _, action := range out.Actions {
+		if err := c.WaitAction(ctx, action.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c Client) EnsureNetwork(ctx context.Context, project, environment string, cfg config.HetznerConfig) (Network, error) {
+	name := cfg.Network.Name
+	if strings.TrimSpace(name) == "" {
+		name = resourceName(project, environment, "network")
+	}
+	existing, err := c.ListNetworks(ctx, project, environment)
+	if err != nil {
+		return Network{}, err
+	}
+	for _, network := range existing {
+		if network.Name == name {
+			return network, nil
+		}
+	}
+	ipRange := cfg.Network.IPRange
+	if strings.TrimSpace(ipRange) == "" {
+		ipRange = "10.98.0.0/16"
+	}
+	body := map[string]any{
+		"name":     name,
+		"ip_range": ipRange,
+		"labels":   resourceLabels(project, environment, "network"),
+	}
+	var out createNetworkResponse
+	if err := c.request(ctx, http.MethodPost, "/networks", body, &out); err != nil {
+		return Network{}, err
+	}
+	return out.Network, nil
+}
+
+func (c Client) ListNetworks(ctx context.Context, project, environment string) ([]Network, error) {
+	if !c.TokenPresent() {
+		return nil, fmt.Errorf("HCLOUD_TOKEN is required")
+	}
+	values := url.Values{}
+	values.Set("label_selector", labelSelector(project, environment))
+	var out listNetworksResponse
+	if err := c.request(ctx, http.MethodGet, "/networks?"+values.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Networks, nil
+}
+
+func (c Client) EnsureFirewall(ctx context.Context, project, environment string, cfg config.HetznerConfig) (Firewall, error) {
+	name := cfg.Firewall.Name
+	if strings.TrimSpace(name) == "" {
+		name = resourceName(project, environment, "firewall")
+	}
+	existing, err := c.ListFirewalls(ctx, project, environment)
+	if err != nil {
+		return Firewall{}, err
+	}
+	for _, firewall := range existing {
+		if firewall.Name == name {
+			return firewall, nil
+		}
+	}
+	body := map[string]any{
+		"name":   name,
+		"labels": resourceLabels(project, environment, "firewall"),
+		"rules":  firewallRules(cfg),
+	}
+	var out createFirewallResponse
+	if err := c.request(ctx, http.MethodPost, "/firewalls", body, &out); err != nil {
+		return Firewall{}, err
+	}
+	return out.Firewall, nil
+}
+
+func (c Client) ListFirewalls(ctx context.Context, project, environment string) ([]Firewall, error) {
+	if !c.TokenPresent() {
+		return nil, fmt.Errorf("HCLOUD_TOKEN is required")
+	}
+	values := url.Values{}
+	values.Set("label_selector", labelSelector(project, environment))
+	var out listFirewallsResponse
+	if err := c.request(ctx, http.MethodGet, "/firewalls?"+values.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Firewalls, nil
+}
+
+func firewallRules(cfg config.HetznerConfig) []map[string]any {
+	rules := []map[string]any{}
+	if cfg.EffectiveSSHFirewall() == config.SSHFirewallManaged {
+		rules = append(rules, map[string]any{
+			"direction":  "in",
+			"protocol":   "tcp",
+			"port":       "22",
+			"source_ips": append([]string(nil), cfg.SSHAllowedCIDRs...),
+		})
+	}
+	rules = append(rules,
+		map[string]any{"direction": "in", "protocol": "tcp", "port": "80", "source_ips": []string{"0.0.0.0/0", "::/0"}},
+		map[string]any{"direction": "in", "protocol": "tcp", "port": "443", "source_ips": []string{"0.0.0.0/0", "::/0"}},
+	)
+	return rules
+}
+
+func resourceName(project, environment, kind string) string {
+	return strings.Join([]string{"ship", safeName(project), safeName(environment), kind}, "-")
+}
+
+func resourceLabels(project, environment, kind string) map[string]string {
+	labels := provider.ShipLabels(project, environment, kind)
+	labels[LabelPool] = kind
+	return labels
+}
+
+func safeName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		allowed := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-'
+		if allowed {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "ship"
+	}
+	return out
+}
+
 func (c Client) request(ctx context.Context, method, path string, body any, out any) error {
 	var reader io.Reader
 	if body != nil {
@@ -393,7 +670,38 @@ func hostFromServer(server Server) provider.Host {
 		Pool:          server.Labels[LabelPool],
 		PublicAddress: server.IPv4(),
 		Labels:        server.Labels,
+		NetworkIDs:    networkIDs(server),
+		FirewallIDs:   firewallIDs(server),
 	}
+}
+
+func networkIDs(server Server) []int64 {
+	ids := make([]int64, 0, len(server.PrivateNet))
+	for _, network := range server.PrivateNet {
+		if network.Network != 0 {
+			ids = append(ids, network.Network)
+		}
+	}
+	return ids
+}
+
+func firewallIDs(server Server) []int64 {
+	ids := make([]int64, 0, len(server.PublicNet.Firewalls))
+	for _, firewall := range server.PublicNet.Firewalls {
+		if firewall.ID != 0 {
+			ids = append(ids, firewall.ID)
+		}
+	}
+	return ids
+}
+
+func containsInt64(values []int64, want int64) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 type listServersResponse struct {
@@ -416,4 +724,28 @@ type getActionResponse struct {
 
 type deleteServerResponse struct {
 	Action Action `json:"action"`
+}
+
+type serverActionResponse struct {
+	Action Action `json:"action"`
+}
+
+type firewallActionsResponse struct {
+	Actions []Action `json:"actions"`
+}
+
+type listNetworksResponse struct {
+	Networks []Network `json:"networks"`
+}
+
+type createNetworkResponse struct {
+	Network Network `json:"network"`
+}
+
+type listFirewallsResponse struct {
+	Firewalls []Firewall `json:"firewalls"`
+}
+
+type createFirewallResponse struct {
+	Firewall Firewall `json:"firewall"`
 }

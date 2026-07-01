@@ -39,6 +39,22 @@ ship plan production
 ship --dry-run deploy production
 ```
 
+Create an encrypted secret store for each environment. Commit `.ship/secrets/*.age` and `.ship/secrets/*.recipients`; keep identity files private.
+
+```bash
+age-keygen -o ~/.config/ship/identity.txt
+age-keygen -y ~/.config/ship/identity.txt
+ship secrets init staging --recipient age1...
+ship secrets init production --recipient age1...
+export SHIP_SECRETS_IDENTITY_FILE=~/.config/ship/identity.txt
+DATABASE_URL=... ship secrets set production DATABASE_URL
+SESSION_SECRET=... ship secrets set production SESSION_SECRET
+ship secrets list production
+ship secrets export production --redacted
+```
+
+`ship secrets set ENV NAME` reads the value from environment variable `NAME` unless `--value` is provided. `ship secrets export ENV` prints plaintext dotenv output for local inspection; prefer `--redacted` in logs or shared terminal output.
+
 When the dry-run output looks right and credentials are present:
 
 ```bash
@@ -47,7 +63,8 @@ export HCLOUD_TOKEN=...     # Hetzner
 export VULTR_API_KEY=...    # Vultr
 ship provision apply production --yes
 ship agent install production
-ship secrets verify
+ship secrets verify production
+ship secrets list production
 ship deploy production
 ship status production
 ship logs production web --lines 100
@@ -77,20 +94,23 @@ The normal test suite references this fixture without requiring Docker.
 
 Ship reads `ship.yml` from the current directory by default. The generated starter config includes:
 
+- staging and production in one file through `environments.<env>` overrides
 - `environments.production.provider.hetzner`
 - `environments.production.provider.vultr` is also supported
 - host pools for `web`, `worker`, and `ingress`
 - stateless `web` and `worker` services
 - a single-primary `postgres` accessory
-- required secrets under `secrets`
+- shared secrets under root `secrets` and scoped service/accessory `secrets`
+- managed Caddy ingress container settings under root `ingress.caddy`
 
 Useful commands while editing config:
 
 ```bash
 ship provision plan production
 ship plan production
-ship secrets verify
+ship secrets verify production
 ship secrets render production --dry-run
+ship secrets diff production
 ```
 
 Hetzner provider example:
@@ -100,12 +120,15 @@ environments:
   production:
     provider:
       hetzner:
-        location: ash
-        server_type: cpx31
+        location: hel1
+        server_type: cx23
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [203.0.113.0/24]
         ssh_keys:
           - ship-key
 ```
+
+Hetzner provisioning manages a private network and firewall by default. Use `ssh_firewall: external` if you manage SSH access outside Ship, or set explicit `ssh_allowed_cidrs` for Ship-managed SSH rules.
 
 Vultr provider example:
 

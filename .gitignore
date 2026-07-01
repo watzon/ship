@@ -1,4 +1,10 @@
-.ship/
+.ship/*
+!.ship/secrets/
+!.ship/secrets/*.age
+!.ship/secrets/*.recipients
+.ship/secrets/*.env
+.ship/secrets/*.identity
+.ship/secrets/*key*
 /ship
 dist/
 coverage.out

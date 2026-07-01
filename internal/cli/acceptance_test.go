@@ -187,6 +187,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -250,6 +251,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -570,6 +572,14 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		api.t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
 	}
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/networks":
+		_ = json.NewEncoder(w).Encode(map[string]any{"networks": []any{}})
+	case r.Method == http.MethodPost && r.URL.Path == "/networks":
+		_ = json.NewEncoder(w).Encode(map[string]any{"network": map[string]any{"id": 300, "name": "ship-sample-production-network"}})
+	case r.Method == http.MethodGet && r.URL.Path == "/firewalls":
+		_ = json.NewEncoder(w).Encode(map[string]any{"firewalls": []any{}})
+	case r.Method == http.MethodPost && r.URL.Path == "/firewalls":
+		_ = json.NewEncoder(w).Encode(map[string]any{"firewall": map[string]any{"id": 400, "name": "ship-sample-production-firewall"}})
 	case r.Method == http.MethodGet && r.URL.Path == "/servers":
 		servers := make([]hetzner.Server, 0, len(api.servers))
 		for _, server := range api.servers {
@@ -584,20 +594,34 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		})
 	case r.Method == http.MethodPost && r.URL.Path == "/servers":
 		var req struct {
-			Name   string            `json:"name"`
-			Labels map[string]string `json:"labels"`
+			Name      string             `json:"name"`
+			Labels    map[string]string  `json:"labels"`
+			Networks  []int64            `json:"networks"`
+			Firewalls []map[string]int64 `json:"firewalls"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			api.t.Fatal(err)
 		}
+		privateNet := make([]hetzner.PrivateNet, 0, len(req.Networks))
+		for _, networkID := range req.Networks {
+			privateNet = append(privateNet, hetzner.PrivateNet{Network: networkID})
+		}
+		firewalls := make([]hetzner.ServerFirewall, 0, len(req.Firewalls))
+		for _, firewall := range req.Firewalls {
+			if id := firewall["firewall"]; id != 0 {
+				firewalls = append(firewalls, hetzner.ServerFirewall{ID: id, Status: "applied"})
+			}
+		}
 		api.nextID++
 		api.nextAction++
 		server := hetzner.Server{
-			ID:     api.nextID,
-			Name:   req.Name,
-			Labels: req.Labels,
+			ID:         api.nextID,
+			Name:       req.Name,
+			Labels:     req.Labels,
+			PrivateNet: privateNet,
 			PublicNet: hetzner.PublicNet{
-				IPv4: hetzner.PublicIPv4{IP: "192.0.2." + strconv.FormatInt(api.nextID-100, 10)},
+				IPv4:      hetzner.PublicIPv4{IP: "192.0.2." + strconv.FormatInt(api.nextID-100, 10)},
+				Firewalls: firewalls,
 			},
 		}
 		api.servers[req.Name] = server

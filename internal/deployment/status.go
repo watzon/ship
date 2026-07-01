@@ -96,7 +96,7 @@ func AggregateStatus(input StatusInput) (StatusReport, error) {
 		if !matchesShipScope(input.Config, input.EnvName, item.Container.Labels) {
 			continue
 		}
-		status := containerStatus(item)
+		status := containerStatusFor(input.Config, input.EnvName, item)
 		report.Observed = append(report.Observed, status)
 		if status.Service == "" || status.Replica <= 0 {
 			continue
@@ -163,6 +163,9 @@ func AggregateStatus(input StatusInput) (StatusReport, error) {
 	}
 
 	for _, observed := range report.Observed {
+		if observed.Kind == "ingress" {
+			continue
+		}
 		if isConfiguredAccessoryStatus(input.Config, observed) {
 			continue
 		}
@@ -191,6 +194,17 @@ func isConfiguredAccessoryStatus(cfg *config.Config, observed ContainerStatus) b
 	return false
 }
 
+func containerStatusFor(cfg *config.Config, envName string, item ObservedContainer) ContainerStatus {
+	status := containerStatus(item)
+	if isManagedCaddyContainer(cfg, envName, item.Container) {
+		status.Kind = "ingress"
+		status.Service = ""
+		status.Replica = 0
+		status.Release = ""
+	}
+	return status
+}
+
 func containerStatus(item ObservedContainer) ContainerStatus {
 	labels := item.Container.Labels
 	replica, _ := strconv.Atoi(labels[docker.LabelReplica])
@@ -214,6 +228,20 @@ func containerStatus(item ObservedContainer) ContainerStatus {
 		Release:   labels[docker.LabelRelease],
 		Labels:    labels,
 	}
+}
+
+func isManagedCaddyContainer(cfg *config.Config, envName string, container docker.ContainerSummary) bool {
+	labels := container.Labels
+	if !matchesShipScope(cfg, envName, labels) {
+		return false
+	}
+	if container.Names == CaddyContainerName(cfg.Project, envName) || container.Names == "ship_caddy" {
+		return true
+	}
+	return labels[docker.LabelService] == "caddy" &&
+		labels[docker.LabelReplica] == "" &&
+		labels[docker.LabelRelease] == "" &&
+		labels[docker.LabelAccessory] == ""
 }
 
 func sortContainerStatuses(statuses []ContainerStatus) {

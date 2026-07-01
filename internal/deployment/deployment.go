@@ -57,6 +57,9 @@ type Action struct {
 	IngressPath   string
 	IngressConfig string
 	IngressHosts  []scheduler.Host
+	CaddyImage    string
+	CaddyName     string
+	CaddyLabels   map[string]string
 	DrainTimeout  time.Duration
 }
 
@@ -259,6 +262,9 @@ func BuildActions(input PlanInput) ([]Action, error) {
 			IngressPath:   ingressPath,
 			IngressConfig: caddyfile,
 			IngressHosts:  ingress.HostsFor(input.Config, inputHosts(input.Environment, input.Hosts), placements),
+			CaddyImage:    caddyImage(input.Config),
+			CaddyName:     CaddyContainerName(input.Config.Project, input.EnvName),
+			CaddyLabels:   CaddyLabels(input.Config.Project, input.EnvName),
 		})
 	} else {
 		shouldClear, err := shouldClearIngress(ingressPath)
@@ -270,6 +276,9 @@ func BuildActions(input PlanInput) ([]Action, error) {
 				Kind:         ActionIngress,
 				IngressPath:  ingressPath,
 				IngressHosts: clearIngressHosts(input),
+				CaddyImage:   caddyImage(input.Config),
+				CaddyName:    CaddyContainerName(input.Config.Project, input.EnvName),
+				CaddyLabels:  CaddyLabels(input.Config.Project, input.EnvName),
 			})
 		}
 	}
@@ -423,13 +432,8 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 
 	var reloaded []scheduler.Host
 	for _, host := range action.IngressHosts {
-		params := agent.CaddyReloadParams{
-			Config:   action.IngressConfig,
-			Validate: true,
-			Clear:    strings.TrimSpace(action.IngressConfig) == "",
-		}
-		if err := agentFor(host).Call(ctx, "caddy_reload", params, nil); err != nil {
-			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, agentFor); rollbackErr != nil {
+		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
+			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
 				return fmt.Errorf("reload ingress on %s: %w; additionally failed to roll back ingress: %v", host.Name, err, rollbackErr)
 			}
 			return fmt.Errorf("reload ingress on %s: %w", host.Name, err)
@@ -438,13 +442,13 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 	}
 
 	if err := os.MkdirAll(filepath.Dir(action.IngressPath), 0o755); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
 			return fmt.Errorf("prepare ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("prepare ingress state: %w", err)
 	}
 	if err := os.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
 			return fmt.Errorf("write ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("write ingress state: %w", err)
@@ -517,18 +521,15 @@ func hostsByName(byName map[string]scheduler.Host) []scheduler.Host {
 	return hosts
 }
 
-func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous string, hadPrevious bool, agentFor AgentFactory) error {
+func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous string, hadPrevious bool, base Action, agentFor AgentFactory) error {
 	if !hadPrevious {
 		return nil
 	}
 	var errs []string
 	for _, host := range hosts {
-		params := agent.CaddyReloadParams{
-			Config:   previous,
-			Validate: true,
-			Clear:    strings.TrimSpace(previous) == "",
-		}
-		if err := agentFor(host).Call(ctx, "caddy_reload", params, nil); err != nil {
+		action := base
+		action.IngressConfig = previous
+		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", host.Name, err))
 		}
 	}
@@ -536,6 +537,73 @@ func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous 
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action, agentFor AgentFactory) error {
+	client := agentFor(host)
+	if strings.TrimSpace(action.IngressConfig) == "" {
+		if action.CaddyName != "" {
+			if err := client.Call(ctx, "stop_container", map[string]string{"name": action.CaddyName}, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	remotePath := remoteCaddyfilePath(action.IngressPath)
+	if err := client.Call(ctx, "write_file", agent.WriteFileParams{
+		Path:    remotePath,
+		Content: action.IngressConfig,
+		Mode:    0o644,
+	}, nil); err != nil {
+		return err
+	}
+	image := action.CaddyImage
+	if image == "" {
+		image = config.DefaultCaddyImage
+	}
+	name := action.CaddyName
+	if name == "" {
+		name = "ship_caddy"
+	}
+	args := []string{
+		"-p", "80:80",
+		"-p", "443:443",
+		"-v", remotePath + ":/etc/caddy/Caddyfile:ro",
+	}
+	return client.Call(ctx, "run_container", agent.RunContainerParams{
+		Name:    name,
+		Image:   image,
+		Command: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile",
+		Args:    args,
+		Labels:  action.CaddyLabels,
+	}, nil)
+}
+
+func remoteCaddyfilePath(localPath string) string {
+	name := filepath.Base(localPath)
+	if name == "." || name == string(filepath.Separator) || strings.TrimSpace(name) == "" {
+		name = "Caddyfile"
+	}
+	return filepath.Join(config.RemoteStateDir, "ingress", name)
+}
+
+func caddyImage(cfg *config.Config) string {
+	if cfg != nil && strings.TrimSpace(cfg.Ingress.Caddy.Image) != "" {
+		return cfg.Ingress.Caddy.Image
+	}
+	return config.DefaultCaddyImage
+}
+
+func CaddyContainerName(project, envName string) string {
+	return strings.Join([]string{"ship", safeNamePart(project), safeNamePart(envName), "caddy"}, "_")
+}
+
+func CaddyLabels(project, envName string) map[string]string {
+	return map[string]string{
+		docker.LabelProject:     safeLabelValue(project),
+		docker.LabelEnvironment: safeLabelValue(envName),
+		docker.LabelService:     "caddy",
+	}
 }
 
 func ContainerName(project, envName, service string, replica int, release string) string {

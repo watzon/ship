@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"filippo.io/age"
 	"github.com/watzon/ship/internal/config"
 )
 
@@ -100,6 +102,52 @@ func TestDiffClassifiesMissingChangedAndExtraDigests(t *testing.T) {
 	}
 	if strings.Join(diff.Extra, ",") != "OLD" {
 		t.Fatalf("extra = %#v", diff.Extra)
+	}
+}
+
+func TestRenderForEnvUsesEncryptedStoreDotenvAndEnvPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityFile := filepath.Join(dir, "identity.txt")
+	if err := os.WriteFile(identityFile, []byte(identity.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(dir, "override.env")
+	if err := os.WriteFile(envFile, []byte("SHIP_TEST_DOTENV=from-dotenv\nSHIP_TEST_ENV=from-dotenv\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := SourceOptions{
+		EnvName:      "production",
+		StateDir:     dir,
+		IdentityFile: identityFile,
+		EnvFiles:     []string{envFile},
+	}
+	if err := InitStore(opts, identity.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStoredSecret(opts, "", "SHIP_TEST_STORE", "from-store"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStoredSecret(opts, "", "SHIP_TEST_DOTENV", "from-store"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHIP_TEST_ENV", "from-env")
+	cfg := &config.Config{Secrets: []string{"SHIP_TEST_STORE", "SHIP_TEST_DOTENV", "SHIP_TEST_ENV"}}
+	rendered, err := RenderForEnv(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		"SHIP_TEST_STORE=from-store",
+		"SHIP_TEST_DOTENV=from-dotenv",
+		"SHIP_TEST_ENV=from-env",
+	} {
+		if !strings.Contains(rendered.Content, needle) {
+			t.Fatalf("rendered content missing %q:\n%s", needle, rendered.Content)
+		}
 	}
 }
 

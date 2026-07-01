@@ -302,7 +302,7 @@ func testConfig(t *testing.T, explicitHosts []string) (*config.Config, string) {
 		Registry: "ghcr.io/acme/example",
 		Environments: map[string]config.Environment{
 			"production": {
-				Provider: config.ProviderConfig{Hetzner: &config.HetznerConfig{Location: "ash", ServerType: "cpx31", Image: "ubuntu-24.04"}},
+				Provider: config.ProviderConfig{Hetzner: &config.HetznerConfig{Location: "ash", ServerType: "cpx31", Image: "ubuntu-24.04", SSHAllowedCIDRs: []string{"0.0.0.0/0"}}},
 				Hosts:    config.HostsConfig{Pools: map[string]config.Pool{"web": pool}},
 			},
 		},

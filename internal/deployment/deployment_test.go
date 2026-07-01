@@ -276,6 +276,42 @@ func TestAggregateStatusKeepsConfiguredAccessoryObservedWithoutDrift(t *testing.
 	}
 }
 
+func TestAggregateStatusClassifiesManagedCaddyAsIngress(t *testing.T) {
+	cfg := testConfig()
+	env := cfg.Environments["production"]
+	report, err := AggregateStatus(StatusInput{
+		Config:         cfg,
+		Environment:    env,
+		EnvName:        "production",
+		CurrentRelease: "new",
+		Observed: []ObservedContainer{
+			statusObserved("web-1", "web", 1, "new", "Up 10 seconds"),
+			statusCaddyObserved("web-1", "Up 5 seconds"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Extra != 0 || report.Summary.Drift {
+		t.Fatalf("summary = %+v", report.Summary)
+	}
+	if len(report.ExtraObserved) != 0 {
+		t.Fatalf("extra observed = %+v", report.ExtraObserved)
+	}
+	foundIngress := false
+	for _, observed := range report.Observed {
+		if observed.Kind == "ingress" && observed.Name == CaddyContainerName("demo", "production") {
+			foundIngress = true
+			if observed.Service != "" || observed.Replica != 0 || observed.Release != "" {
+				t.Fatalf("ingress status retained service drift fields: %+v", observed)
+			}
+		}
+	}
+	if !foundIngress {
+		t.Fatalf("observed did not include ingress caddy: %+v", report.Observed)
+	}
+}
+
 func TestBuildActionsStopsZeroScaleAndRemovedServiceContainers(t *testing.T) {
 	cfg := testConfig()
 	web := cfg.Services["web"]
@@ -375,13 +411,13 @@ func TestBuildAndExecuteActionsClearsStaleIngressWhenCurrentConfigIsEmpty(t *tes
 	if string(data) != "" {
 		t.Fatalf("local caddyfile = %q, want cleared", data)
 	}
-	if !reflect.DeepEqual(fake.reloads, []string{""}) {
-		t.Fatalf("reloads = %#v, want empty reload", fake.reloads)
+	if len(fake.reloads) != 0 {
+		t.Fatalf("reloads = %#v, want none for clear", fake.reloads)
 	}
-	if !reflect.DeepEqual(fake.clears, []bool{true}) {
-		t.Fatalf("clears = %#v, want generated clear", fake.clears)
+	if len(fake.clears) != 0 {
+		t.Fatalf("clears = %#v, want none for clear", fake.clears)
 	}
-	if !reflect.DeepEqual(fake.validated, []bool{true}) {
+	if len(fake.validated) != 0 {
 		t.Fatalf("validated = %#v", fake.validated)
 	}
 }
@@ -671,6 +707,23 @@ func statusAccessoryObserved(host, name, status string) ObservedContainer {
 	}
 }
 
+func statusCaddyObserved(host, status string) ObservedContainer {
+	return ObservedContainer{
+		Host: scheduler.Host{Name: host, Pool: "web", User: "root"},
+		Container: docker.ContainerSummary{
+			Names:  CaddyContainerName("demo", "production"),
+			Image:  "caddy:2",
+			Status: status,
+			Labels: map[string]string{
+				docker.LabelManagedBy:   docker.LabelManagedByValue,
+				docker.LabelProject:     "demo",
+				docker.LabelEnvironment: "production",
+				docker.LabelService:     "caddy",
+			},
+		},
+	}
+}
+
 type fakeAgent struct {
 	methods []string
 }
@@ -736,6 +789,15 @@ type ingressAgent struct {
 
 func (f *ingressAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
+	case "write_file":
+		p := params.(agent.WriteFileParams)
+		f.reloads = append(f.reloads, p.Content)
+		f.validated = append(f.validated, true)
+		f.clears = append(f.clears, strings.TrimSpace(p.Content) == "")
+	case "run_container":
+		if f.failReload {
+			return fmt.Errorf("reload failed on %s", f.host)
+		}
 	case "caddy_reload":
 		p := params.(agent.CaddyReloadParams)
 		f.reloads = append(f.reloads, p.Config)
@@ -751,7 +813,7 @@ func (f *ingressAgent) Call(ctx context.Context, method string, params any, out 
 		if result, ok := out.(*agent.HealthCheckResult); ok {
 			*result = agent.HealthCheckResult{OK: true}
 		}
-	case "run_container", "pull", "stop_container", "list_ship_containers":
+	case "pull", "stop_container", "list_ship_containers":
 		return nil
 	default:
 		return fmt.Errorf("unexpected method %s", method)

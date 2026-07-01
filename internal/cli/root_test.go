@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
 	accessorypkg "github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
@@ -191,6 +192,14 @@ func TestProvisionApplyWithConfigWritesHostFactsNextToConfig(t *testing.T) {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
 		}
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"networks": []any{}})
+		case r.Method == http.MethodPost && r.URL.Path == "/networks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"network": map[string]any{"id": 300, "name": "ship-demo-production-network"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/firewalls":
+			_ = json.NewEncoder(w).Encode(map[string]any{"firewalls": []any{}})
+		case r.Method == http.MethodPost && r.URL.Path == "/firewalls":
+			_ = json.NewEncoder(w).Encode(map[string]any{"firewall": map[string]any{"id": 400, "name": "ship-demo-production-firewall"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/servers":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"servers": []any{},
@@ -1486,7 +1495,7 @@ func TestDeployWritesRemoteSecretFileAndStoresOnlyDigests(t *testing.T) {
 	if err := json.Unmarshal(data, &release); err != nil {
 		t.Fatal(err)
 	}
-	if release.SecretDigests["SHIP_TEST_DATABASE_URL"] != secretspkg.Digest(secretValue) {
+	if release.SecretDigests["service-web:SHIP_TEST_DATABASE_URL"] != secretspkg.Digest(secretValue) {
 		t.Fatalf("secret digests = %+v", release.SecretDigests)
 	}
 }
@@ -1528,7 +1537,7 @@ func TestDeployWritesRemoteReleaseStateToEveryHostWithoutSecretValues(t *testing
 		if strings.Contains(string(data), secretValue) {
 			t.Fatalf("remote release metadata leaked secret value: %s", data)
 		}
-		if write.Release.SecretDigests["SHIP_TEST_DATABASE_URL"] != secretspkg.Digest(secretValue) {
+		if write.Release.SecretDigests["service-web:SHIP_TEST_DATABASE_URL"] != secretspkg.Digest(secretValue) {
 			t.Fatalf("secret digests = %+v", write.Release.SecretDigests)
 		}
 		if write.Release.Images["web"] != digestRef {
@@ -1628,6 +1637,7 @@ func TestStatusKeepsConfiguredAccessoryObservedWithoutExtraDrift(t *testing.T) {
 		"web-1": {
 			serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds"),
 			accessoryContainer("postgres", "web-1", "Up 5 seconds"),
+			caddyContainer("web-1", "Up 5 seconds"),
 		},
 	}
 	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
@@ -1652,13 +1662,23 @@ func TestStatusKeepsConfiguredAccessoryObservedWithoutExtraDrift(t *testing.T) {
 		t.Fatalf("extra observed = %+v", view.ExtraObserved)
 	}
 	foundAccessory := false
+	foundIngress := false
 	for _, observed := range view.Observed {
 		if observed.Accessory == "postgres" && observed.Kind == "accessory" {
 			foundAccessory = true
 		}
+		if observed.Kind == "ingress" && observed.Name == deployment.CaddyContainerName("demo", "production") {
+			foundIngress = true
+			if observed.Service != "" || observed.Replica != 0 || observed.Release != "" {
+				t.Fatalf("ingress status retained service drift fields: %+v", observed)
+			}
+		}
 	}
 	if !foundAccessory {
 		t.Fatalf("observed did not include configured accessory: %+v", view.Observed)
+	}
+	if !foundIngress {
+		t.Fatalf("observed did not include managed ingress: %+v", view.Observed)
 	}
 }
 
@@ -2502,6 +2522,62 @@ func TestSecretsRenderDryRunRedactsValues(t *testing.T) {
 	}
 }
 
+func TestSecretsInitSetListExportWorkflow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityFile := filepath.Join(dir, "ship-secrets.identity")
+	if err := os.WriteFile(identityFile, []byte(identity.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := &options{configPath: path, secretsIdentityFile: identityFile}
+	runSecrets := func(args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		cmd := secretsCmd(opts)
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("ship secrets %s: %v\n%s", strings.Join(args, " "), err, out.String())
+		}
+		return out.String()
+	}
+
+	initOut := runSecrets("init", "production", "--recipient", identity.Recipient().String())
+	if !strings.Contains(initOut, filepath.Join(dir, ".ship", "secrets", "production.age")) {
+		t.Fatalf("init output = %q", initOut)
+	}
+	t.Setenv("DATABASE_URL", "postgres://user:pass@example/db")
+	runSecrets("set", "production", "DATABASE_URL")
+	runSecrets("set", "production", "SESSION_SECRET", "--value", "keyboard-cat")
+
+	listOut := runSecrets("list", "production")
+	if listOut != "DATABASE_URL\nSESSION_SECRET\n" {
+		t.Fatalf("list output = %q", listOut)
+	}
+	exportOut := runSecrets("export", "production")
+	for _, needle := range []string{"DATABASE_URL=postgres://user:pass@example/db", "SESSION_SECRET=keyboard-cat"} {
+		if !strings.Contains(exportOut, needle) {
+			t.Fatalf("export output missing %q:\n%s", needle, exportOut)
+		}
+	}
+	redactedOut := runSecrets("export", "production", "--redacted")
+	if strings.Contains(redactedOut, "postgres://") || strings.Contains(redactedOut, "keyboard-cat") {
+		t.Fatalf("redacted export leaked secret values:\n%s", redactedOut)
+	}
+	for _, needle := range []string{"DATABASE_URL=<redacted:", "SESSION_SECRET=<redacted:"} {
+		if !strings.Contains(redactedOut, needle) {
+			t.Fatalf("redacted export missing %q:\n%s", needle, redactedOut)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".ship", "secrets", "production.recipients")); err != nil {
+		t.Fatalf("recipients file missing: %v", err)
+	}
+}
+
 func TestSecretsDiffReportsDriftWithoutValues(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -2516,8 +2592,8 @@ func TestSecretsDiffReportsDriftWithoutValues(t *testing.T) {
 		Environment: "production",
 		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
 		SecretDigests: map[string]string{
-			"SHIP_TEST_DATABASE_URL": secretspkg.Digest("old-secret"),
-			"OLD_SECRET":             secretspkg.Digest("old"),
+			"service-web:SHIP_TEST_DATABASE_URL": secretspkg.Digest("old-secret"),
+			"service-web:OLD_SECRET":             secretspkg.Digest("old"),
 		},
 		CreatedAt: time.Unix(30, 0),
 	}); err != nil {
@@ -2533,7 +2609,7 @@ func TestSecretsDiffReportsDriftWithoutValues(t *testing.T) {
 		t.Fatalf("expected drift error, got %v", err)
 	}
 	text := out.String()
-	for _, needle := range []string{"changed SHIP_TEST_DATABASE_URL", "extra OLD_SECRET"} {
+	for _, needle := range []string{"changed service-web:SHIP_TEST_DATABASE_URL", "extra service-web:OLD_SECRET"} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("diff output missing %q:\n%s", needle, text)
 		}
@@ -2564,6 +2640,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2589,6 +2666,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2627,6 +2705,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2659,6 +2738,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2690,6 +2770,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2719,6 +2800,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         web:
@@ -2752,6 +2834,7 @@ environments:
         location: ash
         server_type: cpx31
         image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
     hosts:
       pools:
         data:
@@ -2836,6 +2919,21 @@ func serviceContainer(host, service string, replica int, release, status string)
 			docker.LabelService:     service,
 			docker.LabelReplica:     strconv.Itoa(replica),
 			docker.LabelRelease:     release,
+		},
+	}
+}
+
+func caddyContainer(host, status string) docker.ContainerSummary {
+	return docker.ContainerSummary{
+		ID:     host + "-caddy",
+		Image:  "caddy:2",
+		Names:  deployment.CaddyContainerName("demo", "production"),
+		Status: status,
+		Labels: map[string]string{
+			docker.LabelManagedBy:   docker.LabelManagedByValue,
+			docker.LabelProject:     "demo",
+			docker.LabelEnvironment: "production",
+			docker.LabelService:     "caddy",
 		},
 	}
 }

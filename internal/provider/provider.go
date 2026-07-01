@@ -35,6 +35,8 @@ type Host struct {
 	Pool          string
 	PublicAddress string
 	Labels        map[string]string
+	NetworkIDs    []int64
+	FirewallIDs   []int64
 }
 
 type ReconcileResult struct {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,12 +72,45 @@ func TestReconcileCreatesMissingServers(t *testing.T) {
 	if len(create.SSHKeys) != 1 || create.SSHKeys[0] != "ship-key" {
 		t.Fatalf("ssh_keys = %+v", create.SSHKeys)
 	}
+	if len(api.networks) != 1 || len(api.firewalls) != 1 {
+		t.Fatalf("network/firewall creates = %d/%d", len(api.networks), len(api.firewalls))
+	}
+	if len(create.Networks) != 1 || create.Networks[0] != 300 {
+		t.Fatalf("networks = %+v", create.Networks)
+	}
+	if len(create.Firewalls) != 1 || create.Firewalls[0]["firewall"] != 400 {
+		t.Fatalf("firewalls = %+v", create.Firewalls)
+	}
 	if result.Created[0].ID == "" || result.Created[0].PublicAddress == "" {
 		t.Fatalf("created server missing facts: %+v", result.Created[0])
 	}
 }
 
 func TestReconcileLeavesMatchingServersUnchanged(t *testing.T) {
+	existing := []Server{{
+		ID:         10,
+		Name:       "web-1",
+		Labels:     shipLabels("demo", "production", "web"),
+		PrivateNet: []PrivateNet{{Network: 300}},
+		PublicNet:  PublicNet{Firewalls: []ServerFirewall{{ID: 400, Status: "applied"}}},
+	}}
+	api := newFakeHetznerAPI(t, existing)
+	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Existing) != 1 || result.Existing[0].ID != "10" {
+		t.Fatalf("existing = %+v", result.Existing)
+	}
+	if len(result.Created) != 0 || len(api.creates) != 0 {
+		t.Fatalf("created result=%+v requests=%+v", result.Created, api.creates)
+	}
+	if len(api.networkAttachments) != 0 || len(api.firewallApplications) != 0 {
+		t.Fatalf("attachment repairs = %+v/%+v", api.networkAttachments, api.firewallApplications)
+	}
+}
+
+func TestReconcileRepairsExistingServerNetworkAndFirewallAttachments(t *testing.T) {
 	existing := []Server{{
 		ID:     10,
 		Name:   "web-1",
@@ -90,8 +124,33 @@ func TestReconcileLeavesMatchingServersUnchanged(t *testing.T) {
 	if len(result.Existing) != 1 || result.Existing[0].ID != "10" {
 		t.Fatalf("existing = %+v", result.Existing)
 	}
-	if len(result.Created) != 0 || len(api.creates) != 0 {
-		t.Fatalf("created result=%+v requests=%+v", result.Created, api.creates)
+	if got := strings.Join(api.networkAttachments, ","); got != "10:300" {
+		t.Fatalf("network attachments = %q", got)
+	}
+	if got := strings.Join(api.firewallApplications, ","); got != "400:10" {
+		t.Fatalf("firewall applications = %q", got)
+	}
+}
+
+func TestReconcileSkipsDisabledNetworkAndFirewallAttachments(t *testing.T) {
+	existing := []Server{{
+		ID:     10,
+		Name:   "web-1",
+		Labels: shipLabels("demo", "production", "web"),
+	}}
+	env := testEnvironment(1)
+	disabled := false
+	env.Provider.Hetzner.Network.Enabled = &disabled
+	env.Provider.Hetzner.Firewall.Enabled = &disabled
+	api := newFakeHetznerAPI(t, existing)
+	if _, err := api.client().Reconcile(context.Background(), "demo", "production", env); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.networks) != 0 || len(api.firewalls) != 0 {
+		t.Fatalf("network/firewall creates = %d/%d", len(api.networks), len(api.firewalls))
+	}
+	if len(api.networkAttachments) != 0 || len(api.firewallApplications) != 0 {
+		t.Fatalf("attachment repairs = %+v/%+v", api.networkAttachments, api.firewallApplications)
 	}
 }
 
@@ -210,10 +269,11 @@ func TestDecommissionDeletesManagedEnvironmentServers(t *testing.T) {
 func testEnvironment(count int) config.Environment {
 	return config.Environment{
 		Provider: config.ProviderConfig{Hetzner: &config.HetznerConfig{
-			Location:   "ash",
-			ServerType: "cpx31",
-			Image:      "ubuntu-24.04",
-			SSHKeys:    []string{"ship-key"},
+			Location:        "ash",
+			ServerType:      "cpx31",
+			Image:           "ubuntu-24.04",
+			SSHKeys:         []string{"ship-key"},
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
 		}},
 		Hosts: config.HostsConfig{Pools: map[string]config.Pool{
 			"web": {Count: count},
@@ -231,21 +291,52 @@ func shipLabels(project, environment, pool string) map[string]string {
 }
 
 type fakeHetznerAPI struct {
-	server   *httptest.Server
-	existing []Server
-	creates  []createServerRequest
-	deletes  []string
-	selector string
-	nextID   int64
+	server               *httptest.Server
+	existing             []Server
+	creates              []createServerRequest
+	networks             []createNetworkRequest
+	firewalls            []createFirewallRequest
+	networkAttachments   []string
+	firewallApplications []string
+	deletes              []string
+	selector             string
+	nextID               int64
 }
 
 type createServerRequest struct {
-	Name       string            `json:"name"`
-	ServerType string            `json:"server_type"`
-	Image      string            `json:"image"`
-	Location   string            `json:"location"`
-	Labels     map[string]string `json:"labels"`
-	SSHKeys    []string          `json:"ssh_keys"`
+	Name       string             `json:"name"`
+	ServerType string             `json:"server_type"`
+	Image      string             `json:"image"`
+	Location   string             `json:"location"`
+	Labels     map[string]string  `json:"labels"`
+	SSHKeys    []string           `json:"ssh_keys"`
+	Networks   []int64            `json:"networks"`
+	Firewalls  []map[string]int64 `json:"firewalls"`
+}
+
+type createNetworkRequest struct {
+	Name    string            `json:"name"`
+	IPRange string            `json:"ip_range"`
+	Labels  map[string]string `json:"labels"`
+}
+
+type createFirewallRequest struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+	Rules  []map[string]any  `json:"rules"`
+}
+
+type attachNetworkRequest struct {
+	Network int64 `json:"network"`
+}
+
+type applyFirewallRequest struct {
+	ApplyTo []struct {
+		Type   string `json:"type"`
+		Server struct {
+			ID int64 `json:"id"`
+		} `json:"server"`
+	} `json:"apply_to"`
 }
 
 func newFakeHetznerAPI(t *testing.T, existing []Server) *fakeHetznerAPI {
@@ -256,6 +347,32 @@ func newFakeHetznerAPI(t *testing.T, existing []Server) *fakeHetznerAPI {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
 		}
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/networks":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"networks": []Network{},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/networks":
+			var req createNetworkRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			api.networks = append(api.networks, req)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"network": Network{ID: 300, Name: req.Name, Labels: req.Labels},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/firewalls":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"firewalls": []Firewall{},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/firewalls":
+			var req createFirewallRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			api.firewalls = append(api.firewalls, req)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"firewall": Firewall{ID: 400, Name: req.Name, Labels: req.Labels},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/servers":
 			api.selector = r.URL.Query().Get("label_selector")
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -282,6 +399,29 @@ func newFakeHetznerAPI(t *testing.T, existing []Server) *fakeHetznerAPI {
 					}},
 				},
 				"action": Action{ID: id, Status: "running"},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/actions/attach_to_network"):
+			var req attachNetworkRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/servers/"), "/actions/attach_to_network")
+			api.networkAttachments = append(api.networkAttachments, id+":"+strconv.FormatInt(req.Network, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"action": Action{ID: 500 + int64(len(api.networkAttachments)), Status: "running"},
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/actions/apply_to_resources"):
+			var req applyFirewallRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			firewallID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/firewalls/"), "/actions/apply_to_resources")
+			if len(req.ApplyTo) != 1 || req.ApplyTo[0].Type != "server" {
+				t.Fatalf("apply_to = %+v", req.ApplyTo)
+			}
+			api.firewallApplications = append(api.firewallApplications, firewallID+":"+strconv.FormatInt(req.ApplyTo[0].Server.ID, 10))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"actions": []Action{{ID: 600 + int64(len(api.firewallApplications)), Status: "running"}},
 			})
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/actions/"):
 			_ = json.NewEncoder(w).Encode(map[string]any{

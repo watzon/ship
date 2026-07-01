@@ -32,8 +32,10 @@ import (
 )
 
 type options struct {
-	configPath string
-	dryRun     bool
+	configPath          string
+	dryRun              bool
+	envFiles            []string
+	secretsIdentityFile string
 }
 
 var newEnvironmentProvider = providers.ForEnvironment
@@ -86,6 +88,8 @@ func Execute() error {
 	}
 	root.PersistentFlags().StringVarP(&opts.configPath, "config", "c", config.DefaultConfigFile, "path to ship.yml")
 	root.PersistentFlags().BoolVar(&opts.dryRun, "dry-run", false, "print the intended operation without mutating remote state")
+	root.PersistentFlags().StringArrayVar(&opts.envFiles, "env-file", nil, "load secrets from a dotenv file (repeatable)")
+	root.PersistentFlags().StringVar(&opts.secretsIdentityFile, "secrets-identity-file", "", "age identity file for encrypted Ship secrets")
 
 	root.AddCommand(initCmd(opts))
 	root.AddCommand(doctorCmd(opts))
@@ -120,13 +124,53 @@ func initCmd(opts *options) *cobra.Command {
 			if err := os.MkdirAll(config.LocalStateDir, 0o755); err != nil {
 				return err
 			}
+			if err := os.MkdirAll(filepath.Join(config.LocalStateDir, "secrets"), 0o755); err != nil {
+				return err
+			}
 			if err := os.WriteFile(filepath.Join(config.LocalStateDir, "secrets.example"), []byte("DATABASE_URL=\n"), 0o644); err != nil {
+				return err
+			}
+			if err := ensureShipGitignore(); err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "created %s and %s/\n", opts.configPath, config.LocalStateDir)
 			return nil
 		},
 	}
+}
+
+func ensureShipGitignore() error {
+	const block = `
+.ship/*
+!.ship/secrets/
+!.ship/secrets/*.age
+!.ship/secrets/*.recipients
+.ship/secrets/*.env
+.ship/secrets/*.identity
+.ship/secrets/*key*
+`
+	data, err := os.ReadFile(".gitignore")
+	if errors.Is(err, os.ErrNotExist) {
+		return os.WriteFile(".gitignore", []byte(strings.TrimPrefix(block, "\n")), 0o644)
+	}
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(data), "!.ship/secrets/*.age") {
+		return nil
+	}
+	f, err := os.OpenFile(".gitignore", os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		if _, err := f.WriteString("\n"); err != nil {
+			return err
+		}
+	}
+	_, err = f.WriteString(block)
+	return err
 }
 
 func doctorCmd(opts *options) *cobra.Command {
@@ -189,10 +233,11 @@ func provisionCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
 			if !yes && !opts.dryRun {
 				return fmt.Errorf("provision apply requires --yes (or --dry-run) before creating servers")
 			}
@@ -269,10 +314,11 @@ func provisionCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
 			if !decommissionYes && !opts.dryRun {
 				return fmt.Errorf("provision decommission requires --yes (or --dry-run) before deleting servers")
 			}
@@ -452,7 +498,7 @@ func environmentContext(opts *options, envName string) (*config.Config, config.E
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
-	env, err := cfg.Environment(envName)
+	resolved, env, err := cfg.ResolveEnvironment(envName)
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
@@ -460,7 +506,21 @@ func environmentContext(opts *options, envName string) (*config.Config, config.E
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
-	return cfg, env, state.NewStore(stateDir), nil
+	return resolved, env, state.NewStore(stateDir), nil
+}
+
+func secretSourceOptions(opts *options, envName string) (secrets.SourceOptions, error) {
+	stateDir, err := localStateDirForConfig(opts.configPath)
+	if err != nil {
+		return secrets.SourceOptions{}, err
+	}
+	return secrets.SourceOptions{
+		EnvName:      envName,
+		ConfigPath:   opts.configPath,
+		StateDir:     stateDir,
+		EnvFiles:     append([]string(nil), opts.envFiles...),
+		IdentityFile: opts.secretsIdentityFile,
+	}, nil
 }
 
 type hostFactKey struct {
@@ -881,17 +941,22 @@ func deployCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
 			plan, err := planner.DeploymentPlan(cfg, args[0])
 			if err != nil {
 				return err
 			}
 			fmt.Fprint(cmd.OutOrStdout(), plan.String())
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
 			if opts.dryRun {
-				if _, err := secrets.Verify(cfg); err != nil {
+				if _, err := secrets.VerifyForEnv(cfg, secretOpts); err != nil {
 					return err
 				}
 				stateDir, err := localStateDirForConfig(opts.configPath)
@@ -910,7 +975,7 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "started"})
-			secretFile, err := secrets.RenderEnvFile(cfg)
+			secretFiles, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Message: err.Error()})
 				return err
@@ -926,7 +991,7 @@ func deployCmd(opts *options) *cobra.Command {
 				ID:            releaseID,
 				Environment:   args[0],
 				Images:        images,
-				SecretDigests: secretFile.Digests,
+				SecretDigests: secretFiles.Digests,
 				CreatedAt:     createdAt,
 				Status:        state.ReleaseStatusPending,
 			}
@@ -944,13 +1009,13 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
-			secretEnvFiles, secretWrites, err := serviceSecretEnvFiles(cfg, hosts, args[0], secretFile)
+			secretEnvFiles, secretWrites, err := serviceSecretEnvFiles(cfg, hosts, args[0], secretFiles)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_secret_write", Status: "started", Release: releaseID, Message: fmt.Sprintf("writes=%d", len(secretWrites))})
-			if err := writeRemoteSecretFiles(ctx, secretWrites, secretFile.Content); err != nil {
+			if err := writeRemoteSecretFiles(ctx, secretWrites); err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_secret_write", Status: "failed", Release: releaseID, Message: err.Error()})
 				failedRelease, markErr := store.MarkReleaseFailed(releaseID, err.Error(), deployNow())
 				if markErr != nil {
@@ -1123,6 +1188,11 @@ func scaleCmd(opts *options) *cobra.Command {
 				return err
 			}
 			envName := args[0]
+			resolved, _, err := cfg.ResolveEnvironment(envName)
+			if err != nil {
+				return err
+			}
+			cfg = resolved
 			for _, pair := range args[1:] {
 				parts := strings.SplitN(pair, "=", 2)
 				if len(parts) != 2 {
@@ -1193,10 +1263,11 @@ func logsCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
 			if _, ok := cfg.Services[args[1]]; !ok {
 				return fmt.Errorf("unknown service %q", args[1])
 			}
@@ -1409,10 +1480,11 @@ func rollbackCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
 			stateDir, err := localStateDirForConfig(opts.configPath)
 			if err != nil {
 				return err
@@ -1491,7 +1563,11 @@ func rollbackCmd(opts *options) *cobra.Command {
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "rollback", Status: "started", Release: release.ID})
 			recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_attempt", Status: "started", Release: release.ID, Message: rollbackAttemptMessage(currentReleaseID)})
-			secretFile, err := secrets.RenderEnvFile(cfg)
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_attempt", Status: "failed", Release: release.ID, Message: rollbackAttemptFailureMessage(currentReleaseID, err)})
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback", Status: "failed", Release: release.ID, Message: err.Error()})
@@ -1504,7 +1580,7 @@ func rollbackCmd(opts *options) *cobra.Command {
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_secret_write", Status: "started", Release: release.ID, Message: fmt.Sprintf("writes=%d", len(secretWrites))})
-			if err := writeRemoteSecretFiles(ctx, secretWrites, secretFile.Content); err != nil {
+			if err := writeRemoteSecretFiles(ctx, secretWrites); err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_secret_write", Status: "failed", Release: release.ID, Message: err.Error()})
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_attempt", Status: "failed", Release: release.ID, Message: rollbackAttemptFailureMessage(currentReleaseID, err)})
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback", Status: "failed", Release: release.ID, Message: err.Error()})
@@ -1812,12 +1888,13 @@ func deploymentAgentFactory() deployment.AgentFactory {
 }
 
 type remoteSecretFile struct {
-	Host scheduler.Host
-	Path string
+	Host    scheduler.Host
+	Path    string
+	Content string
 }
 
-func serviceSecretEnvFiles(cfg *config.Config, hosts []scheduler.Host, envName string, rendered secrets.RenderedEnvFile) (map[string]string, []remoteSecretFile, error) {
-	if len(rendered.Digests) == 0 {
+func serviceSecretEnvFiles(cfg *config.Config, hosts []scheduler.Host, envName string, rendered secrets.ScopedRenderedEnvFiles) (map[string]string, []remoteSecretFile, error) {
+	if len(rendered.Scopes) == 0 {
 		return nil, nil, nil
 	}
 	placements, err := scheduler.PlaceServicesOnHosts(cfg, hosts)
@@ -1827,10 +1904,15 @@ func serviceSecretEnvFiles(cfg *config.Config, hosts []scheduler.Host, envName s
 	envFiles := map[string]string{}
 	writesByKey := map[string]remoteSecretFile{}
 	for _, placement := range placements {
-		path := secrets.RemoteEnvFilePath(envName, "service-"+placement.Service)
+		scope := "service-" + placement.Service
+		file, ok := rendered.Scopes[scope]
+		if !ok {
+			continue
+		}
+		path := secrets.RemoteEnvFilePath(envName, scope)
 		envFiles[placement.Service] = path
 		key := placement.Host.Name + "\x00" + path
-		writesByKey[key] = remoteSecretFile{Host: placement.Host, Path: path}
+		writesByKey[key] = remoteSecretFile{Host: placement.Host, Path: path, Content: file.Content}
 	}
 	writes := make([]remoteSecretFile, 0, len(writesByKey))
 	for _, write := range writesByKey {
@@ -1845,16 +1927,18 @@ func serviceSecretEnvFiles(cfg *config.Config, hosts []scheduler.Host, envName s
 	return envFiles, writes, nil
 }
 
-func accessorySecretEnvFile(envName, name string, rendered secrets.RenderedEnvFile) string {
-	if len(rendered.Digests) == 0 {
-		return ""
+func accessorySecretEnvFile(envName, name string, rendered secrets.ScopedRenderedEnvFiles) (string, string) {
+	scope := "accessory-" + name
+	file, ok := rendered.Scopes[scope]
+	if !ok {
+		return "", ""
 	}
-	return secrets.RemoteEnvFilePath(envName, "accessory-"+name)
+	return secrets.RemoteEnvFilePath(envName, scope), file.Content
 }
 
-func writeRemoteSecretFiles(ctx context.Context, writes []remoteSecretFile, content string) error {
+func writeRemoteSecretFiles(ctx context.Context, writes []remoteSecretFile) error {
 	for _, write := range writes {
-		if err := writeRemoteSecretFile(ctx, write.Host, write.Path, content); err != nil {
+		if err := writeRemoteSecretFile(ctx, write.Host, write.Path, write.Content); err != nil {
 			return err
 		}
 	}
@@ -1997,7 +2081,7 @@ func accessoryContext(opts *options, envName string) (*config.Config, config.Env
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
-	env, err := cfg.Environment(envName)
+	resolved, env, err := cfg.ResolveEnvironment(envName)
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
@@ -2005,7 +2089,7 @@ func accessoryContext(opts *options, envName string) (*config.Config, config.Env
 	if err != nil {
 		return nil, config.Environment{}, state.Store{}, err
 	}
-	return cfg, env, state.NewStore(stateDir), nil
+	return resolved, env, state.NewStore(stateDir), nil
 }
 
 func accessoryTargets(cfg *config.Config, args []string) ([]string, error) {
@@ -2024,10 +2108,14 @@ func accessoryTargets(cfg *config.Config, args []string) ([]string, error) {
 }
 
 func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *config.Config, env config.Environment, envName string, store state.Store, names []string) error {
-	var secretFile secrets.RenderedEnvFile
+	var secretFile secrets.ScopedRenderedEnvFiles
 	var err error
 	if !opts.dryRun {
-		secretFile, err = secrets.RenderEnvFile(cfg)
+		secretOpts, err := secretSourceOptions(opts, envName)
+		if err != nil {
+			return err
+		}
+		secretFile, err = secrets.RenderScopedForEnv(cfg, secretOpts)
 		if err != nil {
 			return err
 		}
@@ -2062,8 +2150,8 @@ func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *co
 			return err
 		}
 		client := newDeployAgent(placement.Host)
-		secretEnvFile := accessorySecretEnvFile(envName, name, secretFile)
-		if err := writeRemoteSecretFile(ctx, placement.Host, secretEnvFile, secretFile.Content); err != nil {
+		secretEnvFile, secretContent := accessorySecretEnvFile(envName, name, secretFile)
+		if err := writeRemoteSecretFile(ctx, placement.Host, secretEnvFile, secretContent); err != nil {
 			return err
 		}
 		if err := client.Call(ctx, "pull", map[string]string{"image": acc.Image}, nil); err != nil {
@@ -2322,7 +2410,11 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 		return nil
 	}
 
-	secretFile, err := secrets.RenderEnvFile(cfg)
+	secretOpts, err := secretSourceOptions(opts, envName)
+	if err != nil {
+		return fail(err)
+	}
+	secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 	if err != nil {
 		return fail(err)
 	}
@@ -2341,8 +2433,8 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 	}
 
 	targetClient := newDeployAgent(target)
-	secretEnvFile := accessorySecretEnvFile(envName, name, secretFile)
-	if err := writeRemoteSecretFile(ctx, target, secretEnvFile, secretFile.Content); err != nil {
+	secretEnvFile, secretContent := accessorySecretEnvFile(envName, name, secretFile)
+	if err := writeRemoteSecretFile(ctx, target, secretEnvFile, secretContent); err != nil {
 		return fail(err)
 	}
 	if err := targetClient.Call(ctx, "pull", map[string]string{"image": acc.Image}, nil); err != nil {
@@ -2475,16 +2567,154 @@ func observationHosts(items []accessoryObservation) string {
 }
 
 func secretsCmd(opts *options) *cobra.Command {
-	cmd := &cobra.Command{Use: "secrets", Short: "Verify environment-backed secrets"}
+	cmd := &cobra.Command{Use: "secrets", Short: "Manage and verify Ship secrets"}
+	var initRecipient string
+	initCmd := &cobra.Command{
+		Use:   "init ENV",
+		Short: "Create an encrypted secret store for an environment",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			if err := secrets.InitStore(secretOpts, initRecipient); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "created %s\n", secrets.StorePath(secretOpts))
+			return nil
+		},
+	}
+	initCmd.Flags().StringVar(&initRecipient, "recipient", "", "age recipient for encrypting this environment's secrets")
+	_ = initCmd.MarkFlagRequired("recipient")
+	cmd.AddCommand(initCmd)
+
+	var setValue string
+	setCmd := &cobra.Command{
+		Use:   "set ENV NAME",
+		Short: "Set a secret in the encrypted store",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			value := setValue
+			if value == "" {
+				var ok bool
+				value, ok = os.LookupEnv(args[1])
+				if !ok {
+					return fmt.Errorf("missing --value and environment variable %s", args[1])
+				}
+			}
+			if err := secrets.SetStoredSecret(secretOpts, "", args[1], value); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "set %s in %s\n", args[1], secrets.StorePath(secretOpts))
+			return nil
+		},
+	}
+	setCmd.Flags().StringVar(&setValue, "value", "", "secret value; defaults to environment variable NAME")
+	cmd.AddCommand(setCmd)
+
+	unsetCmd := &cobra.Command{
+		Use:   "unset ENV NAME",
+		Short: "Remove a secret from the encrypted store",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			if err := secrets.UnsetStoredSecret(secretOpts, "", args[1]); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "unset %s in %s\n", args[1], secrets.StorePath(secretOpts))
+			return nil
+		},
+	}
+	cmd.AddCommand(unsetCmd)
+
 	cmd.AddCommand(&cobra.Command{
-		Use:   "verify",
-		Short: "Check required secrets exist in the local environment",
+		Use:   "list ENV",
+		Short: "List encrypted store secret names",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			values, err := secrets.ReadStore(secretOpts)
+			if err != nil {
+				return err
+			}
+			names := make([]string, 0, len(values))
+			for name := range values {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				fmt.Fprintln(cmd.OutOrStdout(), name)
+			}
+			return nil
+		},
+	})
+
+	var exportRedacted bool
+	exportCmd := &cobra.Command{
+		Use:   "export ENV",
+		Short: "Export encrypted store secrets",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			values, err := secrets.ReadStore(secretOpts)
+			if err != nil {
+				return err
+			}
+			names := make([]string, 0, len(values))
+			for name := range values {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				value := values[name]
+				if exportRedacted {
+					value = "<redacted:" + secrets.Digest(value) + ">"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s=%s\n", name, value)
+			}
+			return nil
+		},
+	}
+	exportCmd.Flags().BoolVar(&exportRedacted, "redacted", false, "redact values and show digests")
+	cmd.AddCommand(exportCmd)
+
+	cmd.AddCommand(&cobra.Command{
+		Use:   "verify [ENV]",
+		Short: "Check required secrets exist",
+		Args:  cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
 				return err
 			}
-			checks, err := secrets.Verify(cfg)
+			var checks []secrets.Check
+			if len(args) > 0 {
+				resolved, _, err := cfg.ResolveEnvironment(args[0])
+				if err != nil {
+					return err
+				}
+				secretOpts, err := secretSourceOptions(opts, args[0])
+				if err != nil {
+					return err
+				}
+				checks, err = secrets.VerifyForEnv(resolved, secretOpts)
+			} else {
+				checks, err = secrets.Verify(cfg)
+			}
 			for _, check := range checks {
 				if check.Present {
 					fmt.Fprintf(cmd.OutOrStdout(), "ok   %s digest=%s\n", check.Name, check.Digest)
@@ -2504,10 +2734,15 @@ func secretsCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if _, err := cfg.Environment(args[0]); err != nil {
+			resolved, _, err := cfg.ResolveEnvironment(args[0])
+			if err != nil {
 				return err
 			}
-			rendered, err := secrets.RenderEnvFile(cfg)
+			secretOpts, err := secretSourceOptions(opts, args[0])
+			if err != nil {
+				return err
+			}
+			rendered, err := secrets.RenderScopedForEnv(resolved, secretOpts)
 			if err != nil {
 				return err
 			}
@@ -2550,20 +2785,28 @@ func secretsCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env, err := cfg.Environment(args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
-			rendered, err := secrets.RenderEnvFile(cfg)
+			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
 				return err
 			}
-			if len(rendered.Digests) == 0 {
+			rendered, err := secrets.RenderScopedForEnv(resolved, secretOpts)
+			if err != nil {
+				return err
+			}
+			if len(rendered.Scopes) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "no required secrets")
 				return nil
 			}
-			for _, scope := range secretRenderScopes(cfg, env, args[0]) {
-				fmt.Fprintf(cmd.OutOrStdout(), "# %s\n%s\n", scope, rendered.Redacted)
+			for _, scope := range secretRenderScopes(resolved, env, args[0]) {
+				file, ok := rendered.Scopes[strings.TrimSuffix(filepath.Base(scope), ".env")]
+				if !ok {
+					continue
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "# %s\n%s\n", scope, file.Redacted)
 			}
 			return nil
 		},
