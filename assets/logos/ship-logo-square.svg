@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Ship">
+  <g transform="translate(76.8 153.4) scale(2.115)">
+    <style type="text/css">.cls-1 {fill:#15375A;}
+.cls-2 {fill:#149B94;}
+.cls-3 {fill:#176C7D;}</style>
+    <polygon class="cls-1" points="82.4 2.3 52.9 43.4 82.4 55"/>
+    <polyline class="cls-1" points="2.4 28.2 30.5 85.4 35.3 85.3 79.8 58.8 2.4 28.2"/>
+    <polygon class="cls-2" points="86.9 2.2 86.9 55.1 116.5 43.4"/>
+    <polygon class="cls-2" points="89.3 58.8 133.8 85.3 138.8 85.3 167.1 28.2"/>
+    <polyline class="cls-3" points="84.8 60.9 35.5 85.3 133.6 85.3 84.8 60.9"/>
+    <polygon class="cls-1" points="32 88.9 35 94.8 52.6 94.8 49.4 88.9"/>
+    <polygon class="cls-1" points="53.5 88.9 56.9 94.8 112.6 94.8 115.8 88.9"/>
+    <polygon class="cls-1" points="116.7 94.8 134.3 94.8 137.2 88.9 119.7 88.9"/>
+  </g>
+</svg>

@@ -1,6 +1,6 @@
-# Ship
-
-Ship deploys Docker apps to plain Linux servers. One Go binary, a `ship.yml` config file, and SSH. No Kubernetes.
+<p align="center">
+  <img src="assets/logos/readme-banner.svg" alt="Ship — Deploy Docker apps to plain Linux servers" width="640">
+</p>
 
 The model is Kamal-like: you define host pools, services, and accessories in YAML, provision machines through a cloud provider (or point Ship at hosts you already have), install a small agent over SSH, and roll out releases with health checks and rollback.
 
