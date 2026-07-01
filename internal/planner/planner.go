@@ -10,14 +10,14 @@ import (
 )
 
 type Action struct {
-	Kind    string
-	Target  string
-	Details string
+	Kind    string `json:"kind"`
+	Target  string `json:"target"`
+	Details string `json:"details,omitempty"`
 }
 
 type Plan struct {
-	Environment string
-	Actions     []Action
+	Environment string   `json:"environment"`
+	Actions     []Action `json:"actions"`
 }
 
 func (p Plan) Empty() bool {

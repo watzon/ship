@@ -48,12 +48,51 @@ type ContainerSummary struct {
 }
 
 type BuildOptions struct {
-	ContextDir string
-	Dockerfile string
-	Tag        string
-	BuildArgs  map[string]string
-	Target     string
-	Platform   string
+	ContextDir     string
+	Dockerfile     string
+	Tag            string
+	AdditionalTags []string
+	BuildArgs      map[string]string
+	Target         string
+	Builder        string
+	Buildpack      BuildpackOptions
+	Platform       string
+	Platforms      []string
+	Pull           bool
+	NoCache        bool
+	NoCacheFilter  []string
+	CacheFrom      []string
+	CacheTo        []string
+	Secrets        []string
+	SSH            []string
+	SBOM           string
+	Provenance     string
+	Push           bool
+}
+
+type BuildpackOptions struct {
+	Builder      string
+	Buildpacks   []string
+	Env          map[string]string
+	Descriptor   string
+	Publish      bool
+	PullPolicy   string
+	TrustBuilder bool
+}
+
+func (b BuildpackOptions) Enabled() bool {
+	return strings.TrimSpace(b.Builder) != "" ||
+		len(b.Buildpacks) > 0 ||
+		len(b.Env) > 0 ||
+		strings.TrimSpace(b.Descriptor) != "" ||
+		b.Publish ||
+		strings.TrimSpace(b.PullPolicy) != "" ||
+		b.TrustBuilder
+}
+
+type RegistryAuth struct {
+	Server string          `json:"server"`
+	Auth   json.RawMessage `json:"auth"`
 }
 
 type GitRevisionFunc func(context.Context) (string, error)
@@ -90,6 +129,66 @@ func (c Client) RegistryLoggedIn(ctx context.Context, registry string) error {
 	return fmt.Errorf("no docker credentials configured for %s", host)
 }
 
+func (c Client) RegistryAuth(ctx context.Context, registry string) (RegistryAuth, bool, error) {
+	host, err := registryAuthHost(registry)
+	if err != nil {
+		return RegistryAuth{}, false, err
+	}
+	if isDockerHubOfficialImage(registry, host) {
+		return RegistryAuth{}, false, nil
+	}
+	credentials, err := c.registryCredentials(ctx, host)
+	if err != nil {
+		return RegistryAuth{}, false, err
+	}
+	auth, ok, err := registryAuthEntry(credentials)
+	if err != nil || !ok {
+		return RegistryAuth{}, ok, err
+	}
+	return RegistryAuth{Server: host, Auth: auth}, true, nil
+}
+
+func isDockerHubOfficialImage(value, host string) bool {
+	if host != "docker.io" && host != "index.docker.io" {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	named, _, _ := strings.Cut(value, "@")
+	if tagIndex := strings.LastIndex(named, ":"); tagIndex > strings.LastIndex(named, "/") {
+		named = named[:tagIndex]
+	}
+	if !strings.Contains(named, "/") {
+		return true
+	}
+	return strings.HasPrefix(named, "library/")
+}
+
+func registryAuthHost(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("registry is required")
+	}
+	if !strings.Contains(value, "/") {
+		name := value
+		if base, _, ok := strings.Cut(value, ":"); ok {
+			name = base
+		}
+		if name == "localhost" || strings.Contains(name, ".") {
+			host, _, err := registryAuthCandidates(value)
+			return host, err
+		}
+	}
+	ref, err := parseImageReference(value)
+	if err == nil {
+		return ref.authHost(), nil
+	}
+	host, _, err := registryAuthCandidates(value)
+	return host, err
+}
+
 func (c Client) BuildKitSupported(ctx context.Context) error {
 	return c.run(ctx, "docker", "buildx", "version")
 }
@@ -99,14 +198,68 @@ func (c Client) Build(ctx context.Context, contextDir, dockerfile, tag string) e
 }
 
 func (c Client) BuildImage(ctx context.Context, opts BuildOptions) error {
-	args, err := BuildCommand(opts)
+	name, args, err := BuildInvocation(opts)
 	if err != nil {
 		return err
 	}
 	if c.LogWriter != nil && c.CommandRunner == nil && !c.DryRun {
-		return c.stream(ctx, "docker", args...)
+		return c.stream(ctx, name, args...)
 	}
-	return c.run(ctx, "docker", args...)
+	return c.run(ctx, name, args...)
+}
+
+func BuildInvocation(opts BuildOptions) (string, []string, error) {
+	if opts.Buildpack.Enabled() {
+		args, err := PackBuildCommand(opts)
+		return "pack", args, err
+	}
+	args, err := BuildCommand(opts)
+	return "docker", args, err
+}
+
+func PackBuildCommand(opts BuildOptions) ([]string, error) {
+	contextDir := strings.TrimSpace(opts.ContextDir)
+	if contextDir == "" {
+		contextDir = "."
+	}
+	tag := strings.TrimSpace(opts.Tag)
+	if tag == "" {
+		return nil, fmt.Errorf("image tag is required")
+	}
+	args := []string{"build", tag, "--path", contextDir}
+	for _, additionalTag := range additionalImageTags(tag, opts.AdditionalTags) {
+		args = append(args, "--tag", additionalTag)
+	}
+	if builder := strings.TrimSpace(opts.Buildpack.Builder); builder != "" {
+		args = append(args, "--builder", builder)
+	}
+	for _, buildpack := range sortedNonEmpty(opts.Buildpack.Buildpacks) {
+		args = append(args, "--buildpack", buildpack)
+	}
+	envNames := make([]string, 0, len(opts.Buildpack.Env))
+	for name := range opts.Buildpack.Env {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			envNames = append(envNames, name)
+		}
+	}
+	sort.Strings(envNames)
+	for _, name := range envNames {
+		args = append(args, "--env", name+"="+opts.Buildpack.Env[name])
+	}
+	if descriptor := strings.TrimSpace(opts.Buildpack.Descriptor); descriptor != "" {
+		args = append(args, "--descriptor", descriptor)
+	}
+	if pullPolicy := strings.TrimSpace(opts.Buildpack.PullPolicy); pullPolicy != "" {
+		args = append(args, "--pull-policy", pullPolicy)
+	}
+	if opts.Buildpack.TrustBuilder {
+		args = append(args, "--trust-builder")
+	}
+	if BuildPublishesImage(opts) {
+		args = append(args, "--publish")
+	}
+	return args, nil
 }
 
 func BuildCommand(opts BuildOptions) ([]string, error) {
@@ -125,8 +278,33 @@ func BuildCommand(opts BuildOptions) ([]string, error) {
 	if tag == "" {
 		return nil, fmt.Errorf("image tag is required")
 	}
-	args := []string{"build", "-f", dockerfile, "-t", tag, "--label", LabelManagedBy + "=" + LabelManagedByValue}
-	if platform := strings.TrimSpace(opts.Platform); platform != "" {
+	args := []string{"build"}
+	if buildxRequired(opts) {
+		args = []string{"buildx", "build"}
+		if BuildPublishesImage(opts) {
+			args = append(args, "--push")
+		} else {
+			args = append(args, "--load")
+		}
+		if builder := strings.TrimSpace(opts.Builder); builder != "" {
+			args = append(args, "--builder", builder)
+		}
+	}
+	args = append(args, "-f", dockerfile, "-t", tag)
+	for _, additionalTag := range additionalImageTags(tag, opts.AdditionalTags) {
+		args = append(args, "-t", additionalTag)
+	}
+	args = append(args, "--label", LabelManagedBy+"="+LabelManagedByValue)
+	if opts.Pull {
+		args = append(args, "--pull")
+	}
+	if opts.NoCache {
+		args = append(args, "--no-cache")
+	}
+	if filters := nonEmptyOrdered(opts.NoCacheFilter); len(filters) > 0 {
+		args = append(args, "--no-cache-filter", strings.Join(filters, ","))
+	}
+	if platform := buildPlatforms(opts); platform != "" {
 		args = append(args, "--platform", platform)
 	}
 	if target := strings.TrimSpace(opts.Target); target != "" {
@@ -140,8 +318,101 @@ func BuildCommand(opts BuildOptions) ([]string, error) {
 	for _, name := range buildArgNames {
 		args = append(args, "--build-arg", name+"="+opts.BuildArgs[name])
 	}
+	for _, spec := range sortedNonEmpty(opts.CacheFrom) {
+		args = append(args, "--cache-from", spec)
+	}
+	for _, spec := range sortedNonEmpty(opts.CacheTo) {
+		args = append(args, "--cache-to", spec)
+	}
+	for _, spec := range sortedNonEmpty(opts.Secrets) {
+		args = append(args, "--secret", spec)
+	}
+	for _, spec := range sortedNonEmpty(opts.SSH) {
+		args = append(args, "--ssh", spec)
+	}
+	if sbom := strings.TrimSpace(opts.SBOM); sbom != "" && sbom != "false" {
+		args = append(args, "--sbom", sbom)
+	}
+	if provenance := strings.TrimSpace(opts.Provenance); provenance != "" && provenance != "false" {
+		args = append(args, "--provenance", provenance)
+	}
 	args = append(args, contextDir)
 	return args, nil
+}
+
+func buildxRequired(opts BuildOptions) bool {
+	return len(opts.CacheFrom) > 0 ||
+		len(opts.CacheTo) > 0 ||
+		len(opts.Secrets) > 0 ||
+		len(opts.SSH) > 0 ||
+		strings.TrimSpace(opts.Builder) != "" ||
+		len(opts.NoCacheFilter) > 0 ||
+		multiPlatformRequested(opts) ||
+		BuildPublishesImage(opts)
+}
+
+func BuildPublishesImage(opts BuildOptions) bool {
+	return opts.Push ||
+		(opts.Buildpack.Enabled() && opts.Buildpack.Publish) ||
+		multiPlatformRequested(opts) ||
+		buildFlagEnabled(opts.SBOM) ||
+		buildFlagEnabled(opts.Provenance)
+}
+
+func multiPlatformRequested(opts BuildOptions) bool {
+	return len(nonEmptyOrdered(opts.Platforms)) > 0 || strings.Contains(strings.TrimSpace(opts.Platform), ",")
+}
+
+func buildPlatforms(opts BuildOptions) string {
+	platforms := nonEmptyOrdered(opts.Platforms)
+	if len(platforms) > 0 {
+		return strings.Join(platforms, ",")
+	}
+	return strings.TrimSpace(opts.Platform)
+}
+
+func buildFlagEnabled(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && value != "false"
+}
+
+func nonEmptyOrdered(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func sortedNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func additionalImageTags(primary string, values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{strings.TrimSpace(primary): true}
+	for _, value := range sortedNonEmpty(values) {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func (c Client) Push(ctx context.Context, tag string) error {
@@ -237,6 +508,36 @@ func ImageTag(repository, serviceName, releaseTag string) (string, error) {
 		return "", fmt.Errorf("image tag for service %q is too long", serviceName)
 	}
 	return repository + ":" + tag, nil
+}
+
+func ImageAliasTags(repository, serviceName string, aliases []string) ([]string, error) {
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return nil, fmt.Errorf("registry repository is required")
+	}
+	servicePart := sanitizeTagPart(serviceName)
+	if servicePart == "" {
+		return nil, fmt.Errorf("service name is required")
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, alias := range aliases {
+		aliasPart := sanitizeTagPart(alias)
+		if aliasPart == "" {
+			return nil, fmt.Errorf("image alias tag for service %q is required", serviceName)
+		}
+		tag := servicePart + "-" + aliasPart
+		if len(tag) > 128 {
+			return nil, fmt.Errorf("image alias tag for service %q is too long", serviceName)
+		}
+		ref := repository + ":" + tag
+		if seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		out = append(out, ref)
+	}
+	return out, nil
 }
 
 func sanitizeTagPart(value string) string {
@@ -541,6 +842,19 @@ type registryCredentials struct {
 	username      string
 	password      string
 	identityToken string
+}
+
+func registryAuthEntry(credentials registryCredentials) (json.RawMessage, bool, error) {
+	if credentials.identityToken != "" {
+		raw, err := json.Marshal(map[string]string{"identitytoken": credentials.identityToken})
+		return json.RawMessage(raw), true, err
+	}
+	if credentials.username != "" || credentials.password != "" {
+		token := base64.StdEncoding.EncodeToString([]byte(credentials.username + ":" + credentials.password))
+		raw, err := json.Marshal(map[string]string{"auth": token})
+		return json.RawMessage(raw), true, err
+	}
+	return nil, false, nil
 }
 
 func authCredentials(auths map[string]json.RawMessage, candidates []string) (registryCredentials, bool) {

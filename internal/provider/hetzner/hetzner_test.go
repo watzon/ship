@@ -69,6 +69,9 @@ func TestReconcileCreatesMissingServers(t *testing.T) {
 	if create.Labels[LabelManagedBy] != "ship" || create.Labels[LabelProject] != "demo" || create.Labels[LabelEnvironment] != "production" || create.Labels[LabelPool] != "web" {
 		t.Fatalf("labels = %+v", create.Labels)
 	}
+	if create.UserData != "#cloud-config\npackages: [htop]\n" {
+		t.Fatalf("user_data = %q", create.UserData)
+	}
 	if len(create.SSHKeys) != 1 || create.SSHKeys[0] != "ship-key" {
 		t.Fatalf("ssh_keys = %+v", create.SSHKeys)
 	}
@@ -272,6 +275,7 @@ func testEnvironment(count int) config.Environment {
 			Location:        "ash",
 			ServerType:      "cpx31",
 			Image:           "ubuntu-24.04",
+			UserData:        "#cloud-config\npackages: [htop]\n",
 			SSHKeys:         []string{"ship-key"},
 			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
 		}},
@@ -310,6 +314,7 @@ type createServerRequest struct {
 	Location   string             `json:"location"`
 	Labels     map[string]string  `json:"labels"`
 	SSHKeys    []string           `json:"ssh_keys"`
+	UserData   string             `json:"user_data"`
 	Networks   []int64            `json:"networks"`
 	Firewalls  []map[string]int64 `json:"firewalls"`
 }

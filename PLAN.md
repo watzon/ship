@@ -52,10 +52,10 @@ Status: mostly completed.
 
 ### Remaining Tasks
 
-- [ ] Split planning into typed action structs rather than display-only actions.
-- [ ] Add plan diffs against observed state, not only desired-state previews.
-- [ ] Add config rendering/explain commands if the schema grows.
-- [ ] Add JSON output mode for plans for future automation.
+- [x] Split planning into typed action structs rather than display-only actions.
+- [x] Add plan diffs against observed state, not only desired-state previews.
+- [x] Add config rendering/explain commands if the schema grows.
+- [x] Add JSON output mode for plans for future automation.
 
 ### Gates
 
@@ -145,8 +145,8 @@ Status: first API client shape exists; reconciliation is not complete.
   - report unmanaged or extra servers without deleting by default
 - [x] Add `ship provision apply ENV --yes` confirmation behavior.
 - [x] Add server delete/decommission flow as a separate explicit command.
-- [ ] Support configured firewalls for SSH, HTTP, and HTTPS.
-- [ ] Support private networking where available.
+- [x] Support configured firewalls for SSH, HTTP, and HTTPS.
+- [x] Support private networking where available.
 - [x] Add robust retry/backoff around SSH readiness and bounded Hetzner action polling.
 
 ### Gates
@@ -167,7 +167,7 @@ Status: first API client shape exists; reconciliation is not complete.
 
 ## Phase 4: Agent RPC And Remote Host Operations
 
-Status: basic newline-delimited JSON RPC exists over SSH.
+Status: structured newline-delimited JSON RPC exists over SSH with request IDs, error codes, protocol negotiation, supported method discovery, and fleet version reporting.
 
 ### Tasks
 
@@ -186,8 +186,8 @@ Status: basic newline-delimited JSON RPC exists over SSH.
 
 ### Remaining Tasks
 
-- [ ] Add request IDs and structured error codes to RPC.
-- [ ] Add agent methods for:
+- [x] Add request IDs and structured error codes to RPC.
+- [x] Add agent methods for:
   - Docker inspect
   - list Ship-managed containers
   - health check execution
@@ -196,18 +196,20 @@ Status: basic newline-delimited JSON RPC exists over SSH.
   - write release state
   - Caddy config reload
   - accessory backup/restore
-- [ ] Add host-level locks so concurrent deploys do not collide.
-- [ ] Add agent version negotiation.
-- [ ] Add binary upload/install flow.
-- [ ] Add remote state directory migrations.
+- [x] Add host-level locks so concurrent deploys do not collide.
+- [x] Add agent version negotiation.
+- [x] Add binary upload/install flow.
+- [x] Add remote state directory migrations.
+- [x] Add `ship version [ENV]` for local protocol compatibility and per-host agent version audits.
+- [x] Add `ship agent upgrade ENV` to roll the current binary across the fleet with checksum verification.
 
 ### Gates
 
-- [ ] Agent RPC round trips are deterministic and line-delimited.
-- [ ] Agent methods are idempotent where possible.
-- [ ] Agent errors include enough context to diagnose host failures.
-- [ ] The CLI can talk to all hosts in a pool and continue reporting per-host failures.
-- [ ] Agent install can be re-run safely.
+- [x] Agent RPC round trips are deterministic and line-delimited.
+- [x] Agent methods are idempotent where possible.
+- [x] Agent errors include enough context to diagnose host failures.
+- [x] The CLI can talk to all hosts in a pool and continue reporting per-host failures.
+- [x] Agent install can be re-run safely.
 
 ### Testing
 
@@ -361,7 +363,7 @@ Status: accessory config, planning, and restore guardrails exist.
 - [ ] Place each accessory on one eligible host.
 - [ ] Persist accessory placement in state.
 - [ ] Add volume creation and ownership handling.
-- [ ] Add backup artifact storage configuration.
+- [x] Add backup artifact storage/export configuration.
 - [ ] Add restore dry-run and restore confirmation.
 - [ ] Block destructive restore without explicit confirmation.
 - [ ] Add failover command that moves a single-primary accessory only after backup/restore checks.
@@ -570,27 +572,53 @@ Status: completed. CI-safe hardening is covered locally, and the fully destructi
   - `max_surge`
   - `max_unavailable`
   - drain timing
+- [x] Add canary rollout gates before continuing the rest of a service deployment.
 - [x] Add deployment and host lock timeouts so a stuck remote lock, SSH command, or Hetzner action cannot block forever.
 - [x] Enforce agent protocol/version negotiation before mutating remote state.
 - [x] Improve rollback/recovery durability beyond the current local/remote state model:
   - make remote release-state writes less prone to partial-success ambiguity
   - refine rollback target selection when current and previous releases overlap
   - add more fixed-port rollback coverage
+  - block secret-drift rollbacks unless the operator explicitly opts into current secrets
+- [x] Add environment promotion so production can roll the exact image digests already proven in staging without rebuilding.
+- [x] Add release diffing across config hashes, image digests, and secret digests for promotion/rollback review.
 - [x] Improve observability commands that are in V1 scope:
   - make `logs --follow` behave like a real follow mode or rename/document the bounded polling behavior
   - add more structured event detail for failed ingress reloads and remote host failures
   - add JSON output for doctor if still useful
+  - add redacted support bundle snapshots for incident/debug handoff
+  - add first-class webhook notifications for deploy, promote, and rollback outcomes
 - [x] Tighten secrets behavior beyond V1 environment-backed secrets:
   - validate missing secrets during dry runs where safe
   - revisit secret digest salting/truncation tradeoffs
 - [x] Add accessory follow-up operations beyond V1 deploy/backup/restore:
   - failover command for single-primary accessories
+  - logs command for placed accessory containers
+  - exec command for placed accessory containers
   - stronger backup/restore integration tests
   - persisted contact-address coverage for accessory state
+- [x] Add deploy-managed scheduled accessory backups.
+- [x] Add off-host accessory backup export commands with persisted exported artifact URIs.
 - [x] Add image lifecycle improvements beyond V1 digest deploys:
   - build log streaming
   - remote/image pruning policy
   - explicit registry auth validation that does not assume `:latest`
+- [x] Add custom Docker labels for service and accessory containers.
+- [x] Add managed Docker networks for service, release, accessory, and ingress containers.
+- [x] Add stable Docker network aliases for service and accessory private DNS.
+- [x] Add Docker resource limits for accessory containers.
+- [x] Add Docker runtime security, networking, device, GPU, and kernel controls for service, release, and accessory containers.
+- [x] Add advanced Docker run controls for read-only roots, mounts, namespaces, groups, entrypoints, and stop behavior.
+- [x] Add Docker-native healthcheck publishing and image healthcheck disabling for runtime containers.
+- [x] Add root and environment runtime defaults for fleet-wide Docker hardening baselines.
+- [x] Add flexible Docker publish specs for loopback, remapped, and UDP service/accessory ports.
+- [x] Add Docker BuildKit external cache import/export for service image builds.
+- [x] Add Docker BuildKit build secrets and SSH mounts for service image builds.
+- [x] Add Docker BuildKit SBOM and provenance attestations with build-time registry publishing.
+- [x] Add Docker BuildKit multi-platform image publishing for service builds.
+- [x] Add custom Buildx builder selection, base-image pull, and no-cache controls for service builds.
+- [x] Add Cloud Native Buildpacks builds through `pack` for services without Dockerfiles.
+- [x] Add service-prefixed image alias tags while preserving digest-based deploys.
 - [x] Revisit lower-priority planning UX and defer nonessential automation output from V1:
   - typed/JSON plan output
   - plan diffs against observed state

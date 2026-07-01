@@ -1,0 +1,174 @@
+package terraform
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/provider"
+)
+
+var _ provider.Provider = Provider{}
+
+func TestHostsParsesPoolMapOutput(t *testing.T) {
+	env := testEnvironment()
+	prov := testProvider(env, `{
+		"ship_hosts": {
+			"value": {
+				"web": ["198.51.100.10", "198.51.100.11"],
+				"worker": [{"name": "worker-1", "address": "198.51.100.20", "user": "ops", "port": 2222}]
+			}
+		}
+	}`)
+
+	hosts, err := prov.Hosts(context.Background(), "demo", "production", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 3 {
+		t.Fatalf("hosts = %+v", hosts)
+	}
+	if hosts[0].Name != "198.51.100.10" || hosts[0].Pool != "web" || hosts[0].User != "deploy" {
+		t.Fatalf("host[0] = %+v", hosts[0])
+	}
+	if hosts[2].Name != "worker-1" || hosts[2].Pool != "worker" || hosts[2].PublicAddress != "198.51.100.20" || hosts[2].User != "ops" || hosts[2].SSHPort != 2222 {
+		t.Fatalf("host[2] = %+v", hosts[2])
+	}
+}
+
+func TestHostsParsesObjectListOutputAndPassesWorkspace(t *testing.T) {
+	env := testEnvironment()
+	env.Provider.Terraform.Workspace = "prod"
+	env.Provider.Terraform.WorkingDir = "infra"
+	var gotArgs []string
+	var gotEnv []string
+	prov := Provider{
+		Env: env,
+		Run: func(ctx context.Context, workDir, binary string, env []string, args ...string) ([]byte, error) {
+			_ = ctx
+			if workDir != "" {
+				t.Fatalf("workDir = %q", workDir)
+			}
+			if binary != "tofu" {
+				t.Fatalf("binary = %q", binary)
+			}
+			gotEnv = append([]string(nil), env...)
+			gotArgs = append([]string(nil), args...)
+			return []byte(`{
+				"ship_hosts": {
+					"value": [
+						{"id": "i-1", "name": "web-1", "address": "203.0.113.10", "pool": "web", "port": "2200"},
+						{"id": "i-2", "name": "worker-1", "address": "203.0.113.20", "pool": "worker"}
+					]
+				}
+			}`), nil
+		},
+	}
+
+	hosts, err := prov.Hosts(context.Background(), "demo", "production", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(gotArgs, " ") != "-chdir=infra output -json" {
+		t.Fatalf("args = %+v", gotArgs)
+	}
+	if len(gotEnv) != 1 || gotEnv[0] != "TF_WORKSPACE=prod" {
+		t.Fatalf("env = %+v", gotEnv)
+	}
+	if hosts[0].ID != "i-1" || hosts[0].Name != "web-1" || hosts[0].PublicAddress != "203.0.113.10" || hosts[0].SSHPort != 2200 {
+		t.Fatalf("hosts = %+v", hosts)
+	}
+}
+
+func TestReconcileTreatsTerraformHostsAsExisting(t *testing.T) {
+	env := testEnvironment()
+	prov := testProvider(env, `{
+		"ship_hosts": {
+			"value": [{"name": "web-1", "address": "203.0.113.10", "pool": "web"}]
+		}
+	}`)
+
+	result, err := prov.Reconcile(context.Background(), "demo", "production", env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Desired) != 1 || len(result.Existing) != 1 || len(result.Created) != 0 || len(result.Extra) != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Desired[0].Location != "terraform" || result.Existing[0].PublicAddress != "203.0.113.10" {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Existing[0].Labels[provider.LabelProject] != "demo" || result.Existing[0].Labels["tier"] != "edge" {
+		t.Fatalf("labels = %+v", result.Existing[0].Labels)
+	}
+}
+
+func TestHostsRejectsUnknownPool(t *testing.T) {
+	env := testEnvironment()
+	prov := testProvider(env, `{
+		"ship_hosts": {
+			"value": [{"name": "db-1", "address": "203.0.113.30", "pool": "db"}]
+		}
+	}`)
+
+	_, err := prov.Hosts(context.Background(), "demo", "production", env)
+	if err == nil || !strings.Contains(err.Error(), `unknown pool "db"`) {
+		t.Fatalf("expected unknown pool error, got %v", err)
+	}
+}
+
+func TestCredentialChecksRequireTerraformBinary(t *testing.T) {
+	env := testEnvironment()
+	prov := Provider{
+		Env: env,
+		LookupPath: func(binary string) (string, error) {
+			if binary != "tofu" {
+				t.Fatalf("binary = %q", binary)
+			}
+			return "/usr/bin/tofu", nil
+		},
+	}
+	checks := prov.CredentialChecks(func(string) (string, bool) {
+		t.Fatal("terraform provider should not need cloud credentials")
+		return "", false
+	})
+	if len(checks) != 1 || !checks[0].Present || !checks[0].Required {
+		t.Fatalf("checks = %+v", checks)
+	}
+}
+
+func testProvider(env config.Environment, output string) Provider {
+	return Provider{
+		Env: env,
+		Run: func(ctx context.Context, workDir, binary string, env []string, args ...string) ([]byte, error) {
+			_ = ctx
+			_ = workDir
+			_ = env
+			if binary != "tofu" {
+				return nil, nil
+			}
+			if strings.Join(args, " ") != "output -json" {
+				return nil, nil
+			}
+			return []byte(output), nil
+		},
+	}
+}
+
+func testEnvironment() config.Environment {
+	return config.Environment{
+		Provider: config.ProviderConfig{Terraform: &config.TerraformConfig{
+			Binary: "tofu",
+			Output: "ship_hosts",
+			User:   "deploy",
+		}},
+		Hosts: config.HostsConfig{
+			Labels: map[string]string{"team": "platform"},
+			Pools: map[string]config.Pool{
+				"web":    {Labels: map[string]string{"tier": "edge"}},
+				"worker": {User: "worker"},
+			},
+		},
+	}
+}

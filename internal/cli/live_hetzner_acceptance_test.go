@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/watzon/ship/internal/config"
-	"github.com/watzon/ship/internal/hetzner"
+	"github.com/watzon/ship/internal/provider/hetzner"
 	"github.com/watzon/ship/internal/state"
 )
 

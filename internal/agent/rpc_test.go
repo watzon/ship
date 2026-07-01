@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -143,10 +144,12 @@ func TestRunContainerReplacesExistingContainerUnderLock(t *testing.T) {
 	server.Docker = fake
 
 	resp := server.Handle(context.Background(), request(t, "run-1", "run_container", RunContainerParams{
-		Name:   "ship_web_1",
-		Image:  "example/web:1",
-		Args:   []string{"-p", "3000:3000"},
-		Labels: map[string]string{"project": "demo", "environment": "production"},
+		Name:           "ship_web_1",
+		Image:          "example/web:1",
+		Args:           []string{"-p", "3000:3000"},
+		Labels:         map[string]string{"project": "demo", "environment": "production"},
+		Network:        "ship-demo-production",
+		NetworkAliases: []string{"web", "web-internal"},
 	}))
 	if !resp.OK {
 		t.Fatalf("response = %+v", resp)
@@ -161,6 +164,11 @@ func TestRunContainerReplacesExistingContainerUnderLock(t *testing.T) {
 	joinedArgs := strings.Join(fake.runArgs, " ")
 	if !strings.Contains(joinedArgs, "--label environment=production") || !strings.Contains(joinedArgs, "--label project=demo") {
 		t.Fatalf("run args missing labels: %#v", fake.runArgs)
+	}
+	if !strings.Contains(joinedArgs, "--network ship-demo-production") ||
+		!strings.Contains(joinedArgs, "--network-alias web") ||
+		!strings.Contains(joinedArgs, "--network-alias web-internal") {
+		t.Fatalf("run args missing network: %#v", fake.runArgs)
 	}
 }
 
@@ -228,6 +236,76 @@ func TestHealthChecksUseCommandAndHTTP(t *testing.T) {
 	}
 }
 
+func TestExecContainerRunsDockerExec(t *testing.T) {
+	server := testServer(t)
+	var commands [][]string
+	server.CommandRunner = func(ctx context.Context, name string, args ...string) (string, error) {
+		commands = append(commands, append([]string{name}, args...))
+		return "done\n", nil
+	}
+
+	resp := server.Handle(context.Background(), request(t, "exec-1", "exec_container", ExecContainerParams{
+		Name:           "ship_web_1",
+		Command:        "bin/rails db:migrate",
+		TimeoutSeconds: 5,
+	}))
+	if !resp.OK {
+		t.Fatalf("exec response = %+v", resp)
+	}
+	want := []string{"docker", "exec", "ship_web_1", "sh", "-lc", "bin/rails db:migrate"}
+	if len(commands) != 1 || !reflect.DeepEqual(commands[0], want) {
+		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+	var result CommandResult
+	decodeResult(t, resp, &result)
+	if result.Output != "done" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRunOneOffContainerUsesDockerRunRemove(t *testing.T) {
+	server := testServer(t)
+	var commands [][]string
+	server.CommandRunner = func(ctx context.Context, name string, args ...string) (string, error) {
+		commands = append(commands, append([]string{name}, args...))
+		return "migrated\n", nil
+	}
+
+	resp := server.Handle(context.Background(), request(t, "oneoff-1", "run_oneoff_container", RunOneOffContainerParams{
+		Name:           "ship_demo_production_web_release_abc",
+		Image:          "registry.local/acme/web@sha256:abc",
+		Command:        "bin/rails db:migrate",
+		Args:           []string{"--env-file", "/var/lib/ship/secrets/production/service-web.env"},
+		Labels:         map[string]string{"project": "demo"},
+		Network:        "ship-demo-production",
+		NetworkAliases: []string{"release-web"},
+	}))
+	if !resp.OK {
+		t.Fatalf("one-off response = %+v", resp)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("commands = %#v", commands)
+	}
+	joined := strings.Join(commands[0], " ")
+	for _, needle := range []string{
+		"docker run --rm --name ship_demo_production_web_release_abc",
+		"--label project=demo",
+		"--network ship-demo-production",
+		"--network-alias release-web",
+		"--env-file /var/lib/ship/secrets/production/service-web.env",
+		"registry.local/acme/web@sha256:abc sh -lc bin/rails db:migrate",
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("command %q missing %q", joined, needle)
+		}
+	}
+	var result CommandResult
+	decodeResult(t, resp, &result)
+	if result.Output != "migrated" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestWriteFileInstallBinaryAndStateMigration(t *testing.T) {
 	server := testServer(t)
 	target := filepath.Join(t.TempDir(), "nested", "config.txt")
@@ -283,6 +361,92 @@ func TestWriteFileInstallBinaryAndStateMigration(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(to, "legacy.txt")); err != nil {
 		t.Fatalf("migrated file missing: %v", err)
+	}
+}
+
+func TestWriteRegistryAuthMergesDockerConfig(t *testing.T) {
+	server := testServer(t)
+	server.DockerConfigDir = t.TempDir()
+	configPath := filepath.Join(server.DockerConfigDir, "config.json")
+	existingAuth := base64.StdEncoding.EncodeToString([]byte("existing:secret"))
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"credsStore":"osxkeychain","auths":{"registry.old":{"auth":%q}}}`, existingAuth)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	newAuth := base64.StdEncoding.EncodeToString([]byte("new:secret"))
+	resp := server.Handle(context.Background(), request(t, "registry-auth-1", "write_registry_auth", WriteRegistryAuthParams{
+		Server: "ghcr.io",
+		Auth:   json.RawMessage(fmt.Sprintf(`{"auth":%q}`, newAuth)),
+	}))
+	if !resp.OK {
+		t.Fatalf("write registry auth response = %+v", resp)
+	}
+	var result WriteRegistryAuthResult
+	decodeResult(t, resp, &result)
+	if result.Path != configPath || result.Server != "ghcr.io" {
+		t.Fatalf("result = %+v", result)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		CredsStore string                       `json:"credsStore"`
+		Auths      map[string]map[string]string `json:"auths"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredsStore != "osxkeychain" || cfg.Auths["registry.old"]["auth"] != existingAuth || cfg.Auths["ghcr.io"]["auth"] != newAuth {
+		t.Fatalf("merged config = %+v", cfg)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestSyncCronFilesWritesAndRemovesManagedPrefix(t *testing.T) {
+	server := testServer(t)
+	server.CronDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(server.CronDir, "ship-demo-production-old"), []byte("* * * * * root old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(server.CronDir, "unmanaged"), []byte("* * * * * root keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := server.Handle(context.Background(), request(t, "cron-1", "sync_cron_files", SyncCronFilesParams{
+		Prefix: "ship-demo-production-",
+		Files: []CronFile{{
+			Name:    "ship-demo-production-web-cleanup",
+			Content: "17 * * * * root docker exec web sh -lc cleanup",
+		}},
+	}))
+	if !resp.OK {
+		t.Fatalf("sync cron response = %+v", resp)
+	}
+	var result SyncCronFilesResult
+	decodeResult(t, resp, &result)
+	if !reflect.DeepEqual(result.Written, []string{"ship-demo-production-web-cleanup"}) || !reflect.DeepEqual(result.Removed, []string{"ship-demo-production-old"}) {
+		t.Fatalf("result = %+v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(server.CronDir, "ship-demo-production-web-cleanup"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "17 * * * * root docker exec web sh -lc cleanup\n" {
+		t.Fatalf("cron content = %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(server.CronDir, "ship-demo-production-old")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old managed cron still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(server.CronDir, "unmanaged")); err != nil {
+		t.Fatalf("unmanaged cron was removed: %v", err)
 	}
 }
 
@@ -410,6 +574,37 @@ func TestEnsureVolumeCreatesVolumeAndAppliesOwner(t *testing.T) {
 	want := []string{
 		"docker volume create postgres-data",
 		"docker run --rm -v postgres-data:/ship-volume busybox:1.36 chown -R 999:999 /ship-volume",
+	}
+	if len(commands) != len(want) {
+		t.Fatalf("commands = %#v", commands)
+	}
+	for i, command := range commands {
+		if strings.Join(command, " ") != want[i] {
+			t.Fatalf("command %d = %#v, want %q", i, command, want[i])
+		}
+	}
+}
+
+func TestEnsureNetworkInspectsAndCreatesWhenMissing(t *testing.T) {
+	var commands [][]string
+	server := testServer(t)
+	server.CommandRunner = func(ctx context.Context, name string, args ...string) (string, error) {
+		commands = append(commands, append([]string{name}, args...))
+		if strings.Join(append([]string{name}, args...), " ") == "docker network inspect ship-demo-production" {
+			return "", fmt.Errorf("missing")
+		}
+		return "created\n", nil
+	}
+	resp := server.Handle(context.Background(), request(t, "network-1", "ensure_network", EnsureNetworkParams{
+		Name:   "ship-demo-production",
+		Driver: "bridge",
+	}))
+	if !resp.OK {
+		t.Fatalf("response = %+v", resp)
+	}
+	want := []string{
+		"docker network inspect ship-demo-production",
+		"docker network create --driver bridge ship-demo-production",
 	}
 	if len(commands) != len(want) {
 		t.Fatalf("commands = %#v", commands)

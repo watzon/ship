@@ -13,7 +13,7 @@ import (
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/provider"
-	"github.com/watzon/ship/internal/providers"
+	"github.com/watzon/ship/internal/provider/providers"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
@@ -274,6 +274,7 @@ func remoteChecks(ctx context.Context, cfg *config.Config, configPath string, ru
 		checks = append(checks, remoteLinuxCheck(ctx, runner, host, prefix))
 		checks = append(checks, remoteCommandCheck(ctx, runner, host, prefix+" docker", "command -v docker >/dev/null", "docker is installed"))
 		checks = append(checks, remoteCommandCheck(ctx, runner, host, prefix+" systemd", "command -v systemctl >/dev/null && test -d /run/systemd/system", "systemd is available"))
+		checks = append(checks, remoteCommandCheck(ctx, runner, host, prefix+" docker boot", "systemctl is-enabled docker >/dev/null && systemctl is-active docker >/dev/null", "docker.service is enabled and active"))
 		checks = append(checks, remoteCommandCheck(ctx, runner, host, prefix+" state dir", "test -d "+config.RemoteStateDir+" && test -w "+config.RemoteStateDir, config.RemoteStateDir+" is writable"))
 		checks = append(checks, remoteCommandCheck(ctx, runner, host, prefix+" ship binary", "test -x "+config.RemoteBinaryPath, config.RemoteBinaryPath+" is installed"))
 	}

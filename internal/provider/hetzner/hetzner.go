@@ -130,6 +130,7 @@ func DesiredServersFor(project, environment string, env config.Environment) []pr
 		Location: hetzner.Location,
 		Size:     hetzner.ServerType,
 		Image:    hetzner.Image,
+		UserData: hetzner.UserData,
 	})
 }
 
@@ -281,6 +282,9 @@ func (c Client) CreateServer(ctx context.Context, plan provider.HostPlan, opts c
 		"image":       plan.Image,
 		"location":    plan.Location,
 		"labels":      labels,
+	}
+	if plan.UserData != "" {
+		body["user_data"] = plan.UserData
 	}
 	if len(opts.SSHKeys) > 0 {
 		body["ssh_keys"] = opts.SSHKeys
@@ -570,6 +574,7 @@ func firewallRules(cfg config.HetznerConfig) []map[string]any {
 	rules = append(rules,
 		map[string]any{"direction": "in", "protocol": "tcp", "port": "80", "source_ips": []string{"0.0.0.0/0", "::/0"}},
 		map[string]any{"direction": "in", "protocol": "tcp", "port": "443", "source_ips": []string{"0.0.0.0/0", "::/0"}},
+		map[string]any{"direction": "in", "protocol": "udp", "port": "443", "source_ips": []string{"0.0.0.0/0", "::/0"}},
 	)
 	return rules
 }

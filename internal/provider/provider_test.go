@@ -17,7 +17,7 @@ func TestHostPlansUsesEnvironmentPools(t *testing.T) {
 		}},
 	}
 
-	plans := HostPlans("demo", "production", env, HostPlanOptions{Location: "ash", Size: "small", Image: "ubuntu"})
+	plans := HostPlans("demo", "production", env, HostPlanOptions{Location: "ash", Size: "small", Image: "ubuntu", UserData: "#cloud-config\n"})
 
 	if len(plans) != 3 {
 		t.Fatalf("plans = %+v", plans)
@@ -28,7 +28,7 @@ func TestHostPlansUsesEnvironmentPools(t *testing.T) {
 	if plans[2].Name != "worker-1" || plans[2].Pool != "worker" || plans[2].User != "deploy" {
 		t.Fatalf("worker plan = %+v", plans[2])
 	}
-	if plans[0].Location != "ash" || plans[0].Size != "small" || plans[0].Image != "ubuntu" {
+	if plans[0].Location != "ash" || plans[0].Size != "small" || plans[0].Image != "ubuntu" || plans[0].UserData != "#cloud-config\n" {
 		t.Fatalf("provider options missing from plan: %+v", plans[0])
 	}
 	wantLabels := map[string]string{
@@ -39,6 +39,52 @@ func TestHostPlansUsesEnvironmentPools(t *testing.T) {
 	}
 	if !reflect.DeepEqual(plans[0].Labels, wantLabels) {
 		t.Fatalf("labels = %+v, want %+v", plans[0].Labels, wantLabels)
+	}
+}
+
+func TestHostPlansAppliesPoolShapeOverrides(t *testing.T) {
+	env := config.Environment{
+		Hosts: config.HostsConfig{
+			Labels: map[string]string{
+				"owner":       "platform",
+				"cost-center": "shared",
+			},
+			Pools: map[string]config.Pool{
+				"worker": {
+					Count:    1,
+					Location: "hil",
+					Size:     "large",
+					Image:    "ubuntu-worker",
+					UserData: "#cloud-config\npackages: [htop]\n",
+					Labels: map[string]string{
+						"cost-center": "batch",
+						"workload":    "jobs",
+					},
+				},
+				"web": {Count: 1},
+			},
+		},
+	}
+
+	plans := HostPlans("demo", "production", env, HostPlanOptions{Location: "ash", Size: "small", Image: "ubuntu", UserData: "#cloud-config\n"})
+
+	if len(plans) != 2 {
+		t.Fatalf("plans = %+v", plans)
+	}
+	if plans[0].Pool != "web" || plans[0].Location != "ash" || plans[0].Size != "small" || plans[0].Image != "ubuntu" || plans[0].UserData != "#cloud-config\n" {
+		t.Fatalf("web plan = %+v", plans[0])
+	}
+	if plans[1].Pool != "worker" || plans[1].Location != "hil" || plans[1].Size != "large" || plans[1].Image != "ubuntu-worker" || plans[1].UserData != "#cloud-config\npackages: [htop]\n" {
+		t.Fatalf("worker plan = %+v", plans[1])
+	}
+	if plans[0].Labels["owner"] != "platform" || plans[0].Labels["cost-center"] != "shared" {
+		t.Fatalf("web labels = %+v", plans[0].Labels)
+	}
+	if plans[1].Labels["owner"] != "platform" || plans[1].Labels["cost-center"] != "batch" || plans[1].Labels["workload"] != "jobs" {
+		t.Fatalf("worker labels = %+v", plans[1].Labels)
+	}
+	if plans[1].Labels[LabelManagedBy] != "ship" || plans[1].Labels[LabelPool] != "worker" {
+		t.Fatalf("ship labels missing/protected: %+v", plans[1].Labels)
 	}
 }
 

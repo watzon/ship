@@ -26,17 +26,23 @@ type HostPlan struct {
 	Location    string
 	Size        string
 	Image       string
+	UserData    string
 	Labels      map[string]string
 }
 
 type Host struct {
-	ID            string
-	Name          string
-	Pool          string
-	PublicAddress string
-	Labels        map[string]string
-	NetworkIDs    []int64
-	FirewallIDs   []int64
+	ID             string
+	Name           string
+	Pool           string
+	PublicAddress  string
+	SSHPort        int
+	IdentityFile   string
+	KnownHostsFile string
+	JumpHost       string
+	SSHOptions     map[string]string
+	Labels         map[string]string
+	NetworkIDs     []int64
+	FirewallIDs    []int64
 }
 
 type ReconcileResult struct {
@@ -67,6 +73,7 @@ type HostPlanOptions struct {
 	Location string
 	Size     string
 	Image    string
+	UserData string
 }
 
 type ReconcileBackend interface {
@@ -77,19 +84,51 @@ type ReconcileBackend interface {
 func HostPlans(project, environment string, env config.Environment, opts HostPlanOptions) []HostPlan {
 	var plans []HostPlan
 	for _, host := range scheduler.HostsForEnvironment(env) {
+		pool := env.Hosts.Pools[host.Pool]
+		hostOpts := opts
+		if pool.Location != "" {
+			hostOpts.Location = pool.Location
+		}
+		if pool.Size != "" {
+			hostOpts.Size = pool.Size
+		}
+		if pool.Image != "" {
+			hostOpts.Image = pool.Image
+		}
+		if pool.UserData != "" {
+			hostOpts.UserData = pool.UserData
+		}
+		labels := HostLabels(project, environment, host.Pool, env.Hosts.Labels, pool.Labels)
 		plans = append(plans, HostPlan{
 			Project:     project,
 			Environment: environment,
 			Name:        host.Name,
 			Pool:        host.Pool,
 			User:        host.User,
-			Location:    opts.Location,
-			Size:        opts.Size,
-			Image:       opts.Image,
-			Labels:      ShipLabels(project, environment, host.Pool),
+			Location:    hostOpts.Location,
+			Size:        hostOpts.Size,
+			Image:       hostOpts.Image,
+			UserData:    hostOpts.UserData,
+			Labels:      labels,
 		})
 	}
 	return plans
+}
+
+func HostLabels(project, environment, pool string, groups ...map[string]string) map[string]string {
+	labels := map[string]string{}
+	for _, group := range groups {
+		for key, value := range group {
+			if key == "" || value == "" {
+				continue
+			}
+			labels[key] = value
+		}
+	}
+	for key, value := range ShipLabels(project, environment, pool) {
+		labels[key] = value
+	}
+	return labels
 }
 
 func ShipLabels(project, environment, pool string) map[string]string {

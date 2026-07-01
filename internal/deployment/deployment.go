@@ -24,10 +24,12 @@ const (
 	ActionHealth  ActionKind = "health"
 	ActionIngress ActionKind = "ingress"
 	ActionDrain   ActionKind = "drain"
+	ActionCanary  ActionKind = "canary_pause"
 	ActionStop    ActionKind = "stop"
 )
 
 const defaultHealthTimeoutSeconds = 30
+const defaultHealthRetryIntervalSeconds = 2
 
 type ActionKind string
 
@@ -43,24 +45,32 @@ type ObservedContainer struct {
 }
 
 type Action struct {
-	Kind          ActionKind
-	Host          scheduler.Host
-	Service       string
-	Replica       int
-	Release       string
-	ContainerName string
-	Image         string
-	Command       string
-	Args          []string
-	Labels        map[string]string
-	Health        agent.HealthCheckParams
-	IngressPath   string
-	IngressConfig string
-	IngressHosts  []scheduler.Host
-	CaddyImage    string
-	CaddyName     string
-	CaddyLabels   map[string]string
-	DrainTimeout  time.Duration
+	Kind              ActionKind
+	Host              scheduler.Host
+	Service           string
+	Replica           int
+	Release           string
+	ContainerName     string
+	Image             string
+	Command           string
+	Args              []string
+	Labels            map[string]string
+	Network           string
+	NetworkDriver     string
+	NetworkAliases    []string
+	Health            agent.HealthCheckParams
+	HealthRetries     int
+	HealthInterval    time.Duration
+	IngressPath       string
+	IngressConfig     string
+	IngressHosts      []scheduler.Host
+	CaddyImage        string
+	CaddyName         string
+	CaddyDataVolume   string
+	CaddyConfigVolume string
+	CaddyLabels       map[string]string
+	DrainTimeout      time.Duration
+	PauseDuration     time.Duration
 }
 
 type PlanInput struct {
@@ -169,7 +179,11 @@ func BuildActions(input PlanInput) ([]Action, error) {
 	preStopped := map[string]struct{}{}
 	pendingStops := map[string][]ObservedContainer{}
 	surgeCounts := map[string]int{}
+	startedCounts := map[string]int{}
+	desiredCounts := desiredServiceCounts(placements)
 	var actions []Action
+	networkName := DockerNetworkName(input.Config, input.EnvName)
+	networkDriver := DockerNetworkDriver(input.Config)
 	for _, placement := range placements {
 		svc := input.Config.Services[placement.Service]
 		image := input.Images[placement.Service]
@@ -178,8 +192,9 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		}
 		name := ContainerName(input.Config.Project, input.EnvName, placement.Service, placement.Replica, input.ReleaseID)
 		desiredNames[name] = struct{}{}
-		labels := ContainerLabels(input.Config.Project, input.EnvName, placement.Service, placement.Replica, input.ReleaseID)
+		labels := ContainerLabels(input.Config.Project, input.EnvName, placement.Service, placement.Replica, input.ReleaseID, svc.Labels)
 		args := DockerArgs(svc, input.SecretEnvFiles[placement.Service])
+		networkAliases := ServiceNetworkAliases(placement.Service, svc)
 		actions = append(actions, Action{
 			Kind:          ActionPull,
 			Host:          placement.Host,
@@ -209,16 +224,19 @@ func BuildActions(input PlanInput) ([]Action, error) {
 			}
 		}
 		actions = append(actions, Action{
-			Kind:          ActionStart,
-			Host:          placement.Host,
-			Service:       placement.Service,
-			Replica:       placement.Replica,
-			Release:       input.ReleaseID,
-			ContainerName: name,
-			Image:         image,
-			Command:       svc.Command,
-			Args:          args,
-			Labels:        labels,
+			Kind:           ActionStart,
+			Host:           placement.Host,
+			Service:        placement.Service,
+			Replica:        placement.Replica,
+			Release:        input.ReleaseID,
+			ContainerName:  name,
+			Image:          image,
+			Command:        svc.Command,
+			Args:           args,
+			Labels:         labels,
+			Network:        networkName,
+			NetworkDriver:  networkDriver,
+			NetworkAliases: networkAliases,
 		})
 		health, ok, err := HealthCheck(svc, name)
 		if err != nil {
@@ -226,15 +244,19 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		}
 		if ok {
 			actions = append(actions, Action{
-				Kind:          ActionHealth,
-				Host:          placement.Host,
-				Service:       placement.Service,
-				Replica:       placement.Replica,
-				Release:       input.ReleaseID,
-				ContainerName: name,
-				Health:        health,
+				Kind:           ActionHealth,
+				Host:           placement.Host,
+				Service:        placement.Service,
+				Replica:        placement.Replica,
+				Release:        input.ReleaseID,
+				ContainerName:  name,
+				Health:         health,
+				HealthRetries:  svc.Rolling.HealthRetries,
+				HealthInterval: HealthRetryInterval(svc),
 			})
 		}
+		startedCounts[placement.Service]++
+		actions = appendCanaryPauseAction(actions, placement, input.ReleaseID, svc, startedCounts[placement.Service], desiredCounts[placement.Service])
 		if len(pendingStops[placement.Service]) > 0 {
 			surgeCounts[placement.Service]++
 			if surgeCounts[placement.Service] >= rollingMaxSurge(svc) {
@@ -258,13 +280,17 @@ func BuildActions(input PlanInput) ([]Action, error) {
 	caddyfile := ingress.GenerateCaddyfile(input.Config, placements)
 	if strings.TrimSpace(caddyfile) != "" {
 		actions = append(actions, Action{
-			Kind:          ActionIngress,
-			IngressPath:   ingressPath,
-			IngressConfig: caddyfile,
-			IngressHosts:  ingress.HostsFor(input.Config, inputHosts(input.Environment, input.Hosts), placements),
-			CaddyImage:    caddyImage(input.Config),
-			CaddyName:     CaddyContainerName(input.Config.Project, input.EnvName),
-			CaddyLabels:   CaddyLabels(input.Config.Project, input.EnvName),
+			Kind:              ActionIngress,
+			IngressPath:       ingressPath,
+			IngressConfig:     caddyfile,
+			IngressHosts:      ingress.HostsFor(input.Config, inputHosts(input.Environment, input.Hosts), placements),
+			CaddyImage:        caddyImage(input.Config),
+			CaddyName:         CaddyContainerName(input.Config.Project, input.EnvName),
+			CaddyDataVolume:   caddyDataVolume(input.Config, input.EnvName),
+			CaddyConfigVolume: caddyConfigVolume(input.Config, input.EnvName),
+			CaddyLabels:       CaddyLabels(input.Config.Project, input.EnvName),
+			Network:           networkName,
+			NetworkDriver:     networkDriver,
 		})
 	} else {
 		shouldClear, err := shouldClearIngress(ingressPath)
@@ -273,12 +299,16 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		}
 		if shouldClear {
 			actions = append(actions, Action{
-				Kind:         ActionIngress,
-				IngressPath:  ingressPath,
-				IngressHosts: clearIngressHosts(input),
-				CaddyImage:   caddyImage(input.Config),
-				CaddyName:    CaddyContainerName(input.Config.Project, input.EnvName),
-				CaddyLabels:  CaddyLabels(input.Config.Project, input.EnvName),
+				Kind:              ActionIngress,
+				IngressPath:       ingressPath,
+				IngressHosts:      clearIngressHosts(input),
+				CaddyImage:        caddyImage(input.Config),
+				CaddyName:         CaddyContainerName(input.Config.Project, input.EnvName),
+				CaddyDataVolume:   caddyDataVolume(input.Config, input.EnvName),
+				CaddyConfigVolume: caddyConfigVolume(input.Config, input.EnvName),
+				CaddyLabels:       CaddyLabels(input.Config.Project, input.EnvName),
+				Network:           networkName,
+				NetworkDriver:     networkDriver,
 			})
 		}
 	}
@@ -290,6 +320,50 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		actions = appendStopActions(actions, old, input.Config.Services[serviceName])
 	}
 	return actions, nil
+}
+
+func desiredServiceCounts(placements []scheduler.Placement) map[string]int {
+	counts := map[string]int{}
+	for _, placement := range placements {
+		counts[placement.Service]++
+	}
+	return counts
+}
+
+func appendCanaryPauseAction(actions []Action, placement scheduler.Placement, releaseID string, svc config.Service, started, desired int) []Action {
+	pause := canaryPauseDuration(svc)
+	if pause <= 0 || desired <= 1 {
+		return actions
+	}
+	target := canaryReplicaTarget(svc)
+	if target <= 0 || target >= desired || started != target {
+		return actions
+	}
+	return append(actions, Action{
+		Kind:          ActionCanary,
+		Host:          placement.Host,
+		Service:       placement.Service,
+		Replica:       placement.Replica,
+		Release:       releaseID,
+		PauseDuration: pause,
+	})
+}
+
+func canaryReplicaTarget(svc config.Service) int {
+	if svc.Rolling.CanaryReplicas > 0 {
+		return svc.Rolling.CanaryReplicas
+	}
+	if svc.Rolling.CanaryPauseSeconds > 0 {
+		return 1
+	}
+	return 0
+}
+
+func canaryPauseDuration(svc config.Service) time.Duration {
+	if svc.Rolling.CanaryPauseSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(svc.Rolling.CanaryPauseSeconds) * time.Second
 }
 
 func flushPendingStops(actions []Action, pendingStops map[string][]ObservedContainer, surgeCounts map[string]int, serviceName string, svc config.Service, preStopped map[string]struct{}) []Action {
@@ -387,24 +461,24 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 			}
 		case ActionStart:
 			client := agentFor(action.Host)
+			if err := ensureNetwork(ctx, client, action); err != nil {
+				return fmt.Errorf("ensure network %s on %s: %w", action.Network, action.Host.Name, err)
+			}
 			params := agent.RunContainerParams{
-				Name:    action.ContainerName,
-				Image:   action.Image,
-				Command: action.Command,
-				Args:    action.Args,
-				Labels:  action.Labels,
+				Name:           action.ContainerName,
+				Image:          action.Image,
+				Command:        action.Command,
+				Args:           action.Args,
+				Labels:         action.Labels,
+				Network:        action.Network,
+				NetworkAliases: action.NetworkAliases,
 			}
 			if err := client.Call(ctx, "run_container", params, nil); err != nil {
 				return fmt.Errorf("start %s on %s: %w", action.ContainerName, action.Host.Name, err)
 			}
 		case ActionHealth:
-			client := agentFor(action.Host)
-			var result agent.HealthCheckResult
-			if err := client.Call(ctx, "health_check", action.Health, &result); err != nil {
-				return fmt.Errorf("health %s on %s: %w", action.ContainerName, action.Host.Name, err)
-			}
-			if !result.OK {
-				return fmt.Errorf("health %s on %s failed", action.ContainerName, action.Host.Name)
+			if err := executeHealthAction(ctx, action, agentFor, sleep); err != nil {
+				return err
 			}
 		case ActionIngress:
 			if err := executeIngressAction(ctx, action, agentFor); err != nil {
@@ -412,6 +486,8 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 			}
 		case ActionDrain:
 			sleep(action.DrainTimeout)
+		case ActionCanary:
+			sleep(action.PauseDuration)
 		case ActionStop:
 			client := agentFor(action.Host)
 			if err := client.Call(ctx, "stop_container", map[string]string{"name": action.ContainerName}, nil); err != nil {
@@ -422,6 +498,31 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 		}
 	}
 	return nil
+}
+
+func executeHealthAction(ctx context.Context, action Action, agentFor AgentFactory, sleep func(time.Duration)) error {
+	attempts := action.HealthRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		client := agentFor(action.Host)
+		var result agent.HealthCheckResult
+		err := client.Call(ctx, "health_check", action.Health, &result)
+		if err == nil && result.OK {
+			return nil
+		}
+		if err != nil {
+			lastErr = fmt.Errorf("health %s on %s: %w", action.ContainerName, action.Host.Name, err)
+		} else {
+			lastErr = fmt.Errorf("health %s on %s failed", action.ContainerName, action.Host.Name)
+		}
+		if attempt < attempts && action.HealthInterval > 0 {
+			sleep(action.HealthInterval)
+		}
+	}
+	return lastErr
 }
 
 func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory) error {
@@ -565,10 +666,25 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 	if name == "" {
 		name = "ship_caddy"
 	}
+	dataVolume := strings.TrimSpace(action.CaddyDataVolume)
+	if dataVolume == "" {
+		dataVolume = name + "_data"
+	}
+	configVolume := strings.TrimSpace(action.CaddyConfigVolume)
+	if configVolume == "" {
+		configVolume = name + "_config"
+	}
+	if err := ensureNetwork(ctx, client, action); err != nil {
+		return err
+	}
 	args := []string{
+		"--restart", config.DefaultRestartPolicy,
 		"-p", "80:80",
 		"-p", "443:443",
+		"-p", "443:443/udp",
 		"-v", remotePath + ":/etc/caddy/Caddyfile:ro",
+		"-v", dataVolume + ":/data",
+		"-v", configVolume + ":/config",
 	}
 	return client.Call(ctx, "run_container", agent.RunContainerParams{
 		Name:    name,
@@ -576,7 +692,15 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 		Command: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile",
 		Args:    args,
 		Labels:  action.CaddyLabels,
+		Network: action.Network,
 	}, nil)
+}
+
+func ensureNetwork(ctx context.Context, client Agent, action Action) error {
+	if strings.TrimSpace(action.Network) == "" {
+		return nil
+	}
+	return client.Call(ctx, "ensure_network", agent.EnsureNetworkParams{Name: action.Network, Driver: action.NetworkDriver}, nil)
 }
 
 func remoteCaddyfilePath(localPath string) string {
@@ -598,6 +722,86 @@ func CaddyContainerName(project, envName string) string {
 	return strings.Join([]string{"ship", safeNamePart(project), safeNamePart(envName), "caddy"}, "_")
 }
 
+func CaddyDataVolumeName(project, envName string) string {
+	return CaddyContainerName(project, envName) + "_data"
+}
+
+func CaddyConfigVolumeName(project, envName string) string {
+	return CaddyContainerName(project, envName) + "_config"
+}
+
+func CaddyDataVolume(cfg *config.Config, envName string) string {
+	return caddyDataVolume(cfg, envName)
+}
+
+func CaddyConfigVolume(cfg *config.Config, envName string) string {
+	return caddyConfigVolume(cfg, envName)
+}
+
+func caddyDataVolume(cfg *config.Config, envName string) string {
+	if cfg != nil {
+		if volume := strings.TrimSpace(cfg.Ingress.Caddy.DataVolume); volume != "" {
+			return volume
+		}
+		return CaddyDataVolumeName(cfg.Project, envName)
+	}
+	return ""
+}
+
+func caddyConfigVolume(cfg *config.Config, envName string) string {
+	if cfg != nil {
+		if volume := strings.TrimSpace(cfg.Ingress.Caddy.ConfigVolume); volume != "" {
+			return volume
+		}
+		return CaddyConfigVolumeName(cfg.Project, envName)
+	}
+	return ""
+}
+
+func DockerNetworkName(cfg *config.Config, envName string) string {
+	if cfg == nil || !cfg.Docker.Network.EnabledValue(true) {
+		return ""
+	}
+	if name := strings.TrimSpace(cfg.Docker.Network.Name); name != "" {
+		return name
+	}
+	return "ship-" + safeNamePart(cfg.Project) + "-" + safeNamePart(envName)
+}
+
+func DockerNetworkDriver(cfg *config.Config) string {
+	if cfg != nil {
+		if driver := strings.TrimSpace(cfg.Docker.Network.Driver); driver != "" {
+			return driver
+		}
+	}
+	return "bridge"
+}
+
+func ServiceNetworkAliases(service string, svc config.Service) []string {
+	return normalizedAliases(append([]string{service}, svc.NetworkAliases...))
+}
+
+func normalizedAliases(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func CaddyLabels(project, envName string) map[string]string {
 	return map[string]string{
 		docker.LabelProject:     safeLabelValue(project),
@@ -611,17 +815,41 @@ func ContainerName(project, envName, service string, replica int, release string
 	return strings.Join(parts, "_")
 }
 
-func ContainerLabels(project, envName, service string, replica int, release string) map[string]string {
-	return map[string]string{
+func ContainerLabels(project, envName, service string, replica int, release string, custom ...map[string]string) map[string]string {
+	labels := mergeLabels(custom...)
+	for key, value := range map[string]string{
 		docker.LabelProject:     safeLabelValue(project),
 		docker.LabelEnvironment: safeLabelValue(envName),
 		docker.LabelService:     safeLabelValue(service),
 		docker.LabelReplica:     strconv.Itoa(replica),
 		docker.LabelRelease:     safeLabelValue(release),
+	} {
+		labels[key] = value
 	}
+	return labels
+}
+
+func mergeLabels(inputs ...map[string]string) map[string]string {
+	labels := map[string]string{}
+	for _, input := range inputs {
+		for key, value := range input {
+			if strings.TrimSpace(key) != "" {
+				labels[key] = value
+			}
+		}
+	}
+	return labels
 }
 
 func DockerArgs(svc config.Service, envFiles ...string) []string {
+	return dockerArgs(svc, true, true, envFiles...)
+}
+
+func DockerOneOffArgs(svc config.Service, envFiles ...string) []string {
+	return dockerArgs(svc, false, false, envFiles...)
+}
+
+func dockerArgs(svc config.Service, includeRestart, includePorts bool, envFiles ...string) []string {
 	args := []string{}
 	for _, env := range svc.Env {
 		if strings.TrimSpace(env) != "" {
@@ -633,10 +861,206 @@ func DockerArgs(svc config.Service, envFiles ...string) []string {
 			args = append(args, "--env-file", envFile)
 		}
 	}
-	for _, port := range svc.Ports {
-		args = append(args, "-p", fmt.Sprintf("%d:%d", port, port))
+	if includeRestart {
+		args = append(args, RestartPolicyArgs(svc.RestartPolicy)...)
+	}
+	for _, volume := range svc.Volumes {
+		if strings.TrimSpace(volume) != "" {
+			args = append(args, "-v", volume)
+		}
+	}
+	args = append(args, ResourceArgs(svc.Resources)...)
+	args = append(args, RuntimeArgs(svc.Runtime)...)
+	args = append(args, LoggingArgs(svc.Logging)...)
+	if includePorts {
+		for _, port := range svc.Ports {
+			args = append(args, "-p", fmt.Sprintf("%d:%d", port, port))
+		}
+		for _, spec := range sortedNonEmpty(svc.Publish) {
+			args = append(args, "-p", spec)
+		}
 	}
 	return args
+}
+
+func RestartPolicyArgs(policy string) []string {
+	policy = strings.TrimSpace(policy)
+	if policy == "" {
+		policy = config.DefaultRestartPolicy
+	}
+	return []string{"--restart", policy}
+}
+
+func LoggingArgs(logging config.LoggingConfig) []string {
+	var args []string
+	if driver := strings.TrimSpace(logging.Driver); driver != "" {
+		args = append(args, "--log-driver", driver)
+	}
+	keys := make([]string, 0, len(logging.Options))
+	for key := range logging.Options {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "--log-opt", key+"="+logging.Options[key])
+	}
+	return args
+}
+
+func ResourceArgs(resources config.ResourceConfig) []string {
+	var args []string
+	if value := strings.TrimSpace(resources.CPUs); value != "" {
+		args = append(args, "--cpus", value)
+	}
+	if value := strings.TrimSpace(resources.Memory); value != "" {
+		args = append(args, "--memory", value)
+	}
+	if value := strings.TrimSpace(resources.MemoryReservation); value != "" {
+		args = append(args, "--memory-reservation", value)
+	}
+	if value := strings.TrimSpace(resources.MemorySwap); value != "" {
+		args = append(args, "--memory-swap", value)
+	}
+	if resources.CPUShares > 0 {
+		args = append(args, "--cpu-shares", strconv.Itoa(resources.CPUShares))
+	}
+	if value := strings.TrimSpace(resources.CPUSetCPUs); value != "" {
+		args = append(args, "--cpuset-cpus", value)
+	}
+	if resources.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(resources.PIDsLimit))
+	}
+	return args
+}
+
+func RuntimeArgs(runtime config.RuntimeConfig) []string {
+	var args []string
+	if runtime.Privileged {
+		args = append(args, "--privileged")
+	}
+	if runtime.ReadOnly {
+		args = append(args, "--read-only")
+	}
+	if runtime.Init {
+		args = append(args, "--init")
+	}
+	if value := strings.TrimSpace(runtime.User); value != "" {
+		args = append(args, "--user", value)
+	}
+	if value := strings.TrimSpace(runtime.Workdir); value != "" {
+		args = append(args, "--workdir", value)
+	}
+	if value := strings.TrimSpace(runtime.Hostname); value != "" {
+		args = append(args, "--hostname", value)
+	}
+	if value := strings.TrimSpace(runtime.Entrypoint); value != "" {
+		args = append(args, "--entrypoint", value)
+	}
+	if value := strings.TrimSpace(runtime.IPC); value != "" {
+		args = append(args, "--ipc", value)
+	}
+	if value := strings.TrimSpace(runtime.PID); value != "" {
+		args = append(args, "--pid", value)
+	}
+	if value := strings.TrimSpace(runtime.CgroupNS); value != "" {
+		args = append(args, "--cgroupns", value)
+	}
+	if value := strings.TrimSpace(runtime.StopSignal); value != "" {
+		args = append(args, "--stop-signal", value)
+	}
+	if runtime.StopTimeoutSeconds > 0 {
+		args = append(args, "--stop-timeout", strconv.Itoa(runtime.StopTimeoutSeconds))
+	}
+	if value := strings.TrimSpace(runtime.ShmSize); value != "" {
+		args = append(args, "--shm-size", value)
+	}
+	if value := strings.TrimSpace(runtime.GPUs); value != "" {
+		args = append(args, "--gpus", value)
+	}
+	if runtime.NoHealthcheck {
+		args = append(args, "--no-healthcheck")
+	}
+	if value := strings.TrimSpace(runtime.HealthCMD); value != "" {
+		args = append(args, "--health-cmd", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthInterval); value != "" {
+		args = append(args, "--health-interval", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthTimeout); value != "" {
+		args = append(args, "--health-timeout", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthStartPeriod); value != "" {
+		args = append(args, "--health-start-period", value)
+	}
+	if runtime.HealthRetries > 0 {
+		args = append(args, "--health-retries", strconv.Itoa(runtime.HealthRetries))
+	}
+	for _, value := range sortedNonEmpty(runtime.CapAdd) {
+		args = append(args, "--cap-add", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.CapDrop) {
+		args = append(args, "--cap-drop", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.GroupAdd) {
+		args = append(args, "--group-add", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.SecurityOpt) {
+		args = append(args, "--security-opt", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Ulimits) {
+		args = append(args, "--ulimit", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Mounts) {
+		args = append(args, "--mount", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.AddHosts) {
+		args = append(args, "--add-host", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNS) {
+		args = append(args, "--dns", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNSSearch) {
+		args = append(args, "--dns-search", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNSOptions) {
+		args = append(args, "--dns-option", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Devices) {
+		args = append(args, "--device", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DeviceCgroupRules) {
+		args = append(args, "--device-cgroup-rule", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Tmpfs) {
+		args = append(args, "--tmpfs", value)
+	}
+	keys := make([]string, 0, len(runtime.Sysctls))
+	for key := range runtime.Sysctls {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if value := strings.TrimSpace(runtime.Sysctls[key]); value != "" {
+			args = append(args, "--sysctl", key+"="+value)
+		}
+	}
+	return args
+}
+
+func sortedNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func usesFixedHostPorts(svc config.Service) bool {
@@ -670,6 +1094,17 @@ func HealthCheck(svc config.Service, containerName string) (agent.HealthCheckPar
 		}, true, nil
 	}
 	return agent.HealthCheckParams{}, false, nil
+}
+
+func HealthRetryInterval(svc config.Service) time.Duration {
+	if svc.Rolling.HealthRetries <= 0 {
+		return 0
+	}
+	seconds := svc.Rolling.HealthIntervalSeconds
+	if seconds <= 0 {
+		seconds = defaultHealthRetryIntervalSeconds
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func stopCandidates(cfg *config.Config, envName string, observed []ObservedContainer, desiredNames map[string]struct{}) []ObservedContainer {
@@ -719,11 +1154,13 @@ func replacementStopCandidates(cfg *config.Config, envName string, placement sch
 
 func appendStopActions(actions []Action, old ObservedContainer, svc config.Service) []Action {
 	serviceName := old.Container.Labels[docker.LabelService]
+	replica, _ := strconv.Atoi(old.Container.Labels[docker.LabelReplica])
 	if svc.Rolling.DrainTimeoutSeconds > 0 {
 		actions = append(actions, Action{
 			Kind:          ActionDrain,
 			Host:          old.Host,
 			Service:       serviceName,
+			Replica:       replica,
 			Release:       old.Container.Labels[docker.LabelRelease],
 			ContainerName: old.Container.Names,
 			DrainTimeout:  time.Duration(svc.Rolling.DrainTimeoutSeconds) * time.Second,
@@ -733,6 +1170,7 @@ func appendStopActions(actions []Action, old ObservedContainer, svc config.Servi
 		Kind:          ActionStop,
 		Host:          old.Host,
 		Service:       serviceName,
+		Replica:       replica,
 		Release:       old.Container.Labels[docker.LabelRelease],
 		ContainerName: old.Container.Names,
 	})

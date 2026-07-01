@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,7 +20,11 @@ type SSH struct {
 	Host           string
 	DryRun         bool
 	Timeout        time.Duration
+	Port           int
+	IdentityFile   string
 	KnownHostsFile string
+	JumpHost       string
+	Options        map[string]string
 }
 
 func (s SSH) Target() string {
@@ -92,8 +98,20 @@ func (s SSH) args(command string) []string {
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "ConnectTimeout=15",
 	}
+	if s.Port > 0 {
+		args = append(args, "-p", strconv.Itoa(s.Port))
+	}
+	if identityFile := strings.TrimSpace(s.IdentityFile); identityFile != "" {
+		args = append(args, "-i", identityFile)
+	}
 	if knownHostsFile := s.knownHostsFile(); knownHostsFile != "" {
 		args = append(args, "-o", "UserKnownHostsFile="+knownHostsFile)
+	}
+	if jumpHost := strings.TrimSpace(s.JumpHost); jumpHost != "" {
+		args = append(args, "-J", jumpHost)
+	}
+	for _, option := range s.sortedOptions() {
+		args = append(args, "-o", option)
 	}
 	args = append(args, s.Target(), command)
 	return args
@@ -104,6 +122,26 @@ func (s SSH) knownHostsFile() string {
 		return strings.TrimSpace(s.KnownHostsFile)
 	}
 	return strings.TrimSpace(os.Getenv(knownHostsEnv))
+}
+
+func (s SSH) sortedOptions() []string {
+	if len(s.Options) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(s.Options))
+	for key := range s.Options {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	options := make([]string, 0, len(keys))
+	for _, key := range keys {
+		options = append(options, key+"="+strings.TrimSpace(s.Options[key]))
+	}
+	return options
 }
 
 func Available(ctx context.Context) error {

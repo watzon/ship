@@ -71,6 +71,81 @@ func TestBuildActionsStopsFixedPortReplicaBeforeStart(t *testing.T) {
 	}
 }
 
+func TestBuildActionsAddsCustomServiceLabels(t *testing.T) {
+	cfg := testConfig()
+	svc := cfg.Services["web"]
+	svc.Labels = map[string]string{
+		"com.example.team": "platform",
+		"tier":             "frontend",
+	}
+	svc.NetworkAliases = []string{"frontend", "web"}
+	cfg.Services["web"] = svc
+	env := cfg.Environments["production"]
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start Action
+	for _, action := range actions {
+		if action.Kind == ActionStart {
+			start = action
+			break
+		}
+	}
+	if start.Labels["com.example.team"] != "platform" || start.Labels["tier"] != "frontend" {
+		t.Fatalf("custom labels = %+v", start.Labels)
+	}
+	if start.Labels[docker.LabelService] != "web" || start.Labels[docker.LabelRelease] != "new" {
+		t.Fatalf("ship labels = %+v", start.Labels)
+	}
+	if start.Network != "ship-demo-production" || start.NetworkDriver != "bridge" {
+		t.Fatalf("network = %q driver = %q", start.Network, start.NetworkDriver)
+	}
+	if strings.Join(start.NetworkAliases, ",") != "frontend,web" {
+		t.Fatalf("network aliases = %+v", start.NetworkAliases)
+	}
+}
+
+func TestBuildActionsUsesConfiguredDockerNetwork(t *testing.T) {
+	cfg := testConfig()
+	cfg.Docker.Network.Name = "edge-net"
+	cfg.Docker.Network.Driver = "overlay"
+	env := cfg.Environments["production"]
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start, ingressAction *Action
+	for i := range actions {
+		switch actions[i].Kind {
+		case ActionStart:
+			start = &actions[i]
+		case ActionIngress:
+			ingressAction = &actions[i]
+		}
+	}
+	if start == nil || start.Network != "edge-net" || start.NetworkDriver != "overlay" {
+		t.Fatalf("start network = %+v", start)
+	}
+	if ingressAction == nil || ingressAction.Network != "edge-net" || ingressAction.NetworkDriver != "overlay" {
+		t.Fatalf("ingress network = %+v", ingressAction)
+	}
+}
+
 func TestBuildActionsHonorsMaxSurgeOneForRollingReplacement(t *testing.T) {
 	cfg := rollingStrategyConfig(0, 1)
 	env := cfg.Environments["production"]
@@ -102,6 +177,119 @@ func TestBuildActionsHonorsMaxSurgeOneForRollingReplacement(t *testing.T) {
 	}
 	if actions[7].ContainerName != ContainerName("demo", "production", "web", 2, "old") {
 		t.Fatalf("second stop = %+v", actions[7])
+	}
+}
+
+func TestBuildActionsInsertsCanaryPauseAfterFirstHealthyReplica(t *testing.T) {
+	cfg := rollingStrategyConfig(0, 1)
+	env := cfg.Environments["production"]
+	env.Hosts.Pools["web"] = config.Pool{Count: 3}
+	cfg.Environments["production"] = env
+	web := cfg.Services["web"]
+	web.Scale = 3
+	web.Rolling.CanaryPauseSeconds = 45
+	cfg.Services["web"] = web
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+		Observed: []ObservedContainer{
+			statusObserved("web-1", "web", 1, "old", "Up 1 minute"),
+			statusObserved("web-2", "web", 2, "old", "Up 1 minute"),
+			statusObserved("web-3", "web", 3, "old", "Up 1 minute"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := actionKinds(actions)
+	want := []ActionKind{
+		ActionPull, ActionStart, ActionHealth, ActionCanary, ActionStop,
+		ActionPull, ActionStart, ActionHealth, ActionStop,
+		ActionPull, ActionStart, ActionHealth, ActionStop,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("kinds = %#v, want %#v", got, want)
+	}
+	if actions[3].PauseDuration != 45*time.Second || actions[3].Service != "web" || actions[3].Replica != 1 {
+		t.Fatalf("canary action = %+v", actions[3])
+	}
+}
+
+func TestBuildActionsHonorsConfiguredCanaryReplicaBatch(t *testing.T) {
+	cfg := rollingStrategyConfig(0, 2)
+	env := cfg.Environments["production"]
+	env.Hosts.Pools["web"] = config.Pool{Count: 4}
+	cfg.Environments["production"] = env
+	web := cfg.Services["web"]
+	web.Scale = 4
+	web.Rolling.CanaryReplicas = 2
+	web.Rolling.CanaryPauseSeconds = 30
+	cfg.Services["web"] = web
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+		Observed: []ObservedContainer{
+			statusObserved("web-1", "web", 1, "old", "Up 1 minute"),
+			statusObserved("web-2", "web", 2, "old", "Up 1 minute"),
+			statusObserved("web-3", "web", 3, "old", "Up 1 minute"),
+			statusObserved("web-4", "web", 4, "old", "Up 1 minute"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canaryIndexes []int
+	for i, action := range actions {
+		if action.Kind == ActionCanary {
+			canaryIndexes = append(canaryIndexes, i)
+		}
+	}
+	if !reflect.DeepEqual(canaryIndexes, []int{6}) {
+		t.Fatalf("canary indexes = %#v, actions = %#v", canaryIndexes, actionKinds(actions))
+	}
+	if actions[6].Replica != 2 || actions[6].PauseDuration != 30*time.Second {
+		t.Fatalf("canary action = %+v", actions[6])
+	}
+}
+
+func TestBuildActionsCarriesHealthRetrySettings(t *testing.T) {
+	cfg := testConfig()
+	web := cfg.Services["web"]
+	web.Rolling.HealthRetries = 4
+	web.Rolling.HealthIntervalSeconds = 7
+	cfg.Services["web"] = web
+	env := cfg.Environments["production"]
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var health Action
+	for _, action := range actions {
+		if action.Kind == ActionHealth {
+			health = action
+			break
+		}
+	}
+	if health.Kind != ActionHealth {
+		t.Fatalf("missing health action: %+v", actions)
+	}
+	if health.HealthRetries != 4 || health.HealthInterval != 7*time.Second {
+		t.Fatalf("health retry settings = retries %d interval %s", health.HealthRetries, health.HealthInterval)
 	}
 }
 
@@ -176,6 +364,40 @@ func TestBuildActionsUsesHostContactsForIngressUpstreamsOnly(t *testing.T) {
 	}
 	if len(ingressAction.IngressHosts) != 1 || ingressAction.IngressHosts[0].Name != "ingress-1" {
 		t.Fatalf("ingress hosts = %+v", ingressAction.IngressHosts)
+	}
+	if ingressAction.CaddyDataVolume != CaddyDataVolumeName("demo", "production") || ingressAction.CaddyConfigVolume != CaddyConfigVolumeName("demo", "production") {
+		t.Fatalf("caddy volumes = data %q config %q", ingressAction.CaddyDataVolume, ingressAction.CaddyConfigVolume)
+	}
+}
+
+func TestBuildActionsUsesConfiguredCaddyVolumes(t *testing.T) {
+	cfg := testConfig()
+	cfg.Ingress.Caddy.DataVolume = "custom-caddy-data"
+	cfg.Ingress.Caddy.ConfigVolume = "custom-caddy-config"
+	env := cfg.Environments["production"]
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ingressAction *Action
+	for i := range actions {
+		if actions[i].Kind == ActionIngress {
+			ingressAction = &actions[i]
+			break
+		}
+	}
+	if ingressAction == nil {
+		t.Fatalf("missing ingress action: %+v", actions)
+	}
+	if ingressAction.CaddyDataVolume != "custom-caddy-data" || ingressAction.CaddyConfigVolume != "custom-caddy-config" {
+		t.Fatalf("caddy volumes = data %q config %q", ingressAction.CaddyDataVolume, ingressAction.CaddyConfigVolume)
 	}
 }
 
@@ -427,7 +649,7 @@ func TestExecuteActionsUsesAgentMethodsInOrder(t *testing.T) {
 	fake := &fakeAgent{}
 	actions := []Action{
 		{Kind: ActionPull, Host: scheduler.Host{Name: "web-1"}, Image: "example/web@sha256:111"},
-		{Kind: ActionStart, Host: scheduler.Host{Name: "web-1"}, ContainerName: "ship_demo_production_web_1_new", Image: "example/web@sha256:111", Labels: map[string]string{docker.LabelProject: "demo"}},
+		{Kind: ActionStart, Host: scheduler.Host{Name: "web-1"}, ContainerName: "ship_demo_production_web_1_new", Image: "example/web@sha256:111", Labels: map[string]string{docker.LabelProject: "demo"}, Network: "ship-demo-production", NetworkDriver: "bridge"},
 		{Kind: ActionHealth, Host: scheduler.Host{Name: "web-1"}, ContainerName: "ship_demo_production_web_1_new", Health: agent.HealthCheckParams{URL: "http://127.0.0.1:3000/up"}},
 		{Kind: ActionDrain, DrainTimeout: 2 * time.Second},
 		{Kind: ActionStop, Host: scheduler.Host{Name: "web-1"}, ContainerName: "old"},
@@ -440,12 +662,40 @@ func TestExecuteActionsUsesAgentMethodsInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"pull", "run_container", "health_check", "stop_container"}
+	want := []string{"pull", "ensure_network", "run_container", "health_check", "stop_container"}
 	if !reflect.DeepEqual(fake.methods, want) {
 		t.Fatalf("methods = %#v, want %#v", fake.methods, want)
 	}
 	if slept != 2*time.Second {
 		t.Fatalf("slept = %v", slept)
+	}
+}
+
+func TestExecuteActionsRetriesHealthCheck(t *testing.T) {
+	fake := &retryHealthAgent{failuresBeforeOK: 2}
+	var sleeps []time.Duration
+	action := Action{
+		Kind:           ActionHealth,
+		Host:           scheduler.Host{Name: "web-1"},
+		ContainerName:  "ship_demo_production_web_1_new",
+		Health:         agent.HealthCheckParams{URL: "http://127.0.0.1:3000/up"},
+		HealthRetries:  3,
+		HealthInterval: 150 * time.Millisecond,
+	}
+	err := ExecuteActions(context.Background(), []Action{action}, func(host scheduler.Host) Agent {
+		return fake
+	}, func(d time.Duration) {
+		sleeps = append(sleeps, d)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.healthChecks != 3 {
+		t.Fatalf("health checks = %d", fake.healthChecks)
+	}
+	wantSleeps := []time.Duration{150 * time.Millisecond, 150 * time.Millisecond}
+	if !reflect.DeepEqual(sleeps, wantSleeps) {
+		t.Fatalf("sleeps = %#v, want %#v", sleeps, wantSleeps)
 	}
 }
 
@@ -529,6 +779,20 @@ func TestExecuteIngressActionReloadsHostsAndWritesLocalState(t *testing.T) {
 		if len(agents[host].reloads) != 1 || agents[host].reloads[0] != action.IngressConfig {
 			t.Fatalf("%s reloads = %#v", host, agents[host].reloads)
 		}
+		if len(agents[host].runs) != 1 {
+			t.Fatalf("%s runs = %#v", host, agents[host].runs)
+		}
+		runArgs := strings.Join(agents[host].runs[0].Args, " ")
+		for _, needle := range []string{
+			"--restart unless-stopped",
+			"-p 443:443/udp",
+			"-v ship_caddy_data:/data",
+			"-v ship_caddy_config:/config",
+		} {
+			if !strings.Contains(runArgs, needle) {
+				t.Fatalf("%s run args %q missing %q", host, runArgs, needle)
+			}
+		}
 		if !agents[host].validated[0] {
 			t.Fatalf("%s reload was not validated", host)
 		}
@@ -594,6 +858,23 @@ func TestExecuteActionsDoesNotReloadIngressAfterHealthFailure(t *testing.T) {
 	}
 }
 
+func TestExecuteActionsSleepsForCanaryPause(t *testing.T) {
+	var sleeps []time.Duration
+	err := ExecuteActions(context.Background(), []Action{
+		{Kind: ActionCanary, Service: "web", Replica: 1, PauseDuration: 12 * time.Second},
+	}, func(host scheduler.Host) Agent {
+		return &ingressAgent{}
+	}, func(duration time.Duration) {
+		sleeps = append(sleeps, duration)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(sleeps, []time.Duration{12 * time.Second}) {
+		t.Fatalf("sleeps = %#v", sleeps)
+	}
+}
+
 func TestHealthCheckCommandRunsInsideContainer(t *testing.T) {
 	params, ok, err := HealthCheck(config.Service{
 		Health:  config.HealthCheck{Command: "bin/check 'quoted'"},
@@ -614,6 +895,64 @@ func TestDockerArgsIncludesExplicitEnvAndEnvFile(t *testing.T) {
 	args := DockerArgs(config.Service{
 		Env:   []string{"RACK_ENV=production", ""},
 		Ports: []int{3000},
+		Publish: []string{
+			"127.0.0.1:8080:80",
+			"5353:5353/udp",
+		},
+		Volumes: []string{
+			"uploads:/app/uploads",
+			"/srv/config:/app/config:ro",
+		},
+		Resources: config.ResourceConfig{
+			CPUs:              "1.5",
+			Memory:            "512m",
+			MemoryReservation: "256m",
+			MemorySwap:        "1g",
+			CPUShares:         512,
+			CPUSetCPUs:        "0,1",
+			PIDsLimit:         256,
+		},
+		Runtime: config.RuntimeConfig{
+			ReadOnly:           true,
+			Init:               true,
+			User:               "1000:1000",
+			Workdir:            "/app",
+			Hostname:           "web-runtime",
+			Entrypoint:         "/docker-entrypoint",
+			IPC:                "host",
+			PID:                "container:sidecar",
+			CgroupNS:           "host",
+			StopSignal:         "SIGTERM",
+			StopTimeoutSeconds: 30,
+			ShmSize:            "1g",
+			GPUs:               "all",
+			HealthCMD:          "curl -fsS http://127.0.0.1:3000/up || exit 1",
+			HealthInterval:     "10s",
+			HealthTimeout:      "3s",
+			HealthStartPeriod:  "20s",
+			HealthRetries:      3,
+			CapAdd:             []string{"SYS_PTRACE"},
+			CapDrop:            []string{"NET_RAW"},
+			GroupAdd:           []string{"video"},
+			SecurityOpt:        []string{"no-new-privileges:true"},
+			Sysctls:            map[string]string{"net.core.somaxconn": "1024"},
+			Ulimits:            []string{"nofile=262144:262144"},
+			Mounts:             []string{"type=bind,source=/srv/cache,target=/cache,readonly"},
+			AddHosts:           []string{"host.docker.internal:host-gateway"},
+			DNS:                []string{"1.1.1.1"},
+			DNSSearch:          []string{"svc.local"},
+			DNSOptions:         []string{"ndots:1"},
+			Devices:            []string{"/dev/fuse:/dev/fuse"},
+			DeviceCgroupRules:  []string{"c 10:229 rwm"},
+			Tmpfs:              []string{"/tmp:rw,noexec,nosuid,size=64m"},
+		},
+		Logging: config.LoggingConfig{
+			Driver: "json-file",
+			Options: map[string]string{
+				"max-size": "10m",
+				"max-file": "3",
+			},
+		},
 	}, "/var/lib/ship/secrets/production/service-web.env")
 
 	want := []string{
@@ -621,9 +960,122 @@ func TestDockerArgsIncludesExplicitEnvAndEnvFile(t *testing.T) {
 		"RACK_ENV=production",
 		"--env-file",
 		"/var/lib/ship/secrets/production/service-web.env",
+		"--restart",
+		"unless-stopped",
+		"-v",
+		"uploads:/app/uploads",
+		"-v",
+		"/srv/config:/app/config:ro",
+		"--cpus",
+		"1.5",
+		"--memory",
+		"512m",
+		"--memory-reservation",
+		"256m",
+		"--memory-swap",
+		"1g",
+		"--cpu-shares",
+		"512",
+		"--cpuset-cpus",
+		"0,1",
+		"--pids-limit",
+		"256",
+		"--read-only",
+		"--init",
+		"--user",
+		"1000:1000",
+		"--workdir",
+		"/app",
+		"--hostname",
+		"web-runtime",
+		"--entrypoint",
+		"/docker-entrypoint",
+		"--ipc",
+		"host",
+		"--pid",
+		"container:sidecar",
+		"--cgroupns",
+		"host",
+		"--stop-signal",
+		"SIGTERM",
+		"--stop-timeout",
+		"30",
+		"--shm-size",
+		"1g",
+		"--gpus",
+		"all",
+		"--health-cmd",
+		"curl -fsS http://127.0.0.1:3000/up || exit 1",
+		"--health-interval",
+		"10s",
+		"--health-timeout",
+		"3s",
+		"--health-start-period",
+		"20s",
+		"--health-retries",
+		"3",
+		"--cap-add",
+		"SYS_PTRACE",
+		"--cap-drop",
+		"NET_RAW",
+		"--group-add",
+		"video",
+		"--security-opt",
+		"no-new-privileges:true",
+		"--ulimit",
+		"nofile=262144:262144",
+		"--mount",
+		"type=bind,source=/srv/cache,target=/cache,readonly",
+		"--add-host",
+		"host.docker.internal:host-gateway",
+		"--dns",
+		"1.1.1.1",
+		"--dns-search",
+		"svc.local",
+		"--dns-option",
+		"ndots:1",
+		"--device",
+		"/dev/fuse:/dev/fuse",
+		"--device-cgroup-rule",
+		"c 10:229 rwm",
+		"--tmpfs",
+		"/tmp:rw,noexec,nosuid,size=64m",
+		"--sysctl",
+		"net.core.somaxconn=1024",
+		"--log-driver",
+		"json-file",
+		"--log-opt",
+		"max-file=3",
+		"--log-opt",
+		"max-size=10m",
 		"-p",
 		"3000:3000",
+		"-p",
+		"127.0.0.1:8080:80",
+		"-p",
+		"5353:5353/udp",
 	}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
+func TestDockerArgsIncludesCustomRestartPolicy(t *testing.T) {
+	args := DockerArgs(config.Service{RestartPolicy: "on-failure:3"})
+	want := []string{"--restart", "on-failure:3"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
+func TestDockerOneOffArgsOmitRestartPolicyAndPorts(t *testing.T) {
+	args := DockerOneOffArgs(config.Service{
+		RestartPolicy: "always",
+		Ports:         []int{3000},
+		Env:           []string{"RACK_ENV=production"},
+		Runtime:       config.RuntimeConfig{Privileged: true},
+	})
+	want := []string{"-e", "RACK_ENV=production", "--privileged"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("args = %#v, want %#v", args, want)
 	}
@@ -736,6 +1188,28 @@ func (f *fakeAgent) Call(ctx context.Context, method string, params any, out any
 	return nil
 }
 
+type retryHealthAgent struct {
+	healthChecks     int
+	failuresBeforeOK int
+}
+
+func (f *retryHealthAgent) Call(ctx context.Context, method string, params any, out any) error {
+	if method != "health_check" {
+		return fmt.Errorf("unexpected method %s", method)
+	}
+	f.healthChecks++
+	if f.healthChecks <= f.failuresBeforeOK {
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: false}
+		}
+		return nil
+	}
+	if result, ok := out.(*agent.HealthCheckResult); ok {
+		*result = agent.HealthCheckResult{OK: true}
+	}
+	return nil
+}
+
 type fixedPortAgent struct {
 	activePorts map[int]string
 	events      []string
@@ -781,6 +1255,7 @@ func (f *fixedPortAgent) Call(ctx context.Context, method string, params any, ou
 type ingressAgent struct {
 	host       string
 	reloads    []string
+	runs       []agent.RunContainerParams
 	validated  []bool
 	clears     []bool
 	failReload bool
@@ -798,6 +1273,9 @@ func (f *ingressAgent) Call(ctx context.Context, method string, params any, out 
 		if f.failReload {
 			return fmt.Errorf("reload failed on %s", f.host)
 		}
+		f.runs = append(f.runs, params.(agent.RunContainerParams))
+	case "ensure_network":
+		return nil
 	case "caddy_reload":
 		p := params.(agent.CaddyReloadParams)
 		f.reloads = append(f.reloads, p.Config)

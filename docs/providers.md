@@ -2,6 +2,8 @@
 
 Ship providers create, list, and delete ordinary Linux hosts for an environment. The CLI stays provider-neutral by talking only to `internal/provider.Provider`.
 
+Currently supported providers are Hetzner Cloud, Vultr, DigitalOcean, Linode, AWS EC2, Amazon Lightsail, Google Compute Engine, Azure Virtual Machines, Scaleway Instances, OpenStack-compatible clouds, Civo, UpCloud, OVHcloud Public Cloud, Oracle Cloud Infrastructure Compute, Exoscale Compute, cloudscale.ch servers, Latitude.sh bare metal, Kamatera cloud servers, Proxmox VE VMs, Terraform/OpenTofu-managed hosts, Pulumi-managed hosts, Ansible inventory hosts, OpenSSH config inventory, and manual SSH hosts.
+
 ## Config
 
 Add a provider constant and config block in `internal/config/config.go`.
@@ -15,7 +17,7 @@ Provider config should describe the host shape for all pools in the environment.
 
 ## Factory
 
-Register the provider in `internal/providers/providers.go`.
+Register the provider in `internal/provider/providers/providers.go`.
 
 `ForEnvironment` must return a provider initialized from environment variables and the global dry-run flag. The CLI and doctor use this factory, so provider-specific code should not be added to command handlers.
 
@@ -41,7 +43,7 @@ Every provider must mark created hosts with Ship ownership metadata:
 - `environment=<environment>`
 - `pool=<pool>`
 
-Use native labels when the provider supports key/value labels. Use stable tags when it does not. `List` must filter to the requested project and environment before returning hosts, and `Delete` should only be reached for hosts returned by that filtered list.
+Use native labels when the provider supports key/value labels. Use stable tags when it does not. If a provider does not expose arbitrary per-host metadata through its list API, use a deterministic Ship-owned cloud resource name prefix and strip it back to the normal Ship host name internally. `List` must filter to the requested project and environment before returning hosts, and `Delete` should only be reached for hosts returned by that filtered list.
 
 ## Tests
 

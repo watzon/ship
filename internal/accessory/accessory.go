@@ -167,12 +167,53 @@ func ContainerName(project, envName, name string) string {
 	return strings.Join(parts, "_")
 }
 
-func ContainerLabels(project, envName, name string) map[string]string {
-	return map[string]string{
+func ContainerLabels(project, envName, name string, custom ...map[string]string) map[string]string {
+	labels := mergeLabels(custom...)
+	for key, value := range map[string]string{
 		docker.LabelProject:     safeLabelValue(project),
 		docker.LabelEnvironment: safeLabelValue(envName),
 		docker.LabelAccessory:   safeLabelValue(name),
+	} {
+		labels[key] = value
 	}
+	return labels
+}
+
+func NetworkAliases(name string, acc config.Accessory) []string {
+	return normalizedAliases(append([]string{name}, acc.NetworkAliases...))
+}
+
+func mergeLabels(inputs ...map[string]string) map[string]string {
+	labels := map[string]string{}
+	for _, input := range inputs {
+		for key, value := range input {
+			if strings.TrimSpace(key) != "" {
+				labels[key] = value
+			}
+		}
+	}
+	return labels
+}
+
+func normalizedAliases(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func DockerArgs(acc config.Accessory, envFiles ...string) []string {
@@ -187,15 +228,183 @@ func DockerArgs(acc config.Accessory, envFiles ...string) []string {
 			args = append(args, "--env-file", envFile)
 		}
 	}
+	args = append(args, restartPolicyArgs(acc.RestartPolicy)...)
 	for _, port := range acc.Ports {
 		args = append(args, "-p", fmt.Sprintf("%d:%d", port, port))
+	}
+	for _, spec := range sortedNonEmpty(acc.Publish) {
+		args = append(args, "-p", spec)
 	}
 	for _, volume := range acc.Volumes {
 		if strings.TrimSpace(volume) != "" {
 			args = append(args, "-v", volume)
 		}
 	}
+	args = append(args, resourceArgs(acc.Resources)...)
+	args = append(args, runtimeArgs(acc.Runtime)...)
 	return args
+}
+
+func resourceArgs(resources config.ResourceConfig) []string {
+	var args []string
+	if value := strings.TrimSpace(resources.CPUs); value != "" {
+		args = append(args, "--cpus", value)
+	}
+	if value := strings.TrimSpace(resources.Memory); value != "" {
+		args = append(args, "--memory", value)
+	}
+	if value := strings.TrimSpace(resources.MemoryReservation); value != "" {
+		args = append(args, "--memory-reservation", value)
+	}
+	if value := strings.TrimSpace(resources.MemorySwap); value != "" {
+		args = append(args, "--memory-swap", value)
+	}
+	if resources.CPUShares > 0 {
+		args = append(args, "--cpu-shares", strconv.Itoa(resources.CPUShares))
+	}
+	if value := strings.TrimSpace(resources.CPUSetCPUs); value != "" {
+		args = append(args, "--cpuset-cpus", value)
+	}
+	if resources.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(resources.PIDsLimit))
+	}
+	return args
+}
+
+func runtimeArgs(runtime config.RuntimeConfig) []string {
+	var args []string
+	if runtime.Privileged {
+		args = append(args, "--privileged")
+	}
+	if runtime.ReadOnly {
+		args = append(args, "--read-only")
+	}
+	if runtime.Init {
+		args = append(args, "--init")
+	}
+	if value := strings.TrimSpace(runtime.User); value != "" {
+		args = append(args, "--user", value)
+	}
+	if value := strings.TrimSpace(runtime.Workdir); value != "" {
+		args = append(args, "--workdir", value)
+	}
+	if value := strings.TrimSpace(runtime.Hostname); value != "" {
+		args = append(args, "--hostname", value)
+	}
+	if value := strings.TrimSpace(runtime.Entrypoint); value != "" {
+		args = append(args, "--entrypoint", value)
+	}
+	if value := strings.TrimSpace(runtime.IPC); value != "" {
+		args = append(args, "--ipc", value)
+	}
+	if value := strings.TrimSpace(runtime.PID); value != "" {
+		args = append(args, "--pid", value)
+	}
+	if value := strings.TrimSpace(runtime.CgroupNS); value != "" {
+		args = append(args, "--cgroupns", value)
+	}
+	if value := strings.TrimSpace(runtime.StopSignal); value != "" {
+		args = append(args, "--stop-signal", value)
+	}
+	if runtime.StopTimeoutSeconds > 0 {
+		args = append(args, "--stop-timeout", strconv.Itoa(runtime.StopTimeoutSeconds))
+	}
+	if value := strings.TrimSpace(runtime.ShmSize); value != "" {
+		args = append(args, "--shm-size", value)
+	}
+	if value := strings.TrimSpace(runtime.GPUs); value != "" {
+		args = append(args, "--gpus", value)
+	}
+	if runtime.NoHealthcheck {
+		args = append(args, "--no-healthcheck")
+	}
+	if value := strings.TrimSpace(runtime.HealthCMD); value != "" {
+		args = append(args, "--health-cmd", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthInterval); value != "" {
+		args = append(args, "--health-interval", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthTimeout); value != "" {
+		args = append(args, "--health-timeout", value)
+	}
+	if value := strings.TrimSpace(runtime.HealthStartPeriod); value != "" {
+		args = append(args, "--health-start-period", value)
+	}
+	if runtime.HealthRetries > 0 {
+		args = append(args, "--health-retries", strconv.Itoa(runtime.HealthRetries))
+	}
+	for _, value := range sortedNonEmpty(runtime.CapAdd) {
+		args = append(args, "--cap-add", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.CapDrop) {
+		args = append(args, "--cap-drop", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.GroupAdd) {
+		args = append(args, "--group-add", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.SecurityOpt) {
+		args = append(args, "--security-opt", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Ulimits) {
+		args = append(args, "--ulimit", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Mounts) {
+		args = append(args, "--mount", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.AddHosts) {
+		args = append(args, "--add-host", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNS) {
+		args = append(args, "--dns", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNSSearch) {
+		args = append(args, "--dns-search", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DNSOptions) {
+		args = append(args, "--dns-option", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Devices) {
+		args = append(args, "--device", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.DeviceCgroupRules) {
+		args = append(args, "--device-cgroup-rule", value)
+	}
+	for _, value := range sortedNonEmpty(runtime.Tmpfs) {
+		args = append(args, "--tmpfs", value)
+	}
+	keys := make([]string, 0, len(runtime.Sysctls))
+	for key := range runtime.Sysctls {
+		if strings.TrimSpace(key) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if value := strings.TrimSpace(runtime.Sysctls[key]); value != "" {
+			args = append(args, "--sysctl", key+"="+value)
+		}
+	}
+	return args
+}
+
+func sortedNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func restartPolicyArgs(policy string) []string {
+	policy = strings.TrimSpace(policy)
+	if policy == "" {
+		policy = config.DefaultRestartPolicy
+	}
+	return []string{"--restart", policy}
 }
 
 func NamedVolumes(acc config.Accessory) []string {
@@ -268,6 +477,18 @@ func BackupCommand(acc config.Accessory, artifact string) (string, error) {
 	), nil
 }
 
+func BackupExportCommand(acc config.Accessory, artifact string) (string, error) {
+	command := strings.TrimSpace(acc.Backup.ExportCommand)
+	if command == "" {
+		return "", nil
+	}
+	artifact = strings.TrimSpace(artifact)
+	if artifact == "" {
+		return "", errors.New("backup artifact path is required")
+	}
+	return "SHIP_BACKUP_ARTIFACT=" + shellQuote(artifact) + "; export SHIP_BACKUP_ARTIFACT; " + command, nil
+}
+
 func RestoreCheckCommand(acc config.Accessory, envName, name, artifact string) (string, error) {
 	artifact, err := ValidateRestoreArtifact(acc, envName, name, artifact)
 	if err != nil {
@@ -289,6 +510,13 @@ func RestoreCommand(acc config.Accessory, artifact string) (string, error) {
 
 func BackupTimeoutSeconds(acc config.Accessory) int {
 	return defaultBackupTimeoutSeconds
+}
+
+func BackupExportTimeoutSeconds(acc config.Accessory) int {
+	if acc.Backup.ExportTimeoutSeconds > 0 {
+		return acc.Backup.ExportTimeoutSeconds
+	}
+	return BackupTimeoutSeconds(acc)
 }
 
 func MatchesLabels(cfg *config.Config, envName, name string, labels map[string]string) bool {

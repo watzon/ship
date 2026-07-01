@@ -22,8 +22,8 @@ import (
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
-	"github.com/watzon/ship/internal/hetzner"
 	providerpkg "github.com/watzon/ship/internal/provider"
+	"github.com/watzon/ship/internal/provider/hetzner"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/state"
 )
@@ -409,6 +409,10 @@ func (d *acceptanceDocker) ResolveDigest(ctx context.Context, image string) (str
 	*d.events = append(*d.events, "resolve:"+image)
 	sum := sha256.Sum256([]byte(image))
 	return imageRepository(image) + "@sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func (d *acceptanceDocker) RegistryAuth(context.Context, string) (docker.RegistryAuth, bool, error) {
+	return docker.RegistryAuth{}, false, nil
 }
 
 func imageRepository(image string) string {

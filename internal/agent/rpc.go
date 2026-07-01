@@ -83,11 +83,13 @@ type NegotiateResult struct {
 }
 
 type RunContainerParams struct {
-	Name    string            `json:"name"`
-	Image   string            `json:"image"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Labels  map[string]string `json:"labels,omitempty"`
+	Name           string            `json:"name"`
+	Image          string            `json:"image"`
+	Command        string            `json:"command"`
+	Args           []string          `json:"args"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	Network        string            `json:"network,omitempty"`
+	NetworkAliases []string          `json:"network_aliases,omitempty"`
 }
 
 type LogsParams struct {
@@ -116,6 +118,23 @@ type HealthCheckResult struct {
 	DurationMS int64  `json:"duration_ms"`
 }
 
+type ExecContainerParams struct {
+	Name           string `json:"name"`
+	Command        string `json:"command"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
+type RunOneOffContainerParams struct {
+	Name           string            `json:"name"`
+	Image          string            `json:"image"`
+	Command        string            `json:"command"`
+	Args           []string          `json:"args,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	Network        string            `json:"network,omitempty"`
+	NetworkAliases []string          `json:"network_aliases,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+}
+
 type WriteFileParams struct {
 	Path     string `json:"path"`
 	Content  string `json:"content"`
@@ -126,6 +145,32 @@ type WriteFileParams struct {
 type WriteFileResult struct {
 	Path  string `json:"path"`
 	Bytes int    `json:"bytes"`
+}
+
+type WriteRegistryAuthParams struct {
+	Server string          `json:"server"`
+	Auth   json.RawMessage `json:"auth"`
+}
+
+type WriteRegistryAuthResult struct {
+	Path   string `json:"path"`
+	Server string `json:"server"`
+}
+
+type SyncCronFilesParams struct {
+	Prefix string     `json:"prefix"`
+	Files  []CronFile `json:"files"`
+}
+
+type CronFile struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+type SyncCronFilesResult struct {
+	Dir     string   `json:"dir"`
+	Written []string `json:"written,omitempty"`
+	Removed []string `json:"removed,omitempty"`
 }
 
 type ReadReleaseStateParams struct {
@@ -157,6 +202,11 @@ type AccessoryCommandParams struct {
 type EnsureVolumeParams struct {
 	Name  string `json:"name"`
 	Owner string `json:"owner,omitempty"`
+}
+
+type EnsureNetworkParams struct {
+	Name   string `json:"name"`
+	Driver string `json:"driver,omitempty"`
 }
 
 type InstallBinaryParams struct {
@@ -197,11 +247,13 @@ type DockerOps interface {
 type CommandRunner func(ctx context.Context, name string, args ...string) (string, error)
 
 type Server struct {
-	Docker        DockerOps
-	CommandRunner CommandRunner
-	HTTPClient    *http.Client
-	StateDir      string
-	Hostname      func() (string, error)
+	Docker          DockerOps
+	CommandRunner   CommandRunner
+	HTTPClient      *http.Client
+	StateDir        string
+	DockerConfigDir string
+	CronDir         string
+	Hostname        func() (string, error)
 }
 
 type rpcError struct {
@@ -301,13 +353,21 @@ func (s Server) Handle(ctx context.Context, req Request) Response {
 			if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Image) == "" {
 				return failure(req.ID, ErrorInvalidParams, errors.New("name and image are required"))
 			}
+			if err := validateNetworkAliases(p.NetworkAliases); err != nil {
+				return failure(req.ID, ErrorInvalidParams, err)
+			}
 			if _, err := s.docker().Inspect(ctx, p.Name); err == nil {
 				if err := s.docker().StopRemove(ctx, p.Name); err != nil {
 					return failure(req.ID, ErrorDocker, fmt.Errorf("replace container %q: %w", p.Name, err))
 				}
 			}
-			args := append(labelArgs(p.Labels), p.Args...)
+			args := append(labelArgs(p.Labels), networkArgs(p.Network, p.NetworkAliases)...)
+			args = append(args, p.Args...)
 			return empty(req.ID, ErrorDocker, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...))
+		})
+	case "run_oneoff_container":
+		return s.withHostLock(req, "run_oneoff_container", func() Response {
+			return s.runOneOffContainer(ctx, req)
 		})
 	case "stop_container":
 		return s.withHostLock(req, "stop_container", func() Response {
@@ -350,9 +410,21 @@ func (s Server) Handle(ctx context.Context, req Request) Response {
 		return result(req.ID, containers)
 	case "health_check":
 		return s.healthCheck(ctx, req)
+	case "exec_container":
+		return s.withHostLock(req, "exec_container", func() Response {
+			return s.execContainer(ctx, req)
+		})
 	case "write_file":
 		return s.withHostLock(req, "write_file", func() Response {
 			return s.writeFile(req)
+		})
+	case "write_registry_auth":
+		return s.withHostLock(req, "write_registry_auth", func() Response {
+			return s.writeRegistryAuth(req)
+		})
+	case "sync_cron_files":
+		return s.withHostLock(req, "sync_cron_files", func() Response {
+			return s.syncCronFiles(req)
 		})
 	case "read_release_state":
 		return s.readReleaseState(req)
@@ -375,6 +447,10 @@ func (s Server) Handle(ctx context.Context, req Request) Response {
 	case "ensure_volume":
 		return s.withHostLock(req, "ensure_volume", func() Response {
 			return s.ensureVolume(ctx, req)
+		})
+	case "ensure_network":
+		return s.withHostLock(req, "ensure_network", func() Response {
+			return s.ensureNetwork(ctx, req)
 		})
 	case "install_binary":
 		return s.withHostLock(req, "install_binary", func() Response {
@@ -472,6 +548,62 @@ func (s Server) healthCheck(ctx context.Context, req Request) Response {
 	return result(req.ID, HealthCheckResult{OK: true, StatusCode: res.StatusCode, Output: trimOutput(string(body)), DurationMS: time.Since(start).Milliseconds()})
 }
 
+func (s Server) execContainer(ctx context.Context, req Request) Response {
+	var p ExecContainerParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
+	}
+	if strings.TrimSpace(p.Command) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("command is required"))
+	}
+	commandCtx := ctx
+	cancel := func() {}
+	if p.TimeoutSeconds > 0 {
+		commandCtx, cancel = context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+	}
+	defer cancel()
+	out, err := s.command()(commandCtx, "docker", "exec", p.Name, "sh", "-lc", p.Command)
+	if err != nil {
+		return failure(req.ID, ErrorCommandFailed, fmt.Errorf("exec %q failed: %w", p.Name, err))
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
+func (s Server) runOneOffContainer(ctx context.Context, req Request) Response {
+	var p RunOneOffContainerParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Image) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("name and image are required"))
+	}
+	if strings.TrimSpace(p.Command) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("command is required"))
+	}
+	if err := validateNetworkAliases(p.NetworkAliases); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	commandCtx := ctx
+	cancel := func() {}
+	if p.TimeoutSeconds > 0 {
+		commandCtx, cancel = context.WithTimeout(ctx, time.Duration(p.TimeoutSeconds)*time.Second)
+	}
+	defer cancel()
+	args := []string{"run", "--rm", "--name", p.Name}
+	args = append(args, labelArgs(p.Labels)...)
+	args = append(args, networkArgs(p.Network, p.NetworkAliases)...)
+	args = append(args, p.Args...)
+	args = append(args, p.Image, "sh", "-lc", p.Command)
+	out, err := s.command()(commandCtx, "docker", args...)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, fmt.Errorf("one-off container %q failed: %w", p.Name, err))
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
 func (s Server) writeFile(req Request) Response {
 	var p WriteFileParams
 	if err := decode(req.Params, &p); err != nil {
@@ -489,6 +621,101 @@ func (s Server) writeFile(req Request) Response {
 		return failure(req.ID, ErrorFileOperation, err)
 	}
 	return result(req.ID, WriteFileResult{Path: p.Path, Bytes: len(data)})
+}
+
+func (s Server) writeRegistryAuth(req Request) Response {
+	var p WriteRegistryAuthParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	server := strings.TrimSpace(p.Server)
+	if server == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("server is required"))
+	}
+	if !json.Valid(p.Auth) {
+		return failure(req.ID, ErrorInvalidParams, errors.New("auth must be valid JSON"))
+	}
+	var authObject map[string]json.RawMessage
+	if err := json.Unmarshal(p.Auth, &authObject); err != nil || len(authObject) == 0 {
+		return failure(req.ID, ErrorInvalidParams, errors.New("auth must be a JSON object"))
+	}
+	configDir, err := s.dockerConfigDir()
+	if err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	path := filepath.Join(configDir, "config.json")
+	merged, err := mergeDockerAuthConfig(path, server, p.Auth)
+	if err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	if err := atomicWriteFile(path, merged, 0o600); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	return result(req.ID, WriteRegistryAuthResult{Path: path, Server: server})
+}
+
+func (s Server) syncCronFiles(req Request) Response {
+	var p SyncCronFilesParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	prefix := strings.TrimSpace(p.Prefix)
+	if !validCronFileName(prefix) {
+		return failure(req.ID, ErrorInvalidParams, errors.New("prefix must be a safe cron filename prefix"))
+	}
+	cronDir := s.cronDir()
+	if err := os.MkdirAll(cronDir, 0o755); err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	desired := map[string]string{}
+	for _, file := range p.Files {
+		name := strings.TrimSpace(file.Name)
+		if !strings.HasPrefix(name, prefix) || !validCronFileName(name) {
+			return failure(req.ID, ErrorInvalidParams, fmt.Errorf("cron file %q must use the safe prefix %q", name, prefix))
+		}
+		desired[name] = file.Content
+	}
+
+	var removed []string
+	entries, err := os.ReadDir(cronDir)
+	if err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if _, ok := desired[name]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(cronDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return failure(req.ID, ErrorFileOperation, err)
+		}
+		removed = append(removed, name)
+	}
+	sort.Strings(removed)
+
+	names := make([]string, 0, len(desired))
+	for name := range desired {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var written []string
+	for _, name := range names {
+		content := desired[name]
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if err := atomicWriteFile(filepath.Join(cronDir, name), []byte(content), 0o644); err != nil {
+			return failure(req.ID, ErrorFileOperation, err)
+		}
+		written = append(written, name)
+	}
+	return result(req.ID, SyncCronFilesResult{Dir: cronDir, Written: written, Removed: removed})
 }
 
 func (s Server) readReleaseState(req Request) Response {
@@ -644,6 +871,34 @@ func (s Server) ensureVolume(ctx context.Context, req Request) Response {
 	return result(req.ID, CommandResult{Output: trimOutput(out)})
 }
 
+func (s Server) ensureNetwork(ctx context.Context, req Request) Response {
+	var p EnsureNetworkParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if !validDockerVolumeName(p.Name) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("invalid network name %q", p.Name))
+	}
+	if reservedDockerNetworkName(p.Name) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("network name %q is reserved", p.Name))
+	}
+	driver := strings.TrimSpace(p.Driver)
+	if driver == "" {
+		driver = "bridge"
+	}
+	if !validDockerVolumeName(driver) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("invalid network driver %q", p.Driver))
+	}
+	if _, err := s.command()(ctx, "docker", "network", "inspect", p.Name); err == nil {
+		return result(req.ID, CommandResult{})
+	}
+	out, err := s.command()(ctx, "docker", "network", "create", "--driver", driver, p.Name)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, fmt.Errorf("create network %q: %w", p.Name, err))
+	}
+	return result(req.ID, CommandResult{Output: trimOutput(out)})
+}
+
 func (s Server) installBinary(req Request) Response {
 	var p InstallBinaryParams
 	if err := decode(req.Params, &p); err != nil {
@@ -742,6 +997,24 @@ func (s Server) stateDir() string {
 	return config.RemoteStateDir
 }
 
+func (s Server) dockerConfigDir() (string, error) {
+	if strings.TrimSpace(s.DockerConfigDir) != "" {
+		return s.DockerConfigDir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".docker"), nil
+}
+
+func (s Server) cronDir() string {
+	if strings.TrimSpace(s.CronDir) != "" {
+		return s.CronDir
+	}
+	return "/etc/cron.d"
+}
+
 func (s Server) hostname() (string, error) {
 	if s.Hostname != nil {
 		return s.Hostname()
@@ -828,7 +1101,9 @@ func supportedMethods() []string {
 		"accessory_restore",
 		"caddy_reload",
 		"docker_inspect",
+		"exec_container",
 		"health_check",
+		"ensure_network",
 		"ensure_volume",
 		"install_binary",
 		"list_ship_containers",
@@ -839,13 +1114,42 @@ func supportedMethods() []string {
 		"prune_images",
 		"read_release_state",
 		"run_container",
+		"run_oneoff_container",
 		"status",
 		"stop_container",
+		"sync_cron_files",
 		"write_file",
+		"write_registry_auth",
 		"write_release_state",
 	}
 	sort.Strings(methods)
 	return methods
+}
+
+func mergeDockerAuthConfig(path, server string, auth json.RawMessage) ([]byte, error) {
+	config := map[string]json.RawMessage{}
+	if data, err := os.ReadFile(path); err == nil {
+		if len(bytes.TrimSpace(data)) > 0 {
+			if err := json.Unmarshal(data, &config); err != nil {
+				return nil, fmt.Errorf("parse docker config: %w", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	auths := map[string]json.RawMessage{}
+	if raw := config["auths"]; len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &auths); err != nil {
+			return nil, fmt.Errorf("parse docker config auths: %w", err)
+		}
+	}
+	auths[server] = append(json.RawMessage(nil), auth...)
+	rawAuths, err := json.Marshal(auths)
+	if err != nil {
+		return nil, err
+	}
+	config["auths"] = rawAuths
+	return json.MarshalIndent(config, "", "  ")
 }
 
 func validDockerVolumeName(name string) bool {
@@ -882,6 +1186,23 @@ func validVolumeOwner(owner string) bool {
 	return true
 }
 
+func validCronFileName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		allowed := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == '.' || r == '-'
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
 func labelArgs(labels map[string]string) []string {
 	if len(labels) == 0 {
 		return nil
@@ -900,6 +1221,61 @@ func labelArgs(labels map[string]string) []string {
 		args = append(args, "--label", key+"="+value)
 	}
 	return args
+}
+
+func networkArgs(network string, aliases []string) []string {
+	network = strings.TrimSpace(network)
+	if network == "" {
+		return nil
+	}
+	args := []string{"--network", network}
+	for _, alias := range normalizedNetworkAliases(aliases) {
+		args = append(args, "--network-alias", alias)
+	}
+	return args
+}
+
+func normalizedNetworkAliases(aliases []string) []string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		out = append(out, alias)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func validateNetworkAliases(aliases []string) error {
+	for _, alias := range aliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if !validDockerVolumeName(alias) {
+			return fmt.Errorf("invalid network alias %q", alias)
+		}
+	}
+	return nil
+}
+
+func reservedDockerNetworkName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "bridge", "host", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func contentBytes(content, encoding string) ([]byte, error) {

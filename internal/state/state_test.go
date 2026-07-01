@@ -59,6 +59,69 @@ func TestReadHostFactsReadsEnvironmentHosts(t *testing.T) {
 	}
 }
 
+func TestDeployLockRoundTripAndDelete(t *testing.T) {
+	store := NewStore(t.TempDir())
+	lock := DeployLock{
+		Environment: "production",
+		Message:     "incident response",
+		CreatedAt:   time.Unix(10, 0),
+	}
+	if err := store.SaveDeployLock(lock); err != nil {
+		t.Fatal(err)
+	}
+	read, err := store.ReadDeployLock("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.Environment != "production" || read.Message != "incident response" || !read.CreatedAt.Equal(time.Unix(10, 0).UTC()) {
+		t.Fatalf("lock = %+v", read)
+	}
+	if err := store.DeleteDeployLock("production"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadDeployLock("production"); !os.IsNotExist(err) {
+		t.Fatalf("expected missing lock after delete, got %v", err)
+	}
+}
+
+func TestOperationLockRefusesConcurrentOperation(t *testing.T) {
+	store := NewStore(t.TempDir())
+	lock, err := store.AcquireOperationLock("production", "deploy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	if _, err := store.AcquireOperationLock("production", "rollback"); err == nil || !strings.Contains(err.Error(), "already busy") {
+		t.Fatalf("expected busy operation lock, got %v", err)
+	}
+}
+
+func TestOperationLockReleasesAndScopesByEnvironment(t *testing.T) {
+	store := NewStore(t.TempDir())
+	production, err := store.AcquireOperationLock("production", "deploy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging, err := store.AcquireOperationLock("staging", "deploy")
+	if err != nil {
+		t.Fatalf("different environment lock failed: %v", err)
+	}
+	if err := staging.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := production.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := store.AcquireOperationLock("production", "rollback")
+	if err != nil {
+		t.Fatalf("lock after unlock failed: %v", err)
+	}
+	if err := next.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSaveAndListAccessoryState(t *testing.T) {
 	store := NewStore(t.TempDir())
 	accessory := AccessoryState{
@@ -97,10 +160,12 @@ func TestRecordAccessoryBackupAndRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.RecordAccessoryBackup("production", "postgres", AccessoryBackup{
-		Artifact:  "/var/lib/ship/backups/pg.backup",
-		Host:      "data-1",
-		Output:    "ok",
-		CreatedAt: time.Unix(20, 0),
+		Artifact:         "/var/lib/ship/backups/pg.backup",
+		ExportedArtifact: "s3://ship/pg.backup",
+		Host:             "data-1",
+		Output:           "ok",
+		ExportOutput:     "s3://ship/pg.backup",
+		CreatedAt:        time.Unix(20, 0),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +180,7 @@ func TestRecordAccessoryBackupAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if read.LastBackup == nil || read.LastBackup.Output != "ok" {
+	if read.LastBackup == nil || read.LastBackup.Output != "ok" || read.LastBackup.ExportedArtifact != "s3://ship/pg.backup" || read.LastBackup.ExportOutput != "s3://ship/pg.backup" {
 		t.Fatalf("last backup = %+v", read.LastBackup)
 	}
 	if read.LastRestore == nil || read.LastRestore.Artifact != "/var/lib/ship/backups/pg.backup" {
@@ -245,8 +310,46 @@ func TestSaveReleaseWritesReleaseAndCurrentFiles(t *testing.T) {
 	if string(current) != "release-1\n" {
 		t.Fatalf("current = %q", current)
 	}
+	envCurrent, err := os.ReadFile(filepath.Join(store.Dir, "environments", "production", "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(envCurrent) != "release-1\n" {
+		t.Fatalf("environment current = %q", envCurrent)
+	}
 	if !got.Healthy || got.Status != ReleaseStatusHealthy || got.CompletedAt == nil {
 		t.Fatalf("release status = %+v", got)
+	}
+}
+
+func TestCurrentReleaseUsesEnvironmentPointerAfterOtherEnvironmentPromote(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.SaveRelease(Release{ID: "prod-old", Environment: "production", CreatedAt: time.Unix(10, 0), Images: map[string]string{"web": "prod-old"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(Release{ID: "prod-new", Environment: "production", CreatedAt: time.Unix(20, 0), Images: map[string]string{"web": "prod-new"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkReleaseHealthy("prod-old", time.Unix(30, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(Release{ID: "staging-new", Environment: "staging", CreatedAt: time.Unix(40, 0), Images: map[string]string{"web": "staging-new"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != "prod-old" {
+		t.Fatalf("production current = %+v", current)
+	}
+	staging, err := store.CurrentRelease("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staging.ID != "staging-new" {
+		t.Fatalf("staging current = %+v", staging)
 	}
 }
 

@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -88,11 +89,29 @@ func TestImageTagUsesServiceAndRelease(t *testing.T) {
 	}
 }
 
+func TestImageAliasTagsUseServicePrefix(t *testing.T) {
+	got, err := ImageAliasTags("ghcr.io/acme/demo", "web", []string{"latest", "production", "latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"ghcr.io/acme/demo:web-latest",
+		"ghcr.io/acme/demo:web-production",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("alias tags = %#v, want %#v", got, want)
+	}
+}
+
 func TestBuildCommandIncludesArgsTargetAndPlatform(t *testing.T) {
 	got, err := BuildCommand(BuildOptions{
 		ContextDir: "services/web",
 		Dockerfile: "Dockerfile.prod",
 		Tag:        "ghcr.io/acme/demo:web-release",
+		AdditionalTags: []string{
+			"ghcr.io/acme/demo:web-latest",
+			"ghcr.io/acme/demo:web-production",
+		},
 		BuildArgs: map[string]string{
 			"RAILS_ENV": "production",
 			"VERSION":   "release",
@@ -107,6 +126,8 @@ func TestBuildCommandIncludesArgsTargetAndPlatform(t *testing.T) {
 		"build",
 		"-f", filepath.Join("services", "web", "Dockerfile.prod"),
 		"-t", "ghcr.io/acme/demo:web-release",
+		"-t", "ghcr.io/acme/demo:web-latest",
+		"-t", "ghcr.io/acme/demo:web-production",
 		"--label", "managed-by=ship",
 		"--platform", "linux/amd64",
 		"--target", "runtime",
@@ -116,6 +137,196 @@ func TestBuildCommandIncludesArgsTargetAndPlatform(t *testing.T) {
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCommandUsesBuildxWhenExternalCacheConfigured(t *testing.T) {
+	got, err := BuildCommand(BuildOptions{
+		ContextDir: "services/web",
+		Dockerfile: "Dockerfile",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		CacheFrom:  []string{"type=registry,ref=ghcr.io/acme/demo:build-cache"},
+		CacheTo:    []string{"type=registry,ref=ghcr.io/acme/demo:build-cache,mode=max"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"buildx", "build", "--load",
+		"-f", filepath.Join("services", "web", "Dockerfile"),
+		"-t", "ghcr.io/acme/demo:web-release",
+		"--label", "managed-by=ship",
+		"--cache-from", "type=registry,ref=ghcr.io/acme/demo:build-cache",
+		"--cache-to", "type=registry,ref=ghcr.io/acme/demo:build-cache,mode=max",
+		"services/web",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCommandPassesBuildSecretsAndSSHMounts(t *testing.T) {
+	got, err := BuildCommand(BuildOptions{
+		ContextDir: "services/web",
+		Dockerfile: "Dockerfile",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		Secrets:    []string{"id=npm_token,env=NPM_TOKEN", "id=bundle,src=.bundle/credentials"},
+		SSH:        []string{"default"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"buildx", "build", "--load",
+		"-f", filepath.Join("services", "web", "Dockerfile"),
+		"-t", "ghcr.io/acme/demo:web-release",
+		"--label", "managed-by=ship",
+		"--secret", "id=bundle,src=.bundle/credentials",
+		"--secret", "id=npm_token,env=NPM_TOKEN",
+		"--ssh", "default",
+		"services/web",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCommandPublishesAttestedBuilds(t *testing.T) {
+	got, err := BuildCommand(BuildOptions{
+		ContextDir: "services/web",
+		Dockerfile: "Dockerfile",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		CacheFrom:  []string{"type=registry,ref=ghcr.io/acme/demo:build-cache"},
+		SBOM:       "true",
+		Provenance: "mode=max",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"buildx", "build", "--push",
+		"-f", filepath.Join("services", "web", "Dockerfile"),
+		"-t", "ghcr.io/acme/demo:web-release",
+		"--label", "managed-by=ship",
+		"--cache-from", "type=registry,ref=ghcr.io/acme/demo:build-cache",
+		"--sbom", "true",
+		"--provenance", "mode=max",
+		"services/web",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCommandPublishesMultiPlatformBuilds(t *testing.T) {
+	got, err := BuildCommand(BuildOptions{
+		ContextDir: "services/web",
+		Dockerfile: "Dockerfile",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		Platforms:  []string{"linux/amd64", "linux/arm64"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"buildx", "build", "--push",
+		"-f", filepath.Join("services", "web", "Dockerfile"),
+		"-t", "ghcr.io/acme/demo:web-release",
+		"--label", "managed-by=ship",
+		"--platform", "linux/amd64,linux/arm64",
+		"services/web",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCommandUsesCustomBuilderAndFreshnessControls(t *testing.T) {
+	got, err := BuildCommand(BuildOptions{
+		ContextDir:    "services/web",
+		Dockerfile:    "Dockerfile",
+		Tag:           "ghcr.io/acme/demo:web-release",
+		Builder:       "ship-cloud",
+		Pull:          true,
+		NoCache:       true,
+		NoCacheFilter: []string{"install", "assets", "install"},
+		CacheFrom:     []string{"type=registry,ref=ghcr.io/acme/demo:build-cache"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"buildx", "build", "--load",
+		"--builder", "ship-cloud",
+		"-f", filepath.Join("services", "web", "Dockerfile"),
+		"-t", "ghcr.io/acme/demo:web-release",
+		"--label", "managed-by=ship",
+		"--pull",
+		"--no-cache",
+		"--no-cache-filter", "install,assets",
+		"--cache-from", "type=registry,ref=ghcr.io/acme/demo:build-cache",
+		"services/web",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestPackBuildCommandIncludesBuildpackOptions(t *testing.T) {
+	got, err := PackBuildCommand(BuildOptions{
+		ContextDir: "services/web",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		AdditionalTags: []string{
+			"ghcr.io/acme/demo:web-latest",
+			"ghcr.io/acme/demo:web-production",
+		},
+		Buildpack: BuildpackOptions{
+			Builder:    "paketobuildpacks/builder-jammy-base",
+			Buildpacks: []string{"paketo-buildpacks/nodejs", "paketo-buildpacks/procfile"},
+			Env: map[string]string{
+				"BP_NODE_RUN_SCRIPTS": "build",
+				"BP_LOG_LEVEL":        "DEBUG",
+			},
+			Descriptor:   "project.production.toml",
+			Publish:      true,
+			PullPolicy:   "if-not-present",
+			TrustBuilder: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"build", "ghcr.io/acme/demo:web-release",
+		"--path", "services/web",
+		"--tag", "ghcr.io/acme/demo:web-latest",
+		"--tag", "ghcr.io/acme/demo:web-production",
+		"--builder", "paketobuildpacks/builder-jammy-base",
+		"--buildpack", "paketo-buildpacks/nodejs",
+		"--buildpack", "paketo-buildpacks/procfile",
+		"--env", "BP_LOG_LEVEL=DEBUG",
+		"--env", "BP_NODE_RUN_SCRIPTS=build",
+		"--descriptor", "project.production.toml",
+		"--pull-policy", "if-not-present",
+		"--trust-builder",
+		"--publish",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("pack build args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildInvocationUsesPackWhenBuildpackConfigured(t *testing.T) {
+	name, args, err := BuildInvocation(BuildOptions{
+		ContextDir: "services/web",
+		Tag:        "ghcr.io/acme/demo:web-release",
+		Buildpack:  BuildpackOptions{Builder: "paketobuildpacks/builder-jammy-base"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "pack" || len(args) == 0 || args[0] != "build" {
+		t.Fatalf("invocation = %s %#v", name, args)
 	}
 }
 
@@ -244,6 +455,78 @@ func TestRegistryLoggedInUsesDockerAuthConfigForRegistryHost(t *testing.T) {
 	err := Client{}.RegistryLoggedIn(context.Background(), host+"/acme/example")
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRegistryAuthReturnsMinimalDockerAuthEntry(t *testing.T) {
+	auth := base64.StdEncoding.EncodeToString([]byte("u:s"))
+	t.Setenv("DOCKER_AUTH_CONFIG", fmt.Sprintf(`{"auths":{"ghcr.io":{"auth":%q},"registry.example.com":{"identitytoken":"token-value"}}}`, auth))
+
+	got, ok, err := Client{}.RegistryAuth(context.Background(), "ghcr.io/acme/web@sha256:"+strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected registry auth")
+	}
+	if got.Server != "ghcr.io" {
+		t.Fatalf("server = %q", got.Server)
+	}
+	var entry map[string]string
+	if err := json.Unmarshal(got.Auth, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["auth"] != auth || entry["identitytoken"] != "" {
+		t.Fatalf("auth entry = %+v", entry)
+	}
+
+	tokenAuth, ok, err := Client{}.RegistryAuth(context.Background(), "registry.example.com/acme/web:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected token auth")
+	}
+	if tokenAuth.Server != "registry.example.com" {
+		t.Fatalf("token server = %q", tokenAuth.Server)
+	}
+	entry = map[string]string{}
+	if err := json.Unmarshal(tokenAuth.Auth, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["identitytoken"] != "token-value" || entry["auth"] != "" {
+		t.Fatalf("token auth entry = %+v", entry)
+	}
+}
+
+func TestRegistryAuthReturnsFalseWithoutCredentials(t *testing.T) {
+	t.Setenv("DOCKER_AUTH_CONFIG", `{}`)
+
+	got, ok, err := Client{}.RegistryAuth(context.Background(), "registry.example.com/acme/web:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || got.Server != "" {
+		t.Fatalf("auth = %+v ok=%t, want no credentials", got, ok)
+	}
+}
+
+func TestRegistryAuthSkipsOfficialDockerHubImages(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "docker-credential-shiptest"), `#!/bin/sh
+exit 1
+`)
+	t.Setenv("PATH", dir)
+	t.Setenv("DOCKER_AUTH_CONFIG", `{"credsStore":"shiptest"}`)
+
+	for _, image := range []string{"postgres:17", "caddy:2", "library/redis:7"} {
+		got, ok, err := Client{}.RegistryAuth(context.Background(), image)
+		if err != nil {
+			t.Fatalf("%s: %v", image, err)
+		}
+		if ok || got.Server != "" {
+			t.Fatalf("%s auth = %+v ok=%t, want no credentials", image, got, ok)
+		}
 	}
 }
 

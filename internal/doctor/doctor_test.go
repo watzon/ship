@@ -124,7 +124,7 @@ func TestRunUsesProviderCredentialChecks(t *testing.T) {
 func TestRunChecksVultrCredentialsWithDefaultProvider(t *testing.T) {
 	cfg, configPath := testConfig(t, nil)
 	cfg.Environments["staging"] = config.Environment{
-		Provider: config.ProviderConfig{Vultr: &config.VultrConfig{Region: "ewr", Plan: "vc2-2c-4gb", OSID: 2284}},
+		Provider: config.ProviderConfig{Vultr: &config.VultrConfig{Region: "ewr", Plan: "vc2-2c-4gb", OSID: 2284, SSHAllowedCIDRs: []string{"203.0.113.0/24"}}},
 		Hosts:    config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
 	}
 	t.Setenv("HCLOUD_TOKEN", "token")
@@ -141,6 +141,343 @@ func TestRunChecksVultrCredentialsWithDefaultProvider(t *testing.T) {
 
 	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
 	assertCheck(t, report, "vultr token", StatusFail, "missing VULTR_API_KEY")
+}
+
+func TestRunChecksDigitalOceanCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{DigitalOcean: &config.DigitalOceanConfig{
+			Region:          "nyc3",
+			Size:            "s-2vcpu-4gb",
+			Image:           "ubuntu-24-04-x64",
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "DIGITALOCEAN_TOKEN")
+	if err := os.Unsetenv("DIGITALOCEAN_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "digitalocean token", StatusFail, "missing DIGITALOCEAN_TOKEN")
+}
+
+func TestRunChecksLinodeCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Linode: &config.LinodeConfig{
+			Region:          "us-east",
+			Type:            "g6-standard-2",
+			Image:           "linode/ubuntu24.04",
+			AuthorizedKeys:  []string{"ssh-ed25519 AAAA..."},
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "LINODE_TOKEN")
+	if err := os.Unsetenv("LINODE_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "linode token", StatusFail, "missing LINODE_TOKEN")
+}
+
+func TestRunChecksAWSCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{AWS: &config.AWSConfig{
+			Region:          "us-east-1",
+			InstanceType:    "t3.medium",
+			AMI:             "ami-0123456789abcdef0",
+			SubnetID:        "subnet-0123456789abcdef0",
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "AWS_ACCESS_KEY_ID")
+	restoreEnv(t, "AWS_SECRET_ACCESS_KEY")
+	if err := os.Unsetenv("AWS_ACCESS_KEY_ID"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("AWS_SECRET_ACCESS_KEY"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "aws access key", StatusFail, "missing AWS_ACCESS_KEY_ID")
+	assertCheck(t, report, "aws secret key", StatusFail, "missing AWS_SECRET_ACCESS_KEY")
+}
+
+func TestRunChecksGCPCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{GCP: &config.GCPConfig{
+			ProjectID:       "demo-project",
+			Zone:            "us-central1-a",
+			MachineType:     "e2-medium",
+			Image:           "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts",
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "GCP_ACCESS_TOKEN")
+	restoreEnv(t, "GOOGLE_APPLICATION_CREDENTIALS")
+	if err := os.Unsetenv("GCP_ACCESS_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "gcp credentials", StatusFail, "missing GCP_ACCESS_TOKEN or GOOGLE_APPLICATION_CREDENTIALS")
+}
+
+func TestRunChecksAzureCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Azure: &config.AzureConfig{
+			SubscriptionID:  "sub-123",
+			ResourceGroup:   "rg-ship",
+			Location:        "eastus",
+			VMSize:          "Standard_B2s",
+			Image:           "Canonical:ubuntu-24_04-lts:server:latest",
+			AdminUsername:   "deploy",
+			SSHPublicKey:    "ssh-ed25519 AAAA...",
+			VirtualNetwork:  "ship-vnet",
+			Subnet:          "default",
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	for _, key := range []string{"AZURE_ACCESS_TOKEN", "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"} {
+		restoreEnv(t, key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "azure credentials", StatusFail, "missing AZURE_ACCESS_TOKEN or AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET")
+}
+
+func TestRunChecksScalewayCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Scaleway: &config.ScalewayConfig{
+			ProjectID:       "project-id",
+			Zone:            "fr-par-1",
+			CommercialType:  "DEV1-S",
+			Image:           "ubuntu_noble",
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	for _, key := range []string{"SCW_SECRET_KEY", "SCALEWAY_SECRET_KEY"} {
+		restoreEnv(t, key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "scaleway token", StatusFail, "missing SCW_SECRET_KEY")
+}
+
+func TestRunChecksOpenStackCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{OpenStack: &config.OpenStackConfig{
+			Region: "GRA11",
+			Flavor: "b2-7",
+			Image:  "ubuntu-24.04",
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	for _, key := range []string{
+		"OS_AUTH_TOKEN",
+		"OS_COMPUTE_API_URL",
+		"OS_AUTH_URL",
+		"OS_APPLICATION_CREDENTIAL_ID",
+		"OS_APPLICATION_CREDENTIAL_NAME",
+		"OS_APPLICATION_CREDENTIAL_SECRET",
+		"OS_USERNAME",
+		"OS_USER_ID",
+		"OS_PASSWORD",
+		"OS_PROJECT_ID",
+		"OS_PROJECT_NAME",
+	} {
+		restoreEnv(t, key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "openstack credentials", StatusFail, "missing OS_AUTH_TOKEN/OS_COMPUTE_API_URL")
+}
+
+func TestRunChecksExoscaleCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Exoscale: &config.ExoscaleConfig{
+			Zone:            "ch-gva-2",
+			InstanceType:    "standard.medium",
+			Template:        "template-id",
+			SSHKeys:         []string{"deploy"},
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	for _, key := range []string{"EXOSCALE_API_KEY", "EXOSCALE_API_SECRET"} {
+		restoreEnv(t, key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "exoscale credentials", StatusFail, "missing EXOSCALE_API_KEY/EXOSCALE_API_SECRET")
+}
+
+func TestRunChecksCloudscaleCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Cloudscale: &config.CloudscaleConfig{
+			Zone:    "rma1",
+			Flavor:  "flex-4-2",
+			Image:   "debian-13",
+			SSHKeys: []string{"ssh-ed25519 AAAA..."},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	restoreEnv(t, "CLOUDSCALE_API_TOKEN")
+	if err := os.Unsetenv("CLOUDSCALE_API_TOKEN"); err != nil {
+		t.Fatal(err)
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "cloudscale token", StatusFail, "missing CLOUDSCALE_API_TOKEN")
+}
+
+func TestRunChecksLatitudeCredentialsWithDefaultProvider(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	cfg.Environments["staging"] = config.Environment{
+		Provider: config.ProviderConfig{Latitude: &config.LatitudeConfig{
+			Project:         "proj-demo",
+			Site:            "ASH",
+			Plan:            "c2-small-x86",
+			OperatingSystem: "ubuntu_24_04_x64_lts",
+			SSHKeys:         []string{"ssh-key-1"},
+			SSHAllowedCIDRs: []string{"203.0.113.0/24"},
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{"web": {Count: 1}}},
+	}
+	t.Setenv("HCLOUD_TOKEN", "token")
+	for _, key := range []string{"LATITUDE_API_TOKEN", "LATITUDESH_BEARER"} {
+		restoreEnv(t, key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+	})
+
+	assertCheck(t, report, "hetzner token", StatusPass, "HCLOUD_TOKEN is set")
+	assertCheck(t, report, "latitude token", StatusFail, "missing LATITUDE_API_TOKEN or LATITUDESH_BEARER")
+}
+
+func TestRunAcceptsManualProviderWithoutCloudCredentials(t *testing.T) {
+	cfg, configPath := testConfig(t, []string{"web-1.example.com"})
+	cfg.Environments["production"] = config.Environment{
+		Provider: config.ProviderConfig{Manual: &config.ManualConfig{}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{
+			"web": {User: "deploy", Hosts: []string{"web-1.example.com"}},
+		}},
+	}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath: configPath,
+		Docker:     fakeDocker{},
+		SSHAvailable: func(context.Context) error {
+			return nil
+		},
+		Remote: &fakeRemote{
+			outputs: map[string]string{"uname -s": "Linux\n"},
+			errors:  map[string]error{},
+		},
+	})
+
+	assertCheck(t, report, "manual provider", StatusPass, "using existing SSH hosts")
 }
 
 func TestRunReportsMissingSecretsByName(t *testing.T) {
@@ -171,7 +508,8 @@ func TestRunChecksExplicitHostsWithFakeRemote(t *testing.T) {
 	remote := &fakeRemote{
 		outputs: map[string]string{"uname -s": "Linux\n"},
 		errors: map[string]error{
-			"command -v systemctl >/dev/null && test -d /run/systemd/system": errors.New("systemd missing"),
+			"command -v systemctl >/dev/null && test -d /run/systemd/system":                  errors.New("systemd missing"),
+			"systemctl is-enabled docker >/dev/null && systemctl is-active docker >/dev/null": errors.New("docker disabled"),
 		},
 	}
 
@@ -185,6 +523,7 @@ func TestRunChecksExplicitHostsWithFakeRemote(t *testing.T) {
 	assertCheck(t, report, "remote:production/web.example.com ssh", StatusPass, "reachable")
 	assertCheck(t, report, "remote:production/web.example.com linux", StatusPass, "Linux")
 	assertCheck(t, report, "remote:production/web.example.com systemd", StatusFail, "systemd missing")
+	assertCheck(t, report, "remote:production/web.example.com docker boot", StatusFail, "docker disabled")
 	if len(remote.hosts) == 0 || remote.hosts[0].User != "deployer" {
 		t.Fatalf("expected explicit host user to be preserved, got %+v", remote.hosts)
 	}

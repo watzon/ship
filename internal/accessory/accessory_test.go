@@ -41,6 +41,90 @@ func TestValidateRestoreRequiresPrimaryBackupAndRestoreCommand(t *testing.T) {
 	}
 }
 
+func TestBackupExportCommandProvidesArtifactEnvironment(t *testing.T) {
+	command, err := BackupExportCommand(config.Accessory{
+		Backup: config.BackupSpec{
+			ExportCommand: `aws s3 cp "$SHIP_BACKUP_ARTIFACT" s3://ship/postgres.backup`,
+		},
+	}, "/var/lib/ship/backups/postgres.backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != `SHIP_BACKUP_ARTIFACT='/var/lib/ship/backups/postgres.backup'; export SHIP_BACKUP_ARTIFACT; aws s3 cp "$SHIP_BACKUP_ARTIFACT" s3://ship/postgres.backup` {
+		t.Fatalf("export command = %q", command)
+	}
+	if timeout := BackupExportTimeoutSeconds(config.Accessory{Backup: config.BackupSpec{ExportTimeoutSeconds: 45}}); timeout != 45 {
+		t.Fatalf("export timeout = %d", timeout)
+	}
+}
+
+func TestDockerArgsIncludesRestartPolicy(t *testing.T) {
+	args := DockerArgs(config.Accessory{
+		RestartPolicy: "always",
+		Ports:         []int{5432},
+		Publish:       []string{"127.0.0.1:15432:5432"},
+		Resources: config.ResourceConfig{
+			CPUs:              "1.5",
+			Memory:            "1g",
+			MemoryReservation: "512m",
+			MemorySwap:        "2g",
+			CPUShares:         512,
+			CPUSetCPUs:        "0-1",
+			PIDsLimit:         512,
+		},
+		Runtime: config.RuntimeConfig{
+			ReadOnly:           true,
+			Init:               true,
+			User:               "999:999",
+			Entrypoint:         "/usr/local/bin/docker-entrypoint.sh",
+			StopTimeoutSeconds: 45,
+			ShmSize:            "512m",
+			NoHealthcheck:      true,
+			CapAdd:             []string{"IPC_LOCK"},
+			GroupAdd:           []string{"render"},
+			SecurityOpt:        []string{"no-new-privileges:true"},
+			Mounts:             []string{"type=volume,source=cache,target=/cache"},
+			AddHosts:           []string{"host.docker.internal:host-gateway"},
+			Devices:            []string{"/dev/fuse:/dev/fuse"},
+			Sysctls:            map[string]string{"vm.max_map_count": "262144"},
+			Ulimits:            []string{"memlock=-1:-1"},
+		},
+	}, "/var/lib/ship/secrets/production/accessory-postgres.env")
+	joined := strings.Join(args, " ")
+	for _, needle := range []string{
+		"--env-file /var/lib/ship/secrets/production/accessory-postgres.env",
+		"--restart always",
+		"-p 5432:5432",
+		"-p 127.0.0.1:15432:5432",
+		"--cpus 1.5",
+		"--memory 1g",
+		"--memory-reservation 512m",
+		"--memory-swap 2g",
+		"--cpu-shares 512",
+		"--cpuset-cpus 0-1",
+		"--pids-limit 512",
+		"--read-only",
+		"--init",
+		"--user 999:999",
+		"--entrypoint /usr/local/bin/docker-entrypoint.sh",
+		"--stop-timeout 45",
+		"--shm-size 512m",
+		"--no-healthcheck",
+		"--cap-add IPC_LOCK",
+		"--group-add render",
+		"--security-opt no-new-privileges:true",
+		"--mount type=volume,source=cache,target=/cache",
+		"--add-host host.docker.internal:host-gateway",
+		"--device /dev/fuse:/dev/fuse",
+		"--sysctl vm.max_map_count=262144",
+		"--ulimit memlock=-1:-1",
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("args %q missing %q", joined, needle)
+		}
+	}
+}
+
 func TestEnsurePlacementPersistsStableEligibleHost(t *testing.T) {
 	cfg := accessoryConfig()
 	env := cfg.Environments["production"]

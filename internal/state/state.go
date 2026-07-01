@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -32,14 +33,19 @@ type Release struct {
 }
 
 type HostFact struct {
-	Name          string `json:"name"`
-	Pool          string `json:"pool"`
-	User          string `json:"user"`
-	IPv4          string `json:"ipv4,omitempty"`
-	PublicAddress string `json:"public_address,omitempty"`
-	Provider      string `json:"provider,omitempty"`
-	ProviderID    string `json:"provider_id,omitempty"`
-	ServerID      int64  `json:"server_id,omitempty"`
+	Name           string            `json:"name"`
+	Pool           string            `json:"pool"`
+	User           string            `json:"user"`
+	SSHPort        int               `json:"ssh_port,omitempty"`
+	IdentityFile   string            `json:"identity_file,omitempty"`
+	KnownHostsFile string            `json:"known_hosts_file,omitempty"`
+	JumpHost       string            `json:"jump_host,omitempty"`
+	SSHOptions     map[string]string `json:"ssh_options,omitempty"`
+	IPv4           string            `json:"ipv4,omitempty"`
+	PublicAddress  string            `json:"public_address,omitempty"`
+	Provider       string            `json:"provider,omitempty"`
+	ProviderID     string            `json:"provider_id,omitempty"`
+	ServerID       int64             `json:"server_id,omitempty"`
 }
 
 type AccessoryState struct {
@@ -52,10 +58,12 @@ type AccessoryState struct {
 }
 
 type AccessoryBackup struct {
-	Artifact  string    `json:"artifact"`
-	Host      string    `json:"host"`
-	Output    string    `json:"output,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Artifact         string    `json:"artifact"`
+	ExportedArtifact string    `json:"exported_artifact,omitempty"`
+	Host             string    `json:"host"`
+	Output           string    `json:"output,omitempty"`
+	ExportOutput     string    `json:"export_output,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type AccessoryRestore struct {
@@ -75,6 +83,16 @@ type Event struct {
 	Service     string    `json:"service,omitempty"`
 	Accessory   string    `json:"accessory,omitempty"`
 	Host        string    `json:"host,omitempty"`
+}
+
+type DeployLock struct {
+	Environment string    `json:"environment"`
+	Message     string    `json:"message,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type OperationLock struct {
+	file *os.File
 }
 
 type Store struct {
@@ -126,6 +144,131 @@ func (s Store) DeleteHostFacts(environment string) error {
 		return nil
 	}
 	return err
+}
+
+func (s Store) SaveDeployLock(lock DeployLock) error {
+	environment := strings.TrimSpace(lock.Environment)
+	if err := validateStateName("environment", environment); err != nil {
+		return err
+	}
+	lock.Environment = environment
+	lock.Message = strings.TrimSpace(lock.Message)
+	if lock.CreatedAt.IsZero() {
+		lock.CreatedAt = time.Now().UTC()
+	} else {
+		lock.CreatedAt = lock.CreatedAt.UTC()
+	}
+	data, err := json.MarshalIndent(lock, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(s.deployLockPath(environment), data, 0o644)
+}
+
+func (s Store) ReadDeployLock(environment string) (DeployLock, error) {
+	environment = strings.TrimSpace(environment)
+	if err := validateStateName("environment", environment); err != nil {
+		return DeployLock{}, err
+	}
+	data, err := os.ReadFile(s.deployLockPath(environment))
+	if err != nil {
+		return DeployLock{}, err
+	}
+	var lock DeployLock
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return DeployLock{}, err
+	}
+	lock.Environment = environment
+	return lock, nil
+}
+
+func (s Store) DeleteDeployLock(environment string) error {
+	environment = strings.TrimSpace(environment)
+	if err := validateStateName("environment", environment); err != nil {
+		return err
+	}
+	err := os.Remove(s.deployLockPath(environment))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (s Store) AcquireOperationLock(environment, operation string) (*OperationLock, error) {
+	environment = strings.TrimSpace(environment)
+	operation = strings.TrimSpace(operation)
+	if err := validateStateName("environment", environment); err != nil {
+		return nil, err
+	}
+	if operation == "" {
+		return nil, errors.New("operation is required")
+	}
+	path := s.operationLockPath(environment)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("environment %q is already busy with another Ship operation", environment)
+		}
+		return nil, err
+	}
+	info := struct {
+		Environment string    `json:"environment"`
+		Operation   string    `json:"operation"`
+		PID         int       `json:"pid"`
+		CreatedAt   time.Time `json:"created_at"`
+	}{
+		Environment: environment,
+		Operation:   operation,
+		PID:         os.Getpid(),
+		CreatedAt:   time.Now().UTC(),
+	}
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	if err := file.Truncate(0); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	if err := file.Sync(); err != nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		return nil, err
+	}
+	return &OperationLock{file: file}, nil
+}
+
+func (l *OperationLock) Unlock() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	err := syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
+	closeErr := l.file.Close()
+	l.file = nil
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func (s Store) SaveAccessoryState(accessory AccessoryState) error {
@@ -312,6 +455,22 @@ func (s Store) eventsPath(environment string) string {
 	return filepath.Join(s.Dir, "events", environment+".json")
 }
 
+func (s Store) deployLockPath(environment string) string {
+	return filepath.Join(s.Dir, "locks", environment+".json")
+}
+
+func (s Store) operationLockPath(environment string) string {
+	return filepath.Join(s.Dir, "locks", environment+".operation.lock")
+}
+
+func (s Store) currentReleasePath(environment string) string {
+	return filepath.Join(s.Dir, "environments", environment, "current")
+}
+
+func (s Store) legacyCurrentReleasePath() string {
+	return filepath.Join(s.Dir, "current")
+}
+
 func (s Store) SaveReleaseRecord(release Release) error {
 	if err := validateReleaseID(release.ID); err != nil {
 		return err
@@ -340,7 +499,11 @@ func (s Store) PromoteRelease(id string) error {
 	if release.Environment == "" {
 		return errors.New("release environment is required")
 	}
-	return atomicWriteFile(filepath.Join(s.Dir, "current"), []byte(release.ID+"\n"), 0o644)
+	data := []byte(release.ID + "\n")
+	if err := atomicWriteFile(s.currentReleasePath(release.Environment), data, 0o644); err != nil {
+		return err
+	}
+	return atomicWriteFile(s.legacyCurrentReleasePath(), data, 0o644)
 }
 
 func (s Store) MarkReleaseHealthy(id string, at time.Time) (Release, error) {
@@ -397,7 +560,29 @@ func (s Store) ReadRelease(id string) (Release, error) {
 }
 
 func (s Store) CurrentRelease(environment string) (Release, error) {
-	data, err := os.ReadFile(filepath.Join(s.Dir, "current"))
+	environment = strings.TrimSpace(environment)
+	if environment != "" {
+		if err := validateStateName("environment", environment); err != nil {
+			return Release{}, err
+		}
+		data, err := os.ReadFile(s.currentReleasePath(environment))
+		if err == nil {
+			release, readErr := s.ReadRelease(strings.TrimSpace(string(data)))
+			if readErr != nil {
+				return Release{}, readErr
+			}
+			if release.Environment != environment {
+				return Release{}, fmt.Errorf("current release %s belongs to environment %q", release.ID, release.Environment)
+			}
+			if releaseIsHealthy(release) {
+				return release, nil
+			}
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return Release{}, err
+		}
+	}
+	data, err := os.ReadFile(s.legacyCurrentReleasePath())
 	if err == nil {
 		release, readErr := s.ReadRelease(strings.TrimSpace(string(data)))
 		if readErr != nil {

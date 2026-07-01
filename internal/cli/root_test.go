@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,8 +23,8 @@ import (
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"
-	"github.com/watzon/ship/internal/hetzner"
 	providerpkg "github.com/watzon/ship/internal/provider"
+	"github.com/watzon/ship/internal/provider/hetzner"
 	"github.com/watzon/ship/internal/scheduler"
 	secretspkg "github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
@@ -69,6 +71,17 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 		newBootstrapSSH = originalSSH
 		bootstrapMaxAttempts = originalAttempts
 		bootstrapRetryDelay = originalDelay
+	})
+}
+
+func installShipBinaryReader(t *testing.T, content []byte) {
+	t.Helper()
+	originalBinary := readCurrentShipBinary
+	readCurrentShipBinary = func() ([]byte, error) {
+		return append([]byte(nil), content...), nil
+	}
+	t.Cleanup(func() {
+		readCurrentShipBinary = originalBinary
 	})
 }
 
@@ -133,6 +146,302 @@ func TestProvisionApplyRequiresYes(t *testing.T) {
 	}
 }
 
+func TestConfigCmdRendersResolvedYAML(t *testing.T) {
+	path := writeConfig(t)
+	var out bytes.Buffer
+	cmd := configCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"project: example",
+		"registry: ghcr.io/acme/example",
+		"production:",
+		"image: caddy:2",
+		"domains:",
+		"- example.com",
+		"redirects:",
+		"to: https://example.com",
+		"SESSION_SECRET",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("config output missing %q:\n%s", needle, text)
+		}
+	}
+	for _, unexpected := range []string{
+		"port: 0",
+		"identity_file: \"\"",
+		"vultr: null",
+		"services: {}",
+	} {
+		if strings.Contains(text, unexpected) {
+			t.Fatalf("config output included empty default %q:\n%s", unexpected, text)
+		}
+	}
+}
+
+func TestConfigCmdRendersResolvedJSON(t *testing.T) {
+	path := writeConfig(t)
+	var out bytes.Buffer
+	cmd := configCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view map[string]any
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view["project"] != "example" || view["registry"] != "ghcr.io/acme/example" {
+		t.Fatalf("top-level config = %+v", view)
+	}
+	envs := view["environments"].(map[string]any)
+	production := envs["production"].(map[string]any)
+	provider := production["provider"].(map[string]any)
+	hetzner := provider["hetzner"].(map[string]any)
+	if hetzner["server_type"] != "cx23" {
+		t.Fatalf("hetzner config = %+v", hetzner)
+	}
+	ssh, hasSSH := view["ssh"]
+	if hasSSH {
+		t.Fatalf("empty ssh config should be omitted: %+v", ssh)
+	}
+}
+
+func TestHostsCmdUsesConfiguredInventoryBeforeProvisioning(t *testing.T) {
+	path := writeConfig(t)
+	var out bytes.Buffer
+	cmd := hostsCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"hosts production source=config",
+		"ingress-1 pool=ingress user=root contact=ingress-1",
+		"web-1 pool=web user=root contact=web-1",
+		"worker-1 pool=worker user=root contact=worker-1",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("hosts output missing %q:\n%s", needle, text)
+		}
+	}
+}
+
+func TestHostsCmdUsesSavedHostFacts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveHostFacts("production", []state.HostFact{{
+		Name:           "web-1",
+		Pool:           "web",
+		User:           "deploy",
+		SSHPort:        2222,
+		IdentityFile:   "~/.ssh/ship",
+		KnownHostsFile: ".ship/known_hosts",
+		JumpHost:       "bastion.example.com",
+		SSHOptions:     map[string]string{"IdentitiesOnly": "yes"},
+		PublicAddress:  "198.51.100.10",
+		Provider:       "fake",
+		ProviderID:     "instance-abc",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	cmd := hostsCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view hostsView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.Environment != "production" || view.Source != "state" || len(view.Hosts) != 1 {
+		t.Fatalf("view = %+v", view)
+	}
+	host := view.Hosts[0]
+	if host.Name != "web-1" || host.Pool != "web" || host.User != "deploy" || host.Contact != "198.51.100.10" || host.SSHPort != 2222 {
+		t.Fatalf("host = %+v", host)
+	}
+	if host.IdentityFile != "~/.ssh/ship" || host.KnownHostsFile != ".ship/known_hosts" || host.JumpHost != "bastion.example.com" || host.SSHOptions["IdentitiesOnly"] != "yes" {
+		t.Fatalf("host ssh metadata = %+v", host)
+	}
+}
+
+func TestVersionCmdLocal(t *testing.T) {
+	var out bytes.Buffer
+	cmd := versionCmd(&options{})
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"ship version " + agent.AgentVersion,
+		fmt.Sprintf("protocol=%d-%d", agent.AgentMinProtocol, agent.AgentProtocol),
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("version output missing %q:\n%s", needle, text)
+		}
+	}
+}
+
+func TestVersionCmdEnvironmentJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
+			calls = append(calls, host.Name+":"+method)
+			if method != "status" {
+				return fmt.Errorf("unexpected method %s", method)
+			}
+			status, ok := out.(*agent.Status)
+			if !ok {
+				return fmt.Errorf("unexpected status output %T", out)
+			}
+			*status = agent.Status{
+				Hostname:         "node-" + host.Name,
+				StateDir:         config.RemoteStateDir,
+				DockerOK:         true,
+				AgentVersion:     agent.AgentVersion,
+				ProtocolVersion:  agent.AgentProtocol,
+				SupportedMethods: []string{"status", "pull"},
+			}
+			return nil
+		})
+	})
+
+	var out bytes.Buffer
+	cmd := versionCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view versionView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.ShipVersion != agent.AgentVersion || view.MinAgentProtocol != agent.AgentMinProtocol || view.MaxAgentProtocol != agent.AgentProtocol {
+		t.Fatalf("local version fields = %+v", view)
+	}
+	if view.Environment != "production" || len(view.Hosts) != 1 {
+		t.Fatalf("view = %+v", view)
+	}
+	host := view.Hosts[0]
+	if host.Name != "web-1" || host.Pool != "web" || host.AgentVersion != agent.AgentVersion || host.AgentProtocol != agent.AgentProtocol || !host.DockerOK {
+		t.Fatalf("host version = %+v", host)
+	}
+	if strings.Join(host.SupportedMethods, ",") != "status,pull" {
+		t.Fatalf("supported methods = %+v", host.SupportedMethods)
+	}
+	if strings.Join(calls, ",") != "web-1:status" {
+		t.Fatalf("agent calls = %+v", calls)
+	}
+}
+
+func TestAgentUpgradeUploadsCurrentBinary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binary := []byte("ship-upgrade-binary")
+	installShipBinaryReader(t, binary)
+	wantSum := fmt.Sprintf("%x", sha256.Sum256(binary))
+	var calls []agent.InstallBinaryParams
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
+			if method != "install_binary" {
+				return fmt.Errorf("unexpected method %s", method)
+			}
+			p := params.(agent.InstallBinaryParams)
+			calls = append(calls, p)
+			result, ok := out.(*agent.InstallBinaryResult)
+			if !ok {
+				return fmt.Errorf("unexpected install output %T", out)
+			}
+			*result = agent.InstallBinaryResult{Path: p.Path, Installed: true, SHA256: p.SHA256}
+			return nil
+		})
+	})
+
+	var out bytes.Buffer
+	cmd := agentCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"upgrade", "production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("install calls = %+v", calls)
+	}
+	if calls[0].Path != config.RemoteBinaryPath || calls[0].SHA256 != wantSum || calls[0].Mode != 0o755 || calls[0].ContentBase64 == "" {
+		t.Fatalf("install params = %+v, want sha %s", calls[0], wantSum)
+	}
+	var view agentUpgradeView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.Environment != "production" || view.SHA256 != wantSum || len(view.Hosts) != 1 {
+		t.Fatalf("upgrade view = %+v", view)
+	}
+	host := view.Hosts[0]
+	if host.Name != "web-1" || !host.Installed || host.Path != config.RemoteBinaryPath || host.SHA256 != wantSum {
+		t.Fatalf("host upgrade = %+v", host)
+	}
+	timeline, err := state.NewStore(filepath.Join(dir, config.LocalStateDir)).Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "agent_upgrade", "started", "") || !timelineContains(timeline, "agent_upgrade", "succeeded", "") {
+		t.Fatalf("timeline missing agent upgrade events: %+v", timeline)
+	}
+}
+
+func TestAgentUpgradeDryRunDoesNotContactAgents(t *testing.T) {
+	path := writeConfig(t)
+	installShipBinaryReader(t, []byte("ship-upgrade-binary"))
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		t.Fatalf("dry-run upgrade contacted agent on %s", host.Name)
+		return nil
+	})
+
+	var out bytes.Buffer
+	cmd := agentCmd(&options{configPath: path, dryRun: true})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"upgrade", "production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"agent upgrade production",
+		"dry_run=true",
+		"would_install=" + config.RemoteBinaryPath,
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("upgrade dry-run output missing %q:\n%s", needle, text)
+		}
+	}
+}
+
 func TestProvisionApplyDryRunDoesNotRequireYesOrToken(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -173,6 +482,40 @@ func TestProvisionApplyDryRunUsesConfiguredProvider(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "would provision fake-1 pool=fake") {
 		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestProvisionPlanJSON(t *testing.T) {
+	path := writeConfig(t)
+	var out bytes.Buffer
+	cmd := provisionCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"plan", "production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view struct {
+		Environment string `json:"environment"`
+		Actions     []struct {
+			Kind    string `json:"kind"`
+			Target  string `json:"target"`
+			Details string `json:"details,omitempty"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.Environment != "production" || len(view.Actions) == 0 {
+		t.Fatalf("view = %+v", view)
+	}
+	var sawWeb bool
+	for _, action := range view.Actions {
+		if action.Kind == "provision" && action.Target == "web-1" && action.Details == "pool=web" {
+			sawWeb = true
+		}
+	}
+	if !sawWeb {
+		t.Fatalf("missing web provision action: %+v", view.Actions)
 	}
 }
 
@@ -332,6 +675,50 @@ func TestProvisionApplyWritesGenericProviderHostFacts(t *testing.T) {
 		t.Fatalf("facts = %+v", facts)
 	}
 	if facts[0].Provider != "fake" || facts[0].ProviderID != "instance-abc" || facts[0].ServerID != 0 || facts[0].IPv4 != "" || facts[0].PublicAddress != "host.example.test" {
+		t.Fatalf("host fact = %+v", facts[0])
+	}
+}
+
+func TestProvisionApplyManualProviderBootstrapsExistingHosts(t *testing.T) {
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(manualHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var bootstrapEvents []string
+	installBootstrapHooks(t, &bootstrapEvents)
+
+	var out bytes.Buffer
+	cmd := provisionCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"apply", "production", "--yes"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "exists web-1.example.com pool=web provider_id=web-1.example.com public_address=web-1.example.com") {
+		t.Fatalf("output = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "bootstrapped web-1.example.com") {
+		t.Fatalf("bootstrap output missing: %q", out.String())
+	}
+	wantEvents := []string{
+		"bootstrap:web-1.example.com:run:true",
+		"bootstrap:web-1.example.com:run:set -eu",
+		"bootstrap:web-1.example.com:upload:set -eu:16",
+		"bootstrap:web-1.example.com:run:set -eu",
+	}
+	if strings.Join(bootstrapEvents, "\n") != strings.Join(wantEvents, "\n") {
+		t.Fatalf("bootstrap events = %#v, want %#v", bootstrapEvents, wantEvents)
+	}
+	store := state.NewStore(filepath.Join(projectDir, config.LocalStateDir))
+	facts, err := store.ReadHostFacts("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("facts = %+v", facts)
+	}
+	if facts[0].Provider != config.ProviderManual || facts[0].Name != "web-1.example.com" || facts[0].User != "deploy" || facts[0].PublicAddress != "web-1.example.com" {
 		t.Fatalf("host fact = %+v", facts[0])
 	}
 }
@@ -497,6 +884,123 @@ func TestAgentInstallDryRunUsesSavedHostFactContact(t *testing.T) {
 	}
 }
 
+func TestPlanJSON(t *testing.T) {
+	path := writeConfig(t)
+	var out bytes.Buffer
+	cmd := planCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view struct {
+		Environment string `json:"environment"`
+		Actions     []struct {
+			Kind    string `json:"kind"`
+			Target  string `json:"target"`
+			Details string `json:"details,omitempty"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.Environment != "production" || len(view.Actions) == 0 {
+		t.Fatalf("view = %+v", view)
+	}
+	var sawBuild, sawStart, sawIngress bool
+	for _, action := range view.Actions {
+		switch {
+		case action.Kind == "build" && action.Target == "web":
+			sawBuild = true
+		case action.Kind == "start" && action.Target == "web.1":
+			sawStart = true
+		case action.Kind == "ingress" && action.Target == "web" && strings.Contains(action.Details, "example.com"):
+			sawIngress = true
+		}
+	}
+	if !sawBuild || !sawStart || !sawIngress {
+		t.Fatalf("actions missing build/start/ingress: %+v", view.Actions)
+	}
+}
+
+func TestPlanObservedReportsDriftAndRolloutActions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-current",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
+		CreatedAt:   time.Unix(20, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {
+			serviceContainer("web-1", "web", 1, "release-current", "Up 10 seconds"),
+			serviceContainer("web-1", "worker", 1, "old-worker", "Exited"),
+		},
+		"web-2": {
+			serviceContainer("web-2", "web", 2, "release-old", "Up 2 minutes"),
+		},
+	}
+	var events []string
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	var out bytes.Buffer
+	cmd := planCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--observed"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"observed state current_release=release-current",
+		"drift web.2 host=web-2 state=wrong_release",
+		"extra host=web-1",
+		"service=worker",
+		"rollout actions",
+		"start web.1 on web-1",
+		"stop web.2 on web-2",
+		"stop worker.1 on web-1",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("observed plan output missing %q:\n%s", needle, text)
+		}
+	}
+
+	out.Reset()
+	cmd = planCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--observed", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view observedPlanView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatalf("invalid json %q: %v", out.String(), err)
+	}
+	if view.Observed.CurrentRelease != "release-current" || !view.Observed.Summary.Drift || len(view.RolloutActions) == 0 {
+		t.Fatalf("observed plan view = %+v", view)
+	}
+	var sawStop bool
+	for _, action := range view.RolloutActions {
+		if action.Kind == "stop" && action.Container == deployment.ContainerName("demo", "production", "web", 2, "release-old") {
+			sawStop = true
+		}
+	}
+	if !sawStop {
+		t.Fatalf("rollout actions missing stop for old web replica: %+v", view.RolloutActions)
+	}
+}
+
 func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -508,6 +1012,8 @@ func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 	var events []string
 	releaseID := "abc123def456-20260630T183456.123456789Z"
 	tag := "registry.local/acme/demo:web-" + releaseID
+	latestTag := "registry.local/acme/demo:web-latest"
+	productionTag := "registry.local/acme/demo:web-production"
 	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
 	workerDigestRef := "registry.local/acme/worker@sha256:" + strings.Repeat("3", 64)
 	fakeDocker := &recordingDeployDocker{
@@ -532,6 +1038,8 @@ func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 	want := []string{
 		"build:" + tag,
 		"push:" + tag,
+		"push:" + latestTag,
+		"push:" + productionTag,
 		"resolve:" + tag,
 		"resolve:registry.local/acme/worker:stable",
 		"agent:web-1:write_release_state:" + releaseID + ":pending",
@@ -552,8 +1060,694 @@ func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 		t.Fatalf("builds = %#v", fakeDocker.builds)
 	}
 	build := fakeDocker.builds[0]
-	if build.BuildArgs["RAILS_ENV"] != "production" || build.Target != "runtime" || build.Platform != "linux/amd64" {
+	if build.BuildArgs["RAILS_ENV"] != "production" || build.Target != "runtime" || build.Builder != "ship-cloud" || build.Platform != "linux/amd64" {
 		t.Fatalf("build options = %+v", build)
+	}
+	if strings.Join(build.AdditionalTags, ",") != latestTag+","+productionTag {
+		t.Fatalf("build additional tags = %+v", build)
+	}
+	if !build.Pull || build.NoCache || strings.Join(build.NoCacheFilter, ",") != "install,assets" {
+		t.Fatalf("build freshness options = %+v", build)
+	}
+	if strings.Join(build.CacheFrom, ",") != "type=registry,ref=registry.local/acme/demo:build-cache" ||
+		strings.Join(build.CacheTo, ",") != "type=registry,ref=registry.local/acme/demo:build-cache,mode=max" {
+		t.Fatalf("build cache options = %+v", build)
+	}
+	if strings.Join(build.Secrets, ",") != "id=npm_token,env=NPM_TOKEN" || strings.Join(build.SSH, ",") != "default" {
+		t.Fatalf("build secret/ssh options = %+v", build)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	release, err := store.ReadRelease(releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.ConfigHash == "" || release.ConfigHash != configHash(resolved) {
+		t.Fatalf("release config hash = %q, want %q", release.ConfigHash, configHash(resolved))
+	}
+}
+
+func TestPrepareDeployImagesPublishesAttestedBuilds(t *testing.T) {
+	events := []string{}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	latestTag := "registry.local/acme/demo:web-latest"
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fakeDocker := &recordingDeployDocker{
+		events: &events,
+		resolved: map[string]string{
+			tag: digestRef,
+		},
+	}
+	cfg := &config.Config{
+		Registry: "registry.local/acme/demo",
+		Services: map[string]config.Service{
+			"web": {
+				Image: config.ImageSpec{
+					Build:      ".",
+					Tags:       []string{"latest"},
+					SBOM:       config.BuildxFlag("true"),
+					Provenance: config.BuildxFlag("mode=max"),
+				},
+			},
+		},
+	}
+
+	images, err := prepareDeployImages(context.Background(), fakeDocker, cfg, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if images["web"] != digestRef {
+		t.Fatalf("images = %+v, want web digest %q", images, digestRef)
+	}
+	wantEvents := []string{
+		"build:" + tag,
+		"resolve:" + tag,
+	}
+	if strings.Join(events, "\n") != strings.Join(wantEvents, "\n") {
+		t.Fatalf("events = %#v, want %#v", events, wantEvents)
+	}
+	if len(fakeDocker.builds) != 1 {
+		t.Fatalf("builds = %#v", fakeDocker.builds)
+	}
+	build := fakeDocker.builds[0]
+	if !build.Push || build.SBOM != "true" || build.Provenance != "mode=max" || strings.Join(build.AdditionalTags, ",") != latestTag {
+		t.Fatalf("build options = %+v", build)
+	}
+}
+
+func TestPrepareDeployImagesPublishesMultiPlatformBuilds(t *testing.T) {
+	events := []string{}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fakeDocker := &recordingDeployDocker{
+		events: &events,
+		resolved: map[string]string{
+			tag: digestRef,
+		},
+	}
+	cfg := &config.Config{
+		Registry: "registry.local/acme/demo",
+		Services: map[string]config.Service{
+			"web": {
+				Image: config.ImageSpec{
+					Build:     ".",
+					Platforms: []string{"linux/amd64", "linux/arm64"},
+				},
+			},
+		},
+	}
+
+	images, err := prepareDeployImages(context.Background(), fakeDocker, cfg, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if images["web"] != digestRef {
+		t.Fatalf("images = %+v, want web digest %q", images, digestRef)
+	}
+	wantEvents := []string{
+		"build:" + tag,
+		"resolve:" + tag,
+	}
+	if strings.Join(events, "\n") != strings.Join(wantEvents, "\n") {
+		t.Fatalf("events = %#v, want %#v", events, wantEvents)
+	}
+	if len(fakeDocker.builds) != 1 {
+		t.Fatalf("builds = %#v", fakeDocker.builds)
+	}
+	build := fakeDocker.builds[0]
+	if !build.Push || strings.Join(build.Platforms, ",") != "linux/amd64,linux/arm64" {
+		t.Fatalf("build options = %+v", build)
+	}
+}
+
+func TestPrepareDeployImagesPassesBuildpackOptions(t *testing.T) {
+	events := []string{}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fakeDocker := &recordingDeployDocker{
+		events: &events,
+		resolved: map[string]string{
+			tag: digestRef,
+		},
+	}
+	cfg := &config.Config{
+		Registry: "registry.local/acme/demo",
+		Services: map[string]config.Service{
+			"web": {
+				Image: config.ImageSpec{
+					Build: ".",
+					Tags:  []string{"latest"},
+					Buildpack: config.BuildpackConfig{
+						Builder:    "paketobuildpacks/builder-jammy-base",
+						Buildpacks: []string{"paketo-buildpacks/nodejs"},
+						Env: map[string]string{
+							"BP_NODE_RUN_SCRIPTS": "build",
+						},
+						Descriptor:   "project.production.toml",
+						Publish:      true,
+						PullPolicy:   "if-not-present",
+						TrustBuilder: true,
+					},
+				},
+			},
+		},
+	}
+
+	images, err := prepareDeployImages(context.Background(), fakeDocker, cfg, releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if images["web"] != digestRef {
+		t.Fatalf("images = %+v, want web digest %q", images, digestRef)
+	}
+	wantEvents := []string{
+		"build:" + tag,
+		"resolve:" + tag,
+	}
+	if strings.Join(events, "\n") != strings.Join(wantEvents, "\n") {
+		t.Fatalf("events = %#v, want %#v", events, wantEvents)
+	}
+	if len(fakeDocker.builds) != 1 {
+		t.Fatalf("builds = %#v", fakeDocker.builds)
+	}
+	build := fakeDocker.builds[0]
+	if !build.Buildpack.Publish || build.Buildpack.Builder != "paketobuildpacks/builder-jammy-base" || build.Buildpack.PullPolicy != "if-not-present" || !build.Buildpack.TrustBuilder {
+		t.Fatalf("buildpack options = %+v", build.Buildpack)
+	}
+	if strings.Join(build.Buildpack.Buildpacks, ",") != "paketo-buildpacks/nodejs" {
+		t.Fatalf("buildpacks = %+v", build.Buildpack.Buildpacks)
+	}
+	if build.Buildpack.Env["BP_NODE_RUN_SCRIPTS"] != "build" || build.Buildpack.Descriptor != "project.production.toml" {
+		t.Fatalf("buildpack options = %+v", build.Buildpack)
+	}
+}
+
+func TestDeployRunsLifecycleHooksInOrder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(hookDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var hookRuns []hookRun
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+	installLocalHookRunner(t, &hookRuns, "", &events)
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantHooks := []string{
+		"pre_deploy:echo root-pre",
+		"pre_deploy:echo env-pre",
+		"pre_build:echo pre-build",
+		"post_deploy:echo post-deploy",
+	}
+	var gotHooks []string
+	for _, run := range hookRuns {
+		gotHooks = append(gotHooks, run.Context.Hook+":"+run.Command)
+		if run.Context.Project != "demo" || run.Context.Environment != "production" || run.Context.ReleaseID != releaseID || run.Context.ConfigPath != path {
+			t.Fatalf("hook context = %+v", run.Context)
+		}
+	}
+	if strings.Join(gotHooks, "\n") != strings.Join(wantHooks, "\n") {
+		t.Fatalf("hooks = %#v, want %#v", gotHooks, wantHooks)
+	}
+	joined := strings.Join(events, "\n")
+	preBuildAt := strings.Index(joined, "hook:pre_build:echo pre-build")
+	buildAt := strings.Index(joined, "build:"+tag)
+	postDeployAt := strings.Index(joined, "hook:post_deploy:echo post-deploy")
+	healthyAt := strings.Index(joined, "agent:web-1:write_release_state:"+releaseID+":healthy")
+	if preBuildAt < 0 || buildAt < 0 || preBuildAt > buildAt {
+		t.Fatalf("pre-build hook did not precede build:\n%s", joined)
+	}
+	if postDeployAt < 0 || healthyAt < 0 || postDeployAt > healthyAt {
+		t.Fatalf("post-deploy hook did not precede healthy promotion:\n%s", joined)
+	}
+	if hookRuns[3].Hook.Env["SMOKE"] != "1" || hookRuns[3].Hook.TimeoutSeconds != 3 {
+		t.Fatalf("post deploy hook config = %+v", hookRuns[3].Hook)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy_hook", "started", releaseID) || !timelineContains(timeline, "deploy_hook", "succeeded", releaseID) {
+		t.Fatalf("timeline missing deploy hook events: %+v", timeline)
+	}
+}
+
+func TestDeployRunsFailureHookWhenLifecycleHookFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(hookDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var hookRuns []hookRun
+	installDeployHooks(t, panicDeployDocker{t: t}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+	installLocalHookRunner(t, &hookRuns, "pre_build", &events)
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "pre_build hook failed") {
+		t.Fatalf("expected pre_build hook failure, got %v", err)
+	}
+	var gotHooks []string
+	for _, run := range hookRuns {
+		gotHooks = append(gotHooks, run.Context.Hook+":"+run.Command)
+	}
+	wantHooks := []string{
+		"pre_deploy:echo root-pre",
+		"pre_deploy:echo env-pre",
+		"pre_build:echo pre-build",
+		"deploy_failed:echo failed",
+	}
+	if strings.Join(gotHooks, "\n") != strings.Join(wantHooks, "\n") {
+		t.Fatalf("hooks = %#v, want %#v", gotHooks, wantHooks)
+	}
+	if !strings.Contains(hookRuns[len(hookRuns)-1].Context.Failure, "pre_build hook failed") {
+		t.Fatalf("failure hook context = %+v", hookRuns[len(hookRuns)-1].Context)
+	}
+	if len(events) != 4 {
+		t.Fatalf("unexpected deploy events after hook failure: %#v", events)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy_hook", "failed", "abc123def456-20260630T183456.123456789Z") || !timelineContains(timeline, "deploy", "failed", "abc123def456-20260630T183456.123456789Z") {
+		t.Fatalf("timeline missing failed hook/deploy: %+v", timeline)
+	}
+}
+
+func TestDeploySendsWebhookNotifications(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(notificationDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var deliveries []webhookDelivery
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+	installWebhookNotifier(t, &deliveries, nil)
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(deliveries) != 2 {
+		t.Fatalf("deliveries = %+v", deliveries)
+	}
+	if deliveries[0].Webhook.URL != "https://hooks.example/deploys" || deliveries[1].Webhook.URLEnv != "SHIP_NOTIFY_WEBHOOK" {
+		t.Fatalf("notification webhook order = %+v", deliveries)
+	}
+	payload := deliveries[0].Payload
+	if payload.Project != "demo" || payload.Environment != "production" || payload.Operation != "deploy" || payload.Status != "succeeded" || payload.Release != releaseID {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if payload.Images["web"] != digestRef {
+		t.Fatalf("payload images = %+v", payload.Images)
+	}
+	if !payload.Time.Equal(deployNow().UTC()) {
+		t.Fatalf("payload time = %s", payload.Time)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "notification", "succeeded", releaseID) {
+		t.Fatalf("timeline missing notification success: %+v", timeline)
+	}
+}
+
+func TestDeployFailureSendsWebhookNotificationWithoutMaskingError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(notificationDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var deliveries []webhookDelivery
+	installDeployHooks(t, &recordingDeployDocker{events: &events, failStage: "build"}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+	installWebhookNotifier(t, &deliveries, nil)
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "build failed") {
+		t.Fatalf("expected build failure, got %v", err)
+	}
+	if len(deliveries) != 1 {
+		t.Fatalf("deliveries = %+v", deliveries)
+	}
+	payload := deliveries[0].Payload
+	if payload.Operation != "deploy" || payload.Status != "failed" || !strings.Contains(payload.Message, "build failed") {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if len(payload.Images) != 0 {
+		t.Fatalf("failed payload images = %+v", payload.Images)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, timelineErr := store.Events("production")
+	if timelineErr != nil {
+		t.Fatal(timelineErr)
+	}
+	if !timelineContains(timeline, "notification", "succeeded", payload.Release) {
+		t.Fatalf("timeline missing notification success: %+v", timeline)
+	}
+}
+
+func TestDeployWebhookNotificationFailureIsRecordedButNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(notificationDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var deliveries []webhookDelivery
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+	installWebhookNotifier(t, &deliveries, errors.New("webhook unavailable"))
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 2 {
+		t.Fatalf("deliveries = %+v", deliveries)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy", "succeeded", releaseID) || !timelineContains(timeline, "notification", "failed", releaseID) {
+		t.Fatalf("timeline missing deploy success/notification failure: %+v", timeline)
+	}
+}
+
+func TestDefaultSendWebhookNotificationPostsJSON(t *testing.T) {
+	var gotMethod string
+	var gotContentType string
+	var gotAuth string
+	var gotPayload notificationPayload
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	t.Setenv("SHIP_WEBHOOK_URL", server.URL)
+
+	payload := notificationPayload{
+		Project:     "demo",
+		Environment: "production",
+		Operation:   "deploy",
+		Status:      "succeeded",
+		Release:     "release-1",
+		Images:      map[string]string{"web": "image"},
+		Time:        time.Unix(10, 0).UTC(),
+	}
+	err := defaultSendWebhookNotification(context.Background(), config.WebhookNotification{
+		URLEnv:         "SHIP_WEBHOOK_URL",
+		Headers:        map[string]string{"Authorization": "Bearer test"},
+		TimeoutSeconds: 1,
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost || gotContentType != "application/json" || gotAuth != "Bearer test" {
+		t.Fatalf("request method/content-type/auth = %q %q %q", gotMethod, gotContentType, gotAuth)
+	}
+	if gotPayload.Project != payload.Project || gotPayload.Images["web"] != "image" {
+		t.Fatalf("payload = %+v", gotPayload)
+	}
+}
+
+func TestDeployWritesRegistryAuthBeforePull(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	workerDigestRef := "registry.local/acme/worker@sha256:" + strings.Repeat("3", 64)
+	fakeDocker := &recordingDeployDocker{
+		events: &events,
+		resolved: map[string]string{
+			tag:                                 digestRef,
+			"registry.local/acme/worker:stable": workerDigestRef,
+		},
+		auths: map[string]docker.RegistryAuth{
+			digestRef: {Server: "registry.local", Auth: json.RawMessage(`{"auth":"dXNlcjp0b2tlbg=="}`)},
+		},
+	}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(events, "\n")
+	for _, host := range []string{"web-1", "web-2"} {
+		authAt := strings.Index(joined, "agent:"+host+":write_registry_auth:registry.local")
+		pullAt := strings.Index(joined, "agent:"+host+":pull:"+digestRef)
+		if authAt < 0 || pullAt < 0 || authAt > pullAt {
+			t.Fatalf("registry auth did not precede pull for %s:\n%s", host, joined)
+		}
+	}
+	if strings.Count(joined, "write_registry_auth:registry.local") != 2 {
+		t.Fatalf("registry auth was not written once per host:\n%s", joined)
+	}
+}
+
+func TestDeploySyncsServiceSchedulesToCurrentReleaseContainers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(scheduledDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var syncs []agent.SyncCronFilesParams
+	imageRef := "registry.local/acme/web:stable"
+	digestRef := "registry.local/acme/web@sha256:" + strings.Repeat("4", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{imageRef: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, cronSyncs: &syncs}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(syncs) != 2 {
+		t.Fatalf("cron syncs = %#v", syncs)
+	}
+	var scheduled agent.CronFile
+	for _, sync := range syncs {
+		if sync.Prefix != "ship-demo-production-" {
+			t.Fatalf("prefix = %q", sync.Prefix)
+		}
+		if len(sync.Files) == 1 {
+			scheduled = sync.Files[0]
+		}
+	}
+	if scheduled.Name != "ship-demo-production-web-cleanup" {
+		t.Fatalf("scheduled file = %+v", scheduled)
+	}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	container := deployment.ContainerName("demo", "production", "web", 2, releaseID)
+	for _, needle := range []string{
+		"17 * * * * root timeout 300s docker exec '" + container + "' sh -lc 'bin/rails cleanup'",
+		">> '/var/log/ship-demo-production-web-cleanup.log' 2>&1",
+	} {
+		if !strings.Contains(scheduled.Content, needle) {
+			t.Fatalf("cron content missing %q:\n%s", needle, scheduled.Content)
+		}
+	}
+	joined := strings.Join(events, "\n")
+	scheduleAt := strings.Index(joined, "agent:web-2:sync_cron_files:ship-demo-production-:1")
+	healthyAt := strings.Index(joined, "agent:web-2:write_release_state:"+releaseID+":healthy")
+	if scheduleAt < 0 || healthyAt < 0 || scheduleAt > healthyAt {
+		t.Fatalf("schedule sync did not precede healthy release state:\n%s", joined)
+	}
+}
+
+func TestDeploySyncsAccessoryBackupSchedules(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(scheduledAccessoryBackupConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveAccessoryState(state.AccessoryState{
+		Environment: "production",
+		Name:        "postgres",
+		Host:        state.HostFact{Name: "data-1", Pool: "data", User: "root"},
+		UpdatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var syncs []agent.SyncCronFilesParams
+	imageRef := "registry.local/acme/web:stable"
+	digestRef := "registry.local/acme/web@sha256:" + strings.Repeat("5", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{imageRef: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, cronSyncs: &syncs}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(syncs) != 1 {
+		t.Fatalf("cron syncs = %#v", syncs)
+	}
+	if syncs[0].Prefix != "ship-demo-production-" || len(syncs[0].Files) != 1 {
+		t.Fatalf("cron sync = %+v", syncs[0])
+	}
+	scheduled := syncs[0].Files[0]
+	if scheduled.Name != "ship-demo-production-accessory-postgres-backup" {
+		t.Fatalf("scheduled file = %+v", scheduled)
+	}
+	for _, needle := range []string{
+		"13 3 * * * root",
+		"timeout 600s",
+		"artifact=\"$artifact_dir/postgres-$(date -u +\\%Y\\%m\\%dT\\%H\\%M\\%S.000000000Z).backup\"",
+		"pg_dumpall",
+		`SHIP_BACKUP_ARTIFACT="$artifact"; export SHIP_BACKUP_ARTIFACT; printf "s3://ship/\%s\n" "$(basename "$SHIP_BACKUP_ARTIFACT")"`,
+		"/var/log/ship-demo-production-accessory-postgres-backup.log",
+	} {
+		if !strings.Contains(scheduled.Content, needle) {
+			t.Fatalf("accessory backup schedule missing %q:\n%s", needle, scheduled.Content)
+		}
+	}
+}
+
+func TestDeployRunsReleaseCommandBeforeRollout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(releaseCommandDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	secretValue := "postgres://user:pass@example/db"
+	t.Setenv("SHIP_TEST_DATABASE_URL", secretValue)
+
+	var events []string
+	var oneOffRuns []agent.RunOneOffContainerParams
+	imageRef := "registry.local/acme/web:stable"
+	digestRef := "registry.local/acme/web@sha256:" + strings.Repeat("4", 64)
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{imageRef: digestRef}}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, oneOffRuns: &oneOffRuns}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	if len(oneOffRuns) != 1 {
+		t.Fatalf("one-off runs = %#v", oneOffRuns)
+	}
+	run := oneOffRuns[0]
+	if run.Image != digestRef || run.Command != "bin/rails db:migrate" || run.TimeoutSeconds != 600 {
+		t.Fatalf("one-off run = %+v", run)
+	}
+	if run.Network != "ship-demo-production" {
+		t.Fatalf("one-off network = %q", run.Network)
+	}
+	if !strings.Contains(strings.Join(run.Args, " "), "--env-file /var/lib/ship/secrets/production/service-web.env") {
+		t.Fatalf("one-off args missing secret env file: %+v", run.Args)
+	}
+	if !strings.Contains(strings.Join(run.Args, " "), "--log-opt max-size=10m") {
+		t.Fatalf("one-off args missing logging options: %+v", run.Args)
+	}
+	if !strings.Contains(strings.Join(run.Args, " "), "-v uploads:/app/uploads") {
+		t.Fatalf("one-off args missing service volumes: %+v", run.Args)
+	}
+	if !strings.Contains(strings.Join(run.Args, " "), "--memory 512m") || !strings.Contains(strings.Join(run.Args, " "), "--cpus 1") {
+		t.Fatalf("one-off args missing resource limits: %+v", run.Args)
+	}
+	if strings.Contains(strings.Join(run.Args, " "), "-p 3000:3000") {
+		t.Fatalf("one-off args should not bind service ports: %+v", run.Args)
+	}
+	if strings.Contains(strings.Join(run.Args, " "), "--restart") {
+		t.Fatalf("one-off args should not set restart policy: %+v", run.Args)
+	}
+	joined := strings.Join(events, "\n")
+	oneOffAt := strings.Index(joined, "agent:web-1:run_oneoff:ship_demo_production_web_release_"+releaseID+":bin/rails db:migrate")
+	rolloutAt := strings.Index(joined, "agent:web-1:list_ship_containers")
+	if oneOffAt < 0 || rolloutAt < 0 || oneOffAt > rolloutAt {
+		t.Fatalf("release command did not precede rollout inspection:\n%s", joined)
 	}
 }
 
@@ -567,14 +1761,16 @@ func TestDeployWithSavedHostFactsPassesContactsAndPreservesLogicalEvents(t *test
 
 	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
 	if err := store.SaveHostFacts("production", []state.HostFact{
-		{Name: "web-1", Pool: "web", User: "root", IPv4: "203.0.113.10", PublicAddress: "198.51.100.10"},
-		{Name: "web-2", Pool: "web", User: "root", IPv4: "203.0.113.20"},
+		{Name: "web-1", Pool: "web", User: "deploy", SSHPort: 2222, IPv4: "203.0.113.10", PublicAddress: "198.51.100.10"},
+		{Name: "web-2", Pool: "web", User: "ubuntu", IPv4: "203.0.113.20"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	var events []string
 	seenContacts := map[string]string{}
+	seenUsers := map[string]string{}
+	seenPorts := map[string]int{}
 	releaseID := "abc123def456-20260630T183456.123456789Z"
 	tag := "registry.local/acme/demo:web-" + releaseID
 	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
@@ -588,6 +1784,8 @@ func TestDeployWithSavedHostFactsPassesContactsAndPreservesLogicalEvents(t *test
 	}
 	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
 		seenContacts[host.Name] = host.Contact
+		seenUsers[host.Name] = host.User
+		seenPorts[host.Name] = host.SSHPort
 		return recordingDeployAgent{host: host.Name, events: &events}
 	})
 
@@ -602,12 +1800,132 @@ func TestDeployWithSavedHostFactsPassesContactsAndPreservesLogicalEvents(t *test
 	if seenContacts["web-1"] != "198.51.100.10" || seenContacts["web-2"] != "203.0.113.20" {
 		t.Fatalf("seen contacts = %+v", seenContacts)
 	}
+	if seenUsers["web-1"] != "deploy" || seenUsers["web-2"] != "ubuntu" {
+		t.Fatalf("seen users = %+v", seenUsers)
+	}
+	if seenPorts["web-1"] != 2222 || seenPorts["web-2"] != 0 {
+		t.Fatalf("seen ports = %+v", seenPorts)
+	}
 	joined := strings.Join(events, "\n")
 	if !strings.Contains(joined, "agent:web-1:run:"+digestRef) || !strings.Contains(joined, "agent:web-2:run:"+digestRef) {
 		t.Fatalf("logical host events missing:\n%s", joined)
 	}
 	if strings.Contains(joined, "198.51.100.10") || strings.Contains(joined, "203.0.113.20") {
 		t.Fatalf("contact addresses leaked into logical events:\n%s", joined)
+	}
+}
+
+func TestLockUnlockCommandsManageDeployLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var out bytes.Buffer
+	lock := lockCmd(&options{configPath: path})
+	lock.SetOut(&out)
+	lock.SetArgs([]string{"production", "--message", "database maintenance"})
+	if err := lock.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	read, err := store.ReadDeployLock("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.Message != "database maintenance" {
+		t.Fatalf("lock = %+v", read)
+	}
+	if !strings.Contains(out.String(), "locked production: database maintenance") {
+		t.Fatalf("lock output = %q", out.String())
+	}
+
+	out.Reset()
+	unlock := unlockCmd(&options{configPath: path})
+	unlock.SetOut(&out)
+	unlock.SetArgs([]string{"production"})
+	if err := unlock.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadDeployLock("production"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected missing lock, got %v", err)
+	}
+	if !strings.Contains(out.String(), "unlocked production") {
+		t.Fatalf("unlock output = %q", out.String())
+	}
+}
+
+func TestDeployRefusesLockedEnvironmentBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveDeployLock(state.DeployLock{Environment: "production", Message: "freeze"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, panicDeployDocker{t: t}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "deploys are locked for production: freeze") {
+		t.Fatalf("expected deploy lock error, got %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("locked deploy touched agent: %#v", events)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy", "blocked", "") {
+		t.Fatalf("timeline missing blocked deploy: %+v", timeline)
+	}
+}
+
+func TestDeployRefusesConcurrentOperationBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	lock, err := store.AcquireOperationLock("production", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	var events []string
+	installDeployHooks(t, panicDeployDocker{t: t}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already busy") {
+		t.Fatalf("expected busy operation error, got %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("busy deploy touched agent: %#v", events)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy", "blocked", "") {
+		t.Fatalf("timeline missing blocked deploy: %+v", timeline)
 	}
 }
 
@@ -873,6 +2191,104 @@ func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
 	}
 }
 
+func TestPromoteRollsTargetEnvironmentWithSourceReleaseImages(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(promoteConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	sourceImage := "registry.local/acme/demo@sha256:" + strings.Repeat("a", 64)
+	if err := store.SaveRelease(state.Release{
+		ID:          "staging-release",
+		Environment: "staging",
+		Images:      map[string]string{"web": sourceImage},
+		ConfigHash:  "sha256:staging",
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(state.Release{
+		ID:          "production-old",
+		Environment: "production",
+		Images:      map[string]string{"web": "old-image"},
+		ConfigHash:  "sha256:production-old",
+		CreatedAt:   time.Unix(20, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var releaseWrites []releaseStateWrite
+	fakeDocker := &recordingDeployDocker{events: &events}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		return &scriptedDeployAgent{host: host.Name, events: &events, releaseWrites: &releaseWrites}
+	})
+
+	var out bytes.Buffer
+	cmd := promoteCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"staging", "production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != releaseID {
+		t.Fatalf("production current = %+v", current)
+	}
+	sourceCurrent, err := store.CurrentRelease("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceCurrent.ID != "staging-release" {
+		t.Fatalf("staging current = %+v", sourceCurrent)
+	}
+	promoted, err := store.ReadRelease(releaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted.Environment != "production" || promoted.Images["web"] != sourceImage || promoted.Status != state.ReleaseStatusHealthy {
+		t.Fatalf("promoted release = %+v", promoted)
+	}
+	if len(fakeDocker.builds) != 0 {
+		t.Fatalf("promote built images: %+v", fakeDocker.builds)
+	}
+	joined := strings.Join(events, "\n")
+	for _, forbidden := range []string{"build:", "push:", "resolve:"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("promote performed build pipeline work %q:\n%s", forbidden, joined)
+		}
+	}
+	for _, needle := range []string{
+		"agent:prod-1:write_release_state:" + releaseID + ":pending",
+		"agent:prod-1:pull:" + sourceImage,
+		"agent:prod-1:run:ship_demo_production_web_1_" + releaseID,
+		"agent:prod-1:write_release_state:" + releaseID + ":healthy",
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("promote events missing %q:\n%s", needle, joined)
+		}
+	}
+	if len(releaseWrites) != 2 || releaseWrites[0].Release.Status != state.ReleaseStatusPending || releaseWrites[1].Release.Status != state.ReleaseStatusHealthy {
+		t.Fatalf("release writes = %+v", releaseWrites)
+	}
+	if !strings.Contains(out.String(), "promote staging release staging-release to production as "+releaseID) {
+		t.Fatalf("promote output = %q", out.String())
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "promote", "release_created", releaseID) || !timelineContains(timeline, "promote", "succeeded", releaseID) {
+		t.Fatalf("timeline missing promote events: %+v", timeline)
+	}
+}
+
 func TestRollbackAppliesTargetRelease(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -943,6 +2359,56 @@ func TestRollbackRefusesAlreadyCurrentTarget(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("no-op rollback touched agents: %#v", events)
+	}
+}
+
+func TestRollbackRefusesConcurrentOperationBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "old-release", Environment: "production", Images: map[string]string{"web": "old-image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(state.Release{ID: "current-release", Environment: "production", Images: map[string]string{"web": "current-image"}, CreatedAt: time.Unix(20, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := store.AcquireOperationLock("production", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &scriptedDeployAgent{host: host.Name, events: &events}
+	})
+
+	cmd := rollbackCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already busy") {
+		t.Fatalf("expected busy operation error, got %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("busy rollback touched agents: %#v", events)
+	}
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != "current-release" {
+		t.Fatalf("current = %+v", current)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "rollback", "blocked", "old-release") {
+		t.Fatalf("timeline missing blocked rollback: %+v", timeline)
 	}
 }
 
@@ -1063,6 +2529,88 @@ func TestRollbackWritesRemoteSecretFileAndUsesEnvFile(t *testing.T) {
 	}
 	if current.ID != "old-release" {
 		t.Fatalf("current = %+v", current)
+	}
+}
+
+func TestRollbackBlocksSecretDriftUnlessAllowed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(secretDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	currentSecret := "postgres://new"
+	t.Setenv("SHIP_TEST_DATABASE_URL", currentSecret)
+
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "old-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "old-image"},
+		SecretDigests: map[string]string{
+			"service-web:SHIP_TEST_DATABASE_URL": secretspkg.Digest("postgres://old"),
+		},
+		CreatedAt: time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(state.Release{
+		ID:          "current-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "current-image"},
+		SecretDigests: map[string]string{
+			"service-web:SHIP_TEST_DATABASE_URL": secretspkg.Digest(currentSecret),
+		},
+		CreatedAt: time.Unix(20, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var writes []agent.WriteFileParams
+	var runs []agent.RunContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &secretDeployAgent{host: host.Name, events: &events, writes: &writes, runs: &runs}
+	})
+
+	cmd := rollbackCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "rollback secret drift detected") || !strings.Contains(err.Error(), "changed service-web:SHIP_TEST_DATABASE_URL") {
+		t.Fatalf("expected secret drift error, got %v", err)
+	}
+	if len(events) != 0 || len(writes) != 0 || len(runs) != 0 {
+		t.Fatalf("blocked rollback touched agents: events=%#v writes=%#v runs=%#v", events, writes, runs)
+	}
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != "current-release" {
+		t.Fatalf("current changed after blocked rollback: %+v", current)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "rollback", "blocked", "old-release") {
+		t.Fatalf("timeline missing blocked rollback: %+v", timeline)
+	}
+
+	cmd = rollbackCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production", "--allow-secret-drift"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 || !strings.Contains(writes[0].Content, currentSecret) {
+		t.Fatalf("allowed rollback writes = %#v", writes)
+	}
+	current, err = store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != "old-release" {
+		t.Fatalf("current after allowed rollback = %+v", current)
 	}
 }
 
@@ -1252,7 +2800,7 @@ func TestRollbackBlockersDetectStatefulAccessories(t *testing.T) {
 func TestRollbackRefusesAccessoryRiskWithoutConfirmation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
-	if err := os.WriteFile(path, []byte(accessoryConfigYAML()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(serviceAccessoryStatusConfig()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)
@@ -1372,6 +2920,56 @@ func TestDeployDryRunShowsIngressReloadTargetsWithoutAgents(t *testing.T) {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("dry-run output missing %q:\n%s", needle, text)
 		}
+	}
+}
+
+func TestDeployPreservesMaintenanceIngress(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	stateDir := filepath.Join(dir, config.LocalStateDir)
+	if err := writeMaintenanceView(stateDir, maintenanceView{
+		Environment: "production",
+		Enabled:     true,
+		Message:     "Back soon",
+		UpdatedAt:   time.Unix(10, 0),
+		Hosts:       []string{"web-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var writes []agent.WriteFileParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, writes: &writes}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var caddyWrites []string
+	for _, write := range writes {
+		if strings.Contains(write.Path, "production.Caddyfile") {
+			caddyWrites = append(caddyWrites, write.Content)
+		}
+	}
+	if len(caddyWrites) < 2 {
+		t.Fatalf("expected normal and maintenance caddy writes, got %#v", caddyWrites)
+	}
+	if !strings.Contains(caddyWrites[len(caddyWrites)-1], `respond "Back soon" 503`) || strings.Contains(caddyWrites[len(caddyWrites)-1], "reverse_proxy") {
+		t.Fatalf("last caddy write did not preserve maintenance:\n%s", caddyWrites[len(caddyWrites)-1])
+	}
+	timeline, err := state.NewStore(stateDir).Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "maintenance", "preserved", "") {
+		t.Fatalf("timeline missing maintenance preservation: %+v", timeline)
 	}
 }
 
@@ -1610,8 +3208,147 @@ func TestStatusReportsObservedDriftAndJSON(t *testing.T) {
 	if view.CurrentRelease == nil || view.CurrentRelease.ID != "release-new" {
 		t.Fatalf("current release = %+v", view.CurrentRelease)
 	}
+	if view.CurrentConfig == "" {
+		t.Fatalf("current config hash missing: %+v", view)
+	}
 	if !view.Summary.Drift || view.Summary.WrongRelease != 1 || view.Summary.Extra != 2 {
 		t.Fatalf("summary = %+v", view.Summary)
+	}
+}
+
+func TestStatusReportsConfigDrift(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployedHash := configHash(resolved)
+	if err := os.WriteFile(path, []byte(strings.Replace(singleHostConfig(), "scale: 1", "scale: 2", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-1",
+		Environment: "production",
+		Images:      map[string]string{"web": "image"},
+		ConfigHash:  deployedHash,
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := statusCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view statusView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.ConfigDrift || view.DeployedConfig != deployedHash || view.CurrentConfig == "" || view.CurrentConfig == deployedHash {
+		t.Fatalf("config drift view = %+v", view)
+	}
+}
+
+func TestPSListsObservedContainersTextAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(serviceAccessoryStatusConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-new",
+		Environment: "production",
+		Images:      map[string]string{"web": "new"},
+		CreatedAt:   time.Unix(20, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccessoryState(state.AccessoryState{
+		Environment: "production",
+		Name:        "postgres",
+		Host:        state.HostFact{Name: "web-1", Pool: "web", User: "root"},
+		UpdatedAt:   time.Unix(20, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {
+			serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds"),
+			serviceContainer("web-1", "web", 1, "old-release", "Exited"),
+			caddyContainer("web-1", "Up 10 seconds"),
+			accessoryContainer("postgres", "web-1", "Up 5 minutes"),
+		},
+	}
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	var out bytes.Buffer
+	cmd := psCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"containers production current=release-new",
+		"kind=service service=web.1 release=release-new",
+		"kind=ingress",
+		"kind=accessory accessory=postgres",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("ps output missing %q:\n%s", needle, text)
+		}
+	}
+	if strings.Contains(text, "old-release") {
+		t.Fatalf("ps default output included extra old release:\n%s", text)
+	}
+
+	out.Reset()
+	cmd = psCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--all", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view psView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Environment != "production" || view.Current != "release-new" || len(view.Containers) != 4 {
+		t.Fatalf("ps view = %+v", view)
+	}
+	foundOld := false
+	for _, container := range view.Containers {
+		if container.Release == "old-release" {
+			foundOld = true
+		}
+	}
+	if !foundOld {
+		t.Fatalf("ps --all did not include old release: %+v", view.Containers)
 	}
 }
 
@@ -1744,6 +3481,96 @@ func TestInspectIncludesAccessoriesEventsAndJSON(t *testing.T) {
 	}
 }
 
+func TestSupportBundleCollectsRedactedIncidentSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveReleaseRecord(state.Release{
+		ID:          "old-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "old-image"},
+		CreatedAt:   time.Unix(10, 0).UTC(),
+		Status:      state.ReleaseStatusHealthy,
+		Healthy:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(state.Release{
+		ID:          "current-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "current-image"},
+		CreatedAt:   time.Unix(20, 0).UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, kind := range []string{"deploy", "scale"} {
+		if err := store.RecordEvent(state.Event{
+			Time:        time.Unix(int64(30+i), 0).UTC(),
+			Environment: "production",
+			Kind:        kind,
+			Status:      "succeeded",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var events []string
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {serviceContainer("web-1", "web", 1, "current-release", "Up 10 seconds")},
+		"web-2": {serviceContainer("web-2", "web", 2, "current-release", "Up 10 seconds")},
+	}
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	var out bytes.Buffer
+	cmd := supportCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json", "--events-limit", "1", "--releases-limit", "1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var bundle supportBundle
+	if err := json.Unmarshal(out.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Environment != "production" || bundle.Config["project"] != "demo" {
+		t.Fatalf("support config = %+v", bundle.Config)
+	}
+	if bundle.Hosts == nil || len(bundle.Hosts.Hosts) != 2 {
+		t.Fatalf("support hosts = %+v", bundle.Hosts)
+	}
+	if bundle.Status == nil || bundle.Status.CurrentRelease == nil || bundle.Status.CurrentRelease.ID != "current-release" || len(bundle.Status.Observed) != 2 {
+		t.Fatalf("support status = %+v", bundle.Status)
+	}
+	if bundle.Releases == nil || len(bundle.Releases.Releases) != 1 || bundle.Releases.Releases[0].Release.ID != "current-release" {
+		t.Fatalf("support releases = %+v", bundle.Releases)
+	}
+	if len(bundle.Events) != 1 || bundle.Events[0].Kind != "scale" {
+		t.Fatalf("support events = %+v", bundle.Events)
+	}
+	if !strings.Contains(strings.Join(events, "\n"), "agent:web-1:list_ship_containers") {
+		t.Fatalf("support did not inspect observed containers: %#v", events)
+	}
+
+	out.Reset()
+	cmd = supportCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--events-limit", "1", "--releases-limit", "1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{"support bundle production", "doctor passed=", "hosts count=2", "status desired=2 observed=2", "events count=1"} {
+		if !strings.Contains(out.String(), needle) {
+			t.Fatalf("support text missing %q:\n%s", needle, out.String())
+		}
+	}
+}
+
 func TestEventsCommandJSONAndText(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -1786,6 +3613,206 @@ func TestEventsCommandJSONAndText(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Kind != "scale" {
 		t.Fatalf("events json = %+v", events)
+	}
+}
+
+func TestReleasesCommandShowsHistoryTextAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	oldCompleted := time.Unix(11, 0).UTC()
+	currentCompleted := time.Unix(21, 0).UTC()
+	if err := store.SaveReleaseRecord(state.Release{
+		ID:          "old-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "old-image"},
+		ConfigHash:  "sha256:old",
+		CreatedAt:   time.Unix(10, 0).UTC(),
+		CompletedAt: &oldCompleted,
+		Status:      state.ReleaseStatusHealthy,
+		Healthy:     true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRelease(state.Release{
+		ID:          "current-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "current-image"},
+		ConfigHash:  "sha256:current",
+		CreatedAt:   time.Unix(20, 0).UTC(),
+		CompletedAt: &currentCompleted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReleaseRecord(state.Release{
+		ID:          "failed-release",
+		Environment: "production",
+		Images:      map[string]string{"web": "failed-image"},
+		CreatedAt:   time.Unix(30, 0).UTC(),
+		Status:      state.ReleaseStatusFailed,
+		Error:       "health failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	cmd := releasesCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"releases production",
+		"- failed-release status=failed healthy=false",
+		"error=\"health failed\"",
+		"- current-release status=healthy healthy=true",
+		"[current]",
+		"config=sha256:current",
+		"image web=current-image",
+		"- old-release status=healthy healthy=true",
+		"[rollback-target]",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("releases output missing %q:\n%s", needle, text)
+		}
+	}
+	if strings.Index(text, "failed-release") > strings.Index(text, "current-release") {
+		t.Fatalf("releases not newest-first:\n%s", text)
+	}
+
+	out.Reset()
+	cmd = releasesCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json", "--limit", "2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view releaseHistoryView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Environment != "production" || len(view.Releases) != 2 {
+		t.Fatalf("release history json = %+v", view)
+	}
+	if view.Releases[0].Release.ID != "failed-release" || view.Releases[1].Release.ID != "current-release" || !view.Releases[1].Current {
+		t.Fatalf("release history entries = %+v", view.Releases)
+	}
+}
+
+func TestReleasesCommandRejectsInvalidLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := releasesCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production", "--limit", "0"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--limit must be greater than zero") {
+		t.Fatalf("expected invalid limit error, got %v", err)
+	}
+}
+
+func TestReleasesDiffShowsImagesConfigAndSecretChanges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveReleaseRecord(state.Release{
+		ID:          "old-release",
+		Environment: "production",
+		Images: map[string]string{
+			"web":    "old-web",
+			"worker": "old-worker",
+		},
+		SecretDigests: map[string]string{
+			"service-web:DATABASE_URL": "old-digest",
+			"service-web:OLD_SECRET":   "removed-digest",
+		},
+		ConfigHash: "sha256:old",
+		CreatedAt:  time.Unix(10, 0),
+		Status:     state.ReleaseStatusHealthy,
+		Healthy:    true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReleaseRecord(state.Release{
+		ID:          "new-release",
+		Environment: "production",
+		Images: map[string]string{
+			"web": "new-web",
+			"api": "new-api",
+		},
+		SecretDigests: map[string]string{
+			"service-web:DATABASE_URL": "new-digest",
+			"service-web:API_TOKEN":    "added-digest",
+		},
+		ConfigHash: "sha256:new",
+		CreatedAt:  time.Unix(20, 0),
+		Status:     state.ReleaseStatusHealthy,
+		Healthy:    true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	cmd := releasesCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"diff", "production", "--from", "old-release", "--to", "new-release"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "release diff detected") {
+		t.Fatalf("expected release diff error, got %v", err)
+	}
+	text := out.String()
+	for _, needle := range []string{
+		"release diff production old-release -> new-release",
+		"config changed sha256:old -> sha256:new",
+		"image added api=new-api",
+		"image changed web old-web -> new-web",
+		"image removed worker=old-worker",
+		"secret added service-web:API_TOKEN",
+		"secret changed service-web:DATABASE_URL",
+		"secret removed service-web:OLD_SECRET",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("release diff output missing %q:\n%s", needle, text)
+		}
+	}
+
+	out.Reset()
+	cmd = releasesCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"diff", "production", "--from", "old-release", "--to", "new-release", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view releaseDiffView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.Changed || !view.Config.Changed || len(view.Images.Added) != 1 || len(view.Images.Changed) != 1 || len(view.Images.Removed) != 1 {
+		t.Fatalf("release diff json = %+v", view)
+	}
+	if len(view.Secrets.Missing) != 1 || len(view.Secrets.Changed) != 1 || len(view.Secrets.Extra) != 1 {
+		t.Fatalf("release diff secrets = %+v", view.Secrets)
+	}
+
+	out.Reset()
+	cmd = releasesCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"diff", "production", "--from", "old-release", "--to", "old-release"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "no changes") {
+		t.Fatalf("same-release diff output = %q", out.String())
 	}
 }
 
@@ -1902,6 +3929,442 @@ func TestLogsTargetsReplicaLinesFollowAndJSON(t *testing.T) {
 	if !view.Follow || view.Replica != 2 || len(view.Entries) != logsFollowPolls || view.Entries[0].Host != "web-2" {
 		t.Fatalf("logs view = %+v", view)
 	}
+	if view.Release != "release-1" || view.Entries[0].Release != "release-1" {
+		t.Fatalf("logs release = view %q entry %q", view.Release, view.Entries[0].Release)
+	}
+}
+
+func TestLogsCanTargetExplicitAndFailedReleases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "current-release", Environment: "production", Images: map[string]string{"web": "current"}, CreatedAt: time.Unix(30, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReleaseRecord(state.Release{ID: "requested-release", Environment: "production", Images: map[string]string{"web": "requested"}, CreatedAt: time.Unix(20, 0), Status: state.ReleaseStatusHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReleaseRecord(state.Release{ID: "failed-worker", Environment: "production", Images: map[string]string{"worker": "failed"}, CreatedAt: time.Unix(40, 0), Status: state.ReleaseStatusFailed}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReleaseRecord(state.Release{ID: "failed-web", Environment: "production", Images: map[string]string{"web": "failed"}, CreatedAt: time.Unix(50, 0), Status: state.ReleaseStatusFailed}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var logCalls []agent.LogsParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events, logCalls: &logCalls}
+	})
+
+	var out bytes.Buffer
+	cmd := logsCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "1", "--release", "requested-release", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(logCalls) != 1 || logCalls[0].Name != deployment.ContainerName("demo", "production", "web", 1, "requested-release") {
+		t.Fatalf("explicit release log calls = %+v", logCalls)
+	}
+	var explicit logsView
+	if err := json.Unmarshal(out.Bytes(), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	if explicit.Release != "requested-release" || explicit.Entries[0].Release != "requested-release" {
+		t.Fatalf("explicit release view = %+v", explicit)
+	}
+
+	out.Reset()
+	logCalls = nil
+	cmd = logsCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "1", "--failed", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(logCalls) != 1 || logCalls[0].Name != deployment.ContainerName("demo", "production", "web", 1, "failed-web") {
+		t.Fatalf("failed release log calls = %+v", logCalls)
+	}
+	var failed logsView
+	if err := json.Unmarshal(out.Bytes(), &failed); err != nil {
+		t.Fatal(err)
+	}
+	if failed.Release != "failed-web" || failed.Entries[0].Release != "failed-web" {
+		t.Fatalf("failed release view = %+v", failed)
+	}
+}
+
+func TestRestartRecreatesCurrentReleaseReplicaAndRecordsEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var runs []agent.RunContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &restartDeployAgent{host: host.Name, events: &events, runs: &runs}
+	})
+
+	var out bytes.Buffer
+	cmd := restartCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+	if len(runs) != 1 || runs[0].Name != wantName || runs[0].Image != "registry.local/acme/web@sha256:"+strings.Repeat("1", 64) {
+		t.Fatalf("restart runs = %+v", runs)
+	}
+	if runs[0].Labels["com.example.team"] != "platform" || runs[0].Labels[docker.LabelService] != "web" {
+		t.Fatalf("restart labels = %+v", runs[0].Labels)
+	}
+	if runs[0].Network != "ship-demo-production" {
+		t.Fatalf("restart network = %q", runs[0].Network)
+	}
+	if strings.Join(runs[0].NetworkAliases, ",") != "app,web" {
+		t.Fatalf("restart network aliases = %+v", runs[0].NetworkAliases)
+	}
+	args := strings.Join(runs[0].Args, " ")
+	if !strings.Contains(args, "--env-file /var/lib/ship/secrets/production/service-web.env") || !strings.Contains(args, "-p 3000:3000") {
+		t.Fatalf("restart args = %+v", runs[0].Args)
+	}
+	joined := strings.Join(events, "\n")
+	if !strings.Contains(joined, "agent:web-2:run:"+wantName) || !strings.Contains(joined, "agent:web-2:health_check:http://127.0.0.1:3000/up") {
+		t.Fatalf("restart events = %#v", events)
+	}
+	if !strings.Contains(out.String(), "restarted "+wantName+" on web-2") {
+		t.Fatalf("restart output = %q", out.String())
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "restart", "started", "release-1") || !timelineContains(timeline, "restart", "succeeded", "release-1") {
+		t.Fatalf("timeline missing restart events: %+v", timeline)
+	}
+}
+
+func TestRestartDryRunDoesNotTouchAgents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := restartCmd(&options{configPath: path, dryRun: true})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("dry-run restart touched agents: %#v", events)
+	}
+	if !strings.Contains(out.String(), "would restart "+deployment.ContainerName("demo", "production", "web", 1, "release-1")) ||
+		!strings.Contains(out.String(), "would restart "+deployment.ContainerName("demo", "production", "web", 2, "release-1")) {
+		t.Fatalf("dry-run output = %q", out.String())
+	}
+}
+
+func TestHealthChecksCurrentReleaseTextAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &healthDeployAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := healthCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+	for _, needle := range []string{
+		"health production current=release-1 ok=true",
+		"host=web-2 service=web.2 container=" + wantName + " status=ok",
+		"status_code=200",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("health output missing %q:\n%s", needle, text)
+		}
+	}
+	if joined := strings.Join(events, "\n"); !strings.Contains(joined, "agent:web-2:health_check:http://127.0.0.1:3000/up") {
+		t.Fatalf("health events = %#v", events)
+	}
+
+	out.Reset()
+	cmd = healthCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view healthView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Environment != "production" || view.Current != "release-1" || !view.OK || len(view.Checks) != 2 {
+		t.Fatalf("health view = %+v", view)
+	}
+	if view.Checks[0].URL != "http://127.0.0.1:3000/up" || !view.Checks[0].Checked || view.Checks[0].Status != "ok" {
+		t.Fatalf("first health check = %+v", view.Checks[0])
+	}
+}
+
+func TestHealthReportsFailuresBeforeReturningError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &healthDeployAgent{host: host.Name, events: &events, failHost: "web-2"}
+	})
+
+	var out bytes.Buffer
+	cmd := healthCmd(&options{configPath: path})
+	cmd.SilenceUsage = true
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "health checks failed") {
+		t.Fatalf("expected health failure, got %v", err)
+	}
+	var view healthView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.OK || len(view.Checks) != 2 {
+		t.Fatalf("health view = %+v", view)
+	}
+	foundFailed := false
+	for _, check := range view.Checks {
+		if check.Host == "web-2" && check.Status == "failed" && !check.OK {
+			foundFailed = true
+		}
+	}
+	if !foundFailed {
+		t.Fatalf("missing failed check: %+v", view.Checks)
+	}
+	if len(events) != 2 {
+		t.Fatalf("health should check every target before returning: %#v", events)
+	}
+}
+
+func TestMaintenanceEnableStatusDisable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var writes []agent.WriteFileParams
+	installDeployHooks(t, panicDeployDocker{t: t}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, writes: &writes}
+	})
+
+	var out bytes.Buffer
+	cmd := maintenanceCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"enable", "production", "--message", "Back soon"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "enabled maintenance for production on web-1") {
+		t.Fatalf("enable output = %q", out.String())
+	}
+	if len(writes) != 1 || !strings.Contains(writes[0].Content, `respond "Back soon" 503`) {
+		t.Fatalf("maintenance write = %+v", writes)
+	}
+
+	out.Reset()
+	cmd = maintenanceCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"status", "production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "maintenance production enabled=true") || !strings.Contains(out.String(), `message="Back soon"`) {
+		t.Fatalf("status output = %q", out.String())
+	}
+
+	out.Reset()
+	cmd = maintenanceCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"disable", "production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "disabled maintenance for production") {
+		t.Fatalf("disable output = %q", out.String())
+	}
+	if len(writes) != 2 || !strings.Contains(writes[1].Content, "reverse_proxy") || strings.Contains(writes[1].Content, "Back soon") {
+		t.Fatalf("normal ingress restore write = %+v", writes)
+	}
+	statePath := maintenanceStatePath(filepath.Join(dir, config.LocalStateDir), "production")
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("maintenance state still exists: %v", err)
+	}
+}
+
+func TestExecTargetsReplicaCommandTimeoutAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var execCalls []agent.ExecContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events, execCalls: &execCalls}
+	})
+
+	var out bytes.Buffer
+	cmd := execServiceCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "2", "--timeout", "12", "--json", "--", "bin/rails", "db:migrate"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+	if len(execCalls) != 1 || execCalls[0].Name != wantName || execCalls[0].Command != "bin/rails db:migrate" || execCalls[0].TimeoutSeconds != 12 {
+		t.Fatalf("exec calls = %+v", execCalls)
+	}
+	var view execView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Service != "web" || view.Replica != 2 || len(view.Entries) != 1 || view.Entries[0].Host != "web-2" || view.Entries[0].Output != "exec from web-2" {
+		t.Fatalf("exec view = %+v", view)
+	}
+}
+
+func TestPruneRunsOnEveryHostAndRecordsEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := pruneCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(events, "\n")
+	for _, host := range []string{"web-1", "web-2"} {
+		if !strings.Contains(joined, "agent:"+host+":prune_images") {
+			t.Fatalf("prune events missing host %s:\n%s", host, joined)
+		}
+		if !strings.Contains(out.String(), "pruned unused Ship images on "+host) {
+			t.Fatalf("output missing host %s:\n%s", host, out.String())
+		}
+	}
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "prune_images", "started", "") || !timelineContains(timeline, "prune_images", "succeeded", "") {
+		t.Fatalf("prune timeline missing start/success: %+v", timeline)
+	}
+}
+
+func TestPruneRefusesConcurrentOperationBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	lock, err := store.AcquireOperationLock("production", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	cmd := pruneCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already busy") {
+		t.Fatalf("expected busy operation error, got %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("busy prune touched agents: %#v", events)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "prune_images", "blocked", "") {
+		t.Fatalf("timeline missing blocked prune: %+v", timeline)
+	}
 }
 
 func TestAccessoryDeployPersistsPlacementAndRunsOneContainer(t *testing.T) {
@@ -1942,6 +4405,15 @@ func TestAccessoryDeployPersistsPlacementAndRunsOneContainer(t *testing.T) {
 	if run.Labels[docker.LabelAccessory] != "postgres" || run.Labels[docker.LabelProject] != "demo" {
 		t.Fatalf("run labels = %+v", run.Labels)
 	}
+	if run.Labels["com.example.role"] != "database" {
+		t.Fatalf("custom labels = %+v", run.Labels)
+	}
+	if run.Network != "ship-demo-production" {
+		t.Fatalf("accessory network = %q", run.Network)
+	}
+	if strings.Join(run.NetworkAliases, ",") != "database,postgres" {
+		t.Fatalf("accessory network aliases = %+v", run.NetworkAliases)
+	}
 	joinedArgs := strings.Join(run.Args, " ")
 	for _, needle := range []string{"-p 5432:5432", "-v postgres-data:/var/lib/postgresql/data", "-e POSTGRES_PASSWORD_FILE=/run/secrets/postgres"} {
 		if !strings.Contains(joinedArgs, needle) {
@@ -1957,6 +4429,157 @@ func TestAccessoryDeployPersistsPlacementAndRunsOneContainer(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "deployed accessory postgres on data-a") {
 		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestAccessoryExecUsesPersistedPlacementAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(accessoryConfigYAML()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveAccessoryState(state.AccessoryState{
+		Environment: "production",
+		Name:        "postgres",
+		Host:        state.HostFact{Name: "data-a", Pool: "data", User: "deploy", PublicAddress: "data-a"},
+		UpdatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	containerName := accessorypkg.ContainerName("demo", "production", "postgres")
+	observed := map[string][]docker.ContainerSummary{
+		"data-a": {
+			{
+				Names: containerName,
+				Labels: map[string]string{
+					docker.LabelManagedBy:   docker.LabelManagedByValue,
+					docker.LabelProject:     "demo",
+					docker.LabelEnvironment: "production",
+					docker.LabelAccessory:   "postgres",
+				},
+			},
+		},
+	}
+
+	var events []string
+	var execCalls []agent.ExecContainerParams
+	installAccessoryHooks(t, func(host scheduler.Host) deployAgent {
+		return &scriptedAccessoryAgent{host: host.Name, events: &events, observed: observed, execCalls: &execCalls}
+	})
+
+	var out bytes.Buffer
+	cmd := accessoryCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"exec", "production", "postgres", "--timeout", "15", "--json", "--", "psql", "-c", "select 1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(execCalls) != 1 || execCalls[0].Name != containerName || execCalls[0].Command != "psql -c select 1" || execCalls[0].TimeoutSeconds != 15 {
+		t.Fatalf("exec calls = %+v", execCalls)
+	}
+	want := []string{
+		"agent:data-a:list_ship_containers",
+		"agent:data-b:list_ship_containers",
+		"agent:data-a:exec:" + containerName + ":psql -c select 1",
+	}
+	if strings.Join(events, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("events = %#v, want %#v", events, want)
+	}
+	var view execView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Accessory != "postgres" || view.Service != "" || len(view.Entries) != 1 || view.Entries[0].Host != "data-a" || view.Entries[0].Accessory != "postgres" || view.Entries[0].Output != "exec complete" {
+		t.Fatalf("exec view = %+v", view)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "accessory_exec", "started", "") || !timelineContains(timeline, "accessory_exec", "succeeded", "") {
+		t.Fatalf("timeline missing accessory exec events: %+v", timeline)
+	}
+}
+
+func TestAccessoryLogsUsePersistedPlacementFollowAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(accessoryConfigYAML()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveAccessoryState(state.AccessoryState{
+		Environment: "production",
+		Name:        "postgres",
+		Host:        state.HostFact{Name: "data-a", Pool: "data", User: "deploy", PublicAddress: "data-a"},
+		UpdatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	containerName := accessorypkg.ContainerName("demo", "production", "postgres")
+	observed := map[string][]docker.ContainerSummary{
+		"data-a": {
+			{
+				Names: containerName,
+				Labels: map[string]string{
+					docker.LabelManagedBy:   docker.LabelManagedByValue,
+					docker.LabelProject:     "demo",
+					docker.LabelEnvironment: "production",
+					docker.LabelAccessory:   "postgres",
+				},
+			},
+		},
+	}
+	originalInterval := logsFollowInterval
+	logsFollowInterval = time.Nanosecond
+	t.Cleanup(func() {
+		logsFollowInterval = originalInterval
+	})
+
+	var events []string
+	var logCalls []agent.LogsParams
+	installAccessoryHooks(t, func(host scheduler.Host) deployAgent {
+		return &scriptedAccessoryAgent{host: host.Name, events: &events, observed: observed, logCalls: &logCalls}
+	})
+
+	var out bytes.Buffer
+	cmd := accessoryCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"logs", "production", "postgres", "--lines", "25", "--follow", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(logCalls) != logsFollowPolls {
+		t.Fatalf("log calls = %+v", logCalls)
+	}
+	for _, call := range logCalls {
+		if call.Name != containerName || call.Lines != 25 {
+			t.Fatalf("log call = %+v, want name=%s lines=25", call, containerName)
+		}
+	}
+	wantPrefix := []string{
+		"agent:data-a:list_ship_containers",
+		"agent:data-b:list_ship_containers",
+		"agent:data-a:logs:" + containerName + ":25",
+	}
+	joined := strings.Join(events, "\n")
+	for _, needle := range wantPrefix {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("events missing %q: %#v", needle, events)
+		}
+	}
+	var view logsView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !view.Follow || view.Accessory != "postgres" || view.Service != "" || len(view.Entries) != logsFollowPolls {
+		t.Fatalf("logs view = %+v", view)
+	}
+	if view.Entries[0].Host != "data-a" || view.Entries[0].Accessory != "postgres" || view.Entries[0].Logs != "logs from data-a" {
+		t.Fatalf("logs entries = %+v", view.Entries)
 	}
 }
 
@@ -2128,6 +4751,60 @@ func TestAccessoryBackupRunsOnPersistedPlacementAndRecordsArtifact(t *testing.T)
 		t.Fatalf("saved backup = %+v", saved.LastBackup)
 	}
 	if !strings.Contains(out.String(), "backed up accessory postgres on data-a") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestAccessoryBackupExportsArtifactWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(accessoryExportConfigYAML()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveAccessoryState(state.AccessoryState{
+		Environment: "production",
+		Name:        "postgres",
+		Host:        state.HostFact{Name: "data-a", Pool: "data", User: "deploy"},
+		UpdatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	observed := map[string][]docker.ContainerSummary{
+		"data-a": {accessoryContainer("postgres", "data-a", "Up 5 seconds")},
+	}
+	installAccessoryHooks(t, func(host scheduler.Host) deployAgent {
+		return &scriptedAccessoryAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	var out bytes.Buffer
+	cmd := accessoryCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"backup", "production", "postgres"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 || !strings.Contains(events[3], `export SHIP_BACKUP_ARTIFACT`) || !strings.Contains(events[3], `printf "s3://ship/%s`) {
+		t.Fatalf("events = %#v", events)
+	}
+	saved, err := store.ReadAccessoryState("production", "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.LastBackup == nil || saved.LastBackup.ExportedArtifact != "s3://ship/postgres.backup" || !strings.Contains(saved.LastBackup.ExportOutput, "s3://ship/postgres.backup") {
+		t.Fatalf("saved backup = %+v", saved.LastBackup)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "accessory_backup_export", "succeeded", "") {
+		t.Fatalf("timeline missing backup export success: %+v", timeline)
+	}
+	if !strings.Contains(out.String(), "exported=s3://ship/postgres.backup") {
 		t.Fatalf("output = %q", out.String())
 	}
 }
@@ -2655,6 +5332,30 @@ services:
 `
 }
 
+func manualHostConfig() string {
+	return `project: demo
+registry: ghcr.io/acme/demo
+
+environments:
+  production:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          user: deploy
+          hosts:
+            - web-1.example.com
+
+services:
+  web:
+    image:
+      ref: ghcr.io/acme/demo:web
+    pool: web
+    scale: 1
+`
+}
+
 func deployBuildConfig() string {
 	return `project: demo
 registry: registry.local/acme/demo
@@ -2677,10 +5378,26 @@ services:
     image:
       build: .
       dockerfile: Dockerfile
+      tags:
+        - latest
+        - production
       build_args:
         RAILS_ENV: production
       target: runtime
+      builder: ship-cloud
       platform: linux/amd64
+      pull: true
+      no_cache_filter:
+        - install
+        - assets
+      cache_from:
+        - type=registry,ref=registry.local/acme/demo:build-cache
+      cache_to:
+        - type=registry,ref=registry.local/acme/demo:build-cache,mode=max
+      secrets:
+        - id=npm_token,env=NPM_TOKEN
+      ssh:
+        - default
     command: ./bin/server
     pool: web
     scale: 2
@@ -2691,6 +5408,277 @@ services:
       ref: registry.local/acme/worker:stable
     pool: web
     scale: 0
+`
+}
+
+func promoteConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+environments:
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts:
+            - staging-1
+  production:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts:
+            - prod-1
+
+services:
+  web:
+    image:
+      build: .
+    command: ./bin/server
+    pool: web
+    scale: 1
+    ports: [3000]
+`
+}
+
+func hookDeployConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+hooks:
+  pre_deploy:
+    - echo root-pre
+  pre_build:
+    - echo pre-build
+  deploy_failed:
+    - echo failed
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 1
+    hooks:
+      pre_deploy:
+        - echo env-pre
+      post_deploy:
+        - command: echo post-deploy
+          timeout_seconds: 3
+          env:
+            SMOKE: "1"
+
+services:
+  web:
+    image:
+      build: .
+    command: ./bin/server
+    pool: web
+    scale: 1
+    ports: [3000]
+`
+}
+
+func notificationDeployConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+notifications:
+  webhooks:
+    - url: https://hooks.example/deploys
+      events: [deploy:*]
+      headers:
+        X-Ship: root
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 1
+    notifications:
+      webhooks:
+        - url_env: SHIP_NOTIFY_WEBHOOK
+          events: [deploy:succeeded]
+          timeout_seconds: 3
+          headers:
+            X-Env: production
+
+services:
+  web:
+    image:
+      build: .
+    command: ./bin/server
+    pool: web
+    scale: 1
+    ports: [3000]
+`
+}
+
+func restartConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+secrets:
+  - DATABASE_URL
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 2
+
+services:
+  web:
+    image:
+      ref: registry.local/acme/web:stable
+    labels:
+      com.example.team: platform
+    network_aliases:
+      - app
+    command: ./bin/server
+    pool: web
+    scale: 2
+    ports: [3000]
+    health:
+      http: /up
+    rolling:
+      health_retries: 1
+      health_interval_seconds: 1
+`
+}
+
+func scheduledDeployConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 2
+
+services:
+  web:
+    image:
+      ref: registry.local/acme/web:stable
+    command: ./bin/server
+    pool: web
+    scale: 2
+    schedules:
+      cleanup:
+        cron: "17 * * * *"
+        command: bin/rails cleanup
+        replica: 2
+        timeout_seconds: 300
+`
+}
+
+func scheduledAccessoryBackupConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        data:
+          count: 1
+
+services:
+  web:
+    image:
+      ref: registry.local/acme/web:stable
+    pool: data
+    scale: 0
+
+accessories:
+  postgres:
+    image: postgres:17
+    pool: data
+    primary: true
+    backup:
+      command: pg_dumpall
+      export_command: 'printf "s3://ship/%s\n" "$(basename "$SHIP_BACKUP_ARTIFACT")"'
+      required: true
+      schedule:
+        cron: "13 3 * * *"
+        timeout_seconds: 600
+`
+}
+
+func releaseCommandDeployConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 1
+
+services:
+  web:
+    image:
+      ref: registry.local/acme/web:stable
+    command: ./bin/server
+    pool: web
+    scale: 1
+    ports: [3000]
+    logging:
+      options:
+        max-size: 10m
+    volumes:
+      - uploads:/app/uploads
+    resources:
+      cpus: "1"
+      memory: 512m
+    secrets:
+      - SHIP_TEST_DATABASE_URL
+    release:
+      command: bin/rails db:migrate
+      timeout_seconds: 600
 `
 }
 
@@ -2855,6 +5843,10 @@ accessories:
     image: postgres:17
     pool: data
     primary: true
+    labels:
+      com.example.role: database
+    network_aliases:
+      - database
     volume_owner: "999:999"
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -2868,6 +5860,10 @@ accessories:
       required: true
       restore_check: true
 `
+}
+
+func accessoryExportConfigYAML() string {
+	return strings.Replace(accessoryConfigYAML(), "restore_check: true\n", "restore_check: true\n      export_command: 'printf \"s3://ship/%s\\\\n\" \"$(basename \"$SHIP_BACKUP_ARTIFACT\")\"'\n      export_timeout_seconds: 45\n", 1)
 }
 
 func accessorySecretConfigYAML() string {
@@ -2952,11 +5948,27 @@ type releaseStateWrite struct {
 	Release state.Release
 }
 
+type deployAgentFunc func(context.Context, string, any, any) error
+
+func (f deployAgentFunc) Call(ctx context.Context, method string, params any, out any) error {
+	return f(ctx, method, params, out)
+}
+
+func installAgentHook(t *testing.T, agentFactory func(scheduler.Host) deployAgent) {
+	t.Helper()
+	originalAgent := newDeployAgent
+	newDeployAgent = agentFactory
+	t.Cleanup(func() {
+		newDeployAgent = originalAgent
+	})
+}
+
 type observabilityAgent struct {
-	host     string
-	events   *[]string
-	observed map[string][]docker.ContainerSummary
-	logCalls *[]agent.LogsParams
+	host      string
+	events    *[]string
+	observed  map[string][]docker.ContainerSummary
+	logCalls  *[]agent.LogsParams
+	execCalls *[]agent.ExecContainerParams
 }
 
 func (o *observabilityAgent) Call(ctx context.Context, method string, params any, out any) error {
@@ -2975,6 +5987,15 @@ func (o *observabilityAgent) Call(ctx context.Context, method string, params any
 		if result, ok := out.(*map[string]string); ok {
 			*result = map[string]string{"logs": "logs from " + o.host}
 		}
+	case "exec_container":
+		p := params.(agent.ExecContainerParams)
+		*o.events = append(*o.events, fmt.Sprintf("agent:%s:exec:%s:%s", o.host, p.Name, p.Command))
+		if o.execCalls != nil {
+			*o.execCalls = append(*o.execCalls, p)
+		}
+		if result, ok := out.(*agent.CommandResult); ok {
+			*result = agent.CommandResult{Output: "exec from " + o.host}
+		}
 	default:
 		*o.events = append(*o.events, fmt.Sprintf("agent:%s:%s", o.host, method))
 	}
@@ -2987,6 +6008,8 @@ type scriptedAccessoryAgent struct {
 	observed   map[string][]docker.ContainerSummary
 	runs       *[]agent.RunContainerParams
 	writes     *[]agent.WriteFileParams
+	logCalls   *[]agent.LogsParams
+	execCalls  *[]agent.ExecContainerParams
 	failMethod string
 }
 
@@ -3003,11 +6026,22 @@ func (s *scriptedAccessoryAgent) Call(ctx context.Context, method string, params
 	case "ensure_volume":
 		p := params.(agent.EnsureVolumeParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:ensure_volume:%s:%s", s.host, p.Name, p.Owner))
+	case "ensure_network":
+		return nil
 	case "write_file":
 		p := params.(agent.WriteFileParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:write_file:%s:%04o", s.host, p.Path, p.Mode))
 		if s.writes != nil {
 			*s.writes = append(*s.writes, p)
+		}
+	case "logs":
+		p := params.(agent.LogsParams)
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:logs:%s:%d", s.host, p.Name, p.Lines))
+		if s.logCalls != nil {
+			*s.logCalls = append(*s.logCalls, p)
+		}
+		if result, ok := out.(*map[string]string); ok {
+			*result = map[string]string{"logs": "logs from " + s.host}
 		}
 	case "run_container":
 		p := params.(agent.RunContainerParams)
@@ -3019,7 +6053,11 @@ func (s *scriptedAccessoryAgent) Call(ctx context.Context, method string, params
 		p := params.(agent.AccessoryCommandParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:accessory_backup:%s:%s", s.host, p.Name, p.Command))
 		if result, ok := out.(*agent.CommandResult); ok {
-			*result = agent.CommandResult{Output: "backup complete"}
+			output := "backup complete"
+			if strings.Contains(p.Command, "SHIP_BACKUP_ARTIFACT=") && strings.Contains(p.Command, "s3://ship") {
+				output = "s3://ship/postgres.backup\nexport complete"
+			}
+			*result = agent.CommandResult{Output: output}
 		}
 	case "health_check":
 		p := params.(agent.HealthCheckParams)
@@ -3032,6 +6070,15 @@ func (s *scriptedAccessoryAgent) Call(ctx context.Context, method string, params
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:accessory_restore:%s:%s", s.host, p.Name, p.Command))
 		if result, ok := out.(*agent.CommandResult); ok {
 			*result = agent.CommandResult{Output: "restore complete"}
+		}
+	case "exec_container":
+		p := params.(agent.ExecContainerParams)
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:exec:%s:%s", s.host, p.Name, p.Command))
+		if s.execCalls != nil {
+			*s.execCalls = append(*s.execCalls, p)
+		}
+		if result, ok := out.(*agent.CommandResult); ok {
+			*result = agent.CommandResult{Output: "exec complete"}
 		}
 	default:
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:%s", s.host, method))
@@ -3064,6 +6111,48 @@ func installDeployHooks(t *testing.T, dockerClient deployDocker, agentFactory fu
 	})
 }
 
+type hookRun struct {
+	Command   string
+	Context   hookContext
+	Hook      config.HookCommand
+	ReleaseID string
+}
+
+func installLocalHookRunner(t *testing.T, runs *[]hookRun, failHook string, events *[]string) {
+	t.Helper()
+	originalRunner := runLocalHookCommand
+	runLocalHookCommand = func(ctx context.Context, hook config.HookCommand, hctx hookContext, w io.Writer) error {
+		*runs = append(*runs, hookRun{Command: hook.Command, Context: hctx, Hook: hook, ReleaseID: hctx.ReleaseID})
+		if events != nil {
+			*events = append(*events, "hook:"+hctx.Hook+":"+hook.Command)
+		}
+		if hctx.Hook == failHook {
+			return fmt.Errorf("%s hook failed", hctx.Hook)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		runLocalHookCommand = originalRunner
+	})
+}
+
+type webhookDelivery struct {
+	Webhook config.WebhookNotification
+	Payload notificationPayload
+}
+
+func installWebhookNotifier(t *testing.T, deliveries *[]webhookDelivery, err error) {
+	t.Helper()
+	originalNotifier := sendWebhookNotification
+	sendWebhookNotification = func(ctx context.Context, webhook config.WebhookNotification, payload notificationPayload) error {
+		*deliveries = append(*deliveries, webhookDelivery{Webhook: webhook, Payload: payload})
+		return err
+	}
+	t.Cleanup(func() {
+		sendWebhookNotification = originalNotifier
+	})
+}
+
 func unsetEnv(t *testing.T, name string) {
 	t.Helper()
 	value, ok := os.LookupEnv(name)
@@ -3083,6 +6172,7 @@ type recordingDeployDocker struct {
 	events    *[]string
 	builds    []docker.BuildOptions
 	resolved  map[string]string
+	auths     map[string]docker.RegistryAuth
 	failStage string
 }
 
@@ -3114,10 +6204,25 @@ func (r *recordingDeployDocker) ResolveDigest(ctx context.Context, image string)
 	return image + "@sha256:" + strings.Repeat("2", 64), nil
 }
 
+func (r *recordingDeployDocker) RegistryAuth(ctx context.Context, image string) (docker.RegistryAuth, bool, error) {
+	if r.failStage == "registry_auth" {
+		*r.events = append(*r.events, "registry_auth:"+image)
+		return docker.RegistryAuth{}, false, errors.New("registry auth failed")
+	}
+	auth, ok := r.auths[image]
+	if ok {
+		*r.events = append(*r.events, "registry_auth:"+image)
+	}
+	return auth, ok, nil
+}
+
 type recordingDeployAgent struct {
 	host          string
 	events        *[]string
 	releaseWrites *[]releaseStateWrite
+	cronSyncs     *[]agent.SyncCronFilesParams
+	oneOffRuns    *[]agent.RunOneOffContainerParams
+	writes        *[]agent.WriteFileParams
 }
 
 func (r recordingDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
@@ -3136,9 +6241,72 @@ func (r recordingDeployAgent) Call(ctx context.Context, method string, params an
 	case "pull":
 		image := params.(map[string]string)["image"]
 		*r.events = append(*r.events, fmt.Sprintf("agent:%s:pull:%s", r.host, image))
+	case "write_registry_auth":
+		p := params.(agent.WriteRegistryAuthParams)
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:write_registry_auth:%s", r.host, p.Server))
+	case "write_file":
+		p := params.(agent.WriteFileParams)
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:write_file:%s", r.host, p.Path))
+		if r.writes != nil {
+			*r.writes = append(*r.writes, p)
+		}
+	case "sync_cron_files":
+		p := params.(agent.SyncCronFilesParams)
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:sync_cron_files:%s:%d", r.host, p.Prefix, len(p.Files)))
+		if r.cronSyncs != nil {
+			*r.cronSyncs = append(*r.cronSyncs, p)
+		}
+	case "ensure_network":
+		return nil
 	case "run_container":
 		p := params.(agent.RunContainerParams)
 		*r.events = append(*r.events, fmt.Sprintf("agent:%s:run:%s", r.host, p.Image))
+	case "health_check":
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:health_check", r.host))
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: true}
+		}
+	case "run_oneoff_container":
+		p := params.(agent.RunOneOffContainerParams)
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:run_oneoff:%s:%s", r.host, p.Name, p.Command))
+		if r.oneOffRuns != nil {
+			*r.oneOffRuns = append(*r.oneOffRuns, p)
+		}
+		if result, ok := out.(*agent.CommandResult); ok {
+			*result = agent.CommandResult{Output: "one-off complete"}
+		}
+	default:
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:%s", r.host, method))
+	}
+	return nil
+}
+
+type restartDeployAgent struct {
+	host   string
+	events *[]string
+	runs   *[]agent.RunContainerParams
+}
+
+func (r *restartDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
+	switch method {
+	case "ensure_network":
+		return nil
+	case "run_container":
+		p := params.(agent.RunContainerParams)
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:run:%s", r.host, p.Name))
+		if r.runs != nil {
+			*r.runs = append(*r.runs, p)
+		}
+	case "health_check":
+		p := params.(agent.HealthCheckParams)
+		target := p.URL
+		if target == "" {
+			target = p.Command
+		}
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:health_check:%s", r.host, target))
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: true}
+		}
 	default:
 		*r.events = append(*r.events, fmt.Sprintf("agent:%s:%s", r.host, method))
 	}
@@ -3175,6 +6343,8 @@ func (s *secretDeployAgent) Call(ctx context.Context, method string, params any,
 	case "pull":
 		image := params.(map[string]string)["image"]
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:pull:%s", s.host, image))
+	case "ensure_network":
+		return nil
 	case "run_container":
 		p := params.(agent.RunContainerParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:run:%s", s.host, p.Name))
@@ -3211,6 +6381,8 @@ func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params an
 	case "pull":
 		image := params.(map[string]string)["image"]
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:pull:%s", s.host, image))
+	case "ensure_network":
+		return nil
 	case "run_container":
 		p := params.(agent.RunContainerParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:run:%s", s.host, p.Name))
@@ -3227,6 +6399,35 @@ func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params an
 	}
 	if method == s.failMethod {
 		return fmt.Errorf("%s failed", method)
+	}
+	return nil
+}
+
+type healthDeployAgent struct {
+	host     string
+	events   *[]string
+	failHost string
+}
+
+func (h *healthDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
+	switch method {
+	case "health_check":
+		p := params.(agent.HealthCheckParams)
+		target := p.URL
+		if target == "" {
+			target = p.Command
+		}
+		*h.events = append(*h.events, fmt.Sprintf("agent:%s:health_check:%s", h.host, target))
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{
+				OK:         h.host != h.failHost,
+				StatusCode: 200,
+				Output:     "checked " + h.host,
+				DurationMS: 25,
+			}
+		}
+	default:
+		*h.events = append(*h.events, fmt.Sprintf("agent:%s:%s", h.host, method))
 	}
 	return nil
 }
@@ -3248,4 +6449,9 @@ func (p panicDeployDocker) Push(context.Context, string) error {
 func (p panicDeployDocker) ResolveDigest(context.Context, string) (string, error) {
 	p.t.Fatal("unexpected digest resolve")
 	return "", nil
+}
+
+func (p panicDeployDocker) RegistryAuth(context.Context, string) (docker.RegistryAuth, bool, error) {
+	p.t.Fatal("unexpected registry auth")
+	return docker.RegistryAuth{}, false, nil
 }
