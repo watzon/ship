@@ -14,39 +14,30 @@ import (
 	"time"
 
 	"github.com/watzon/ship/internal/config"
-	"github.com/watzon/ship/internal/scheduler"
+	"github.com/watzon/ship/internal/provider"
 )
 
 const (
 	defaultAPIBase = "https://api.hetzner.cloud/v1"
 
-	LabelManagedBy   = "managed-by"
-	LabelProject     = "project"
-	LabelEnvironment = "environment"
-	LabelPool        = "pool"
+	LabelManagedBy   = provider.LabelManagedBy
+	LabelProject     = provider.LabelProject
+	LabelEnvironment = provider.LabelEnvironment
+	LabelPool        = provider.LabelPool
 
 	DefaultActionTimeout = 10 * time.Minute
 )
 
 type Client struct {
-	Token        string
-	DryRun       bool
-	HTTP         *http.Client
-	BaseURL      string
-	PollInterval time.Duration
+	Token         string
+	DryRun        bool
+	HTTP          *http.Client
+	BaseURL       string
+	PollInterval  time.Duration
 	ActionTimeout time.Duration
 }
 
-type ServerPlan struct {
-	Project     string
-	Environment string
-	Name        string
-	Pool        string
-	User        string
-	Location    string
-	ServerType  string
-	Image       string
-}
+type ServerPlan = provider.HostPlan
 
 type Server struct {
 	ID        int64             `json:"id"`
@@ -74,115 +65,120 @@ type ActionError struct {
 	Message string `json:"message"`
 }
 
-type ReconcileResult struct {
-	Desired  []ServerPlan
-	Existing []Server
-	Created  []Server
-	Extra    []Server
-}
+type ReconcileResult = provider.ReconcileResult
 
 type DecommissionResult struct {
-	Deleted []Server
+	Deleted []provider.Host
 }
 
 func NewFromEnv(dryRun bool) Client {
 	return Client{Token: os.Getenv("HCLOUD_TOKEN"), DryRun: dryRun, HTTP: http.DefaultClient}
 }
 
+func (c Client) Name() string {
+	return config.ProviderHetzner
+}
+
 func (c Client) TokenPresent() bool {
 	return strings.TrimSpace(c.Token) != ""
 }
 
-func DesiredServers(env config.Environment) []ServerPlan {
+func (c Client) CredentialChecks(lookupEnv func(string) (string, bool)) []provider.CredentialCheck {
+	_, ok := lookupEnv("HCLOUD_TOKEN")
+	return []provider.CredentialCheck{{
+		Name:           "hetzner token",
+		Present:        ok,
+		Required:       true,
+		PresentMessage: "HCLOUD_TOKEN is set",
+		MissingMessage: "missing HCLOUD_TOKEN",
+	}}
+}
+
+func DesiredServers(env config.Environment) []provider.HostPlan {
 	return DesiredServersFor("", "", env)
 }
 
-func DesiredServersFor(project, environment string, env config.Environment) []ServerPlan {
+func DesiredServersFor(project, environment string, env config.Environment) []provider.HostPlan {
 	hetzner := env.Provider.Hetzner
 	if hetzner == nil {
 		return nil
 	}
-	var plans []ServerPlan
-	for _, host := range scheduler.HostsForEnvironment(env) {
-		plans = append(plans, ServerPlan{
-			Project:     project,
-			Environment: environment,
-			Name:        host.Name,
-			Pool:        host.Pool,
-			User:        host.User,
-			Location:    hetzner.Location,
-			ServerType:  hetzner.ServerType,
-			Image:       hetzner.Image,
-		})
-	}
-	return plans
-}
-
-func (p ServerPlan) Labels() map[string]string {
-	labels := map[string]string{
-		LabelManagedBy: "ship",
-		LabelPool:      p.Pool,
-	}
-	if p.Project != "" {
-		labels[LabelProject] = p.Project
-	}
-	if p.Environment != "" {
-		labels[LabelEnvironment] = p.Environment
-	}
-	return labels
+	return provider.HostPlans(project, environment, env, provider.HostPlanOptions{
+		Location: hetzner.Location,
+		Size:     hetzner.ServerType,
+		Image:    hetzner.Image,
+	})
 }
 
 func (s Server) IPv4() string {
 	return s.PublicNet.IPv4.IP
 }
 
-func (c Client) Reconcile(ctx context.Context, project, environment string, env config.Environment) (ReconcileResult, error) {
+func (c Client) PlanHosts(project, environment string, env config.Environment) ([]provider.HostPlan, error) {
 	if env.Provider.Hetzner == nil {
-		return ReconcileResult{}, fmt.Errorf("environment %q must define provider.hetzner", environment)
+		return nil, fmt.Errorf("environment %q must define provider.hetzner", environment)
+	}
+	return DesiredServersFor(project, environment, env), nil
+}
+
+func (c Client) Reconcile(ctx context.Context, project, environment string, env config.Environment) (provider.ReconcileResult, error) {
+	if env.Provider.Hetzner == nil {
+		return provider.ReconcileResult{}, fmt.Errorf("environment %q must define provider.hetzner", environment)
 	}
 	if strings.TrimSpace(project) == "" {
-		return ReconcileResult{}, fmt.Errorf("project is required")
+		return provider.ReconcileResult{}, fmt.Errorf("project is required")
 	}
 	if strings.TrimSpace(environment) == "" {
-		return ReconcileResult{}, fmt.Errorf("environment is required")
+		return provider.ReconcileResult{}, fmt.Errorf("environment is required")
 	}
 
 	desired := DesiredServersFor(project, environment, env)
-	result := ReconcileResult{Desired: desired}
+	result := provider.ReconcileResult{Desired: desired}
 	if c.DryRun {
 		return result, nil
 	}
 
+	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, sshKeys: env.Provider.Hetzner.SSHKeys})
+}
+
+type reconcileBackend struct {
+	client  Client
+	sshKeys []string
+}
+
+func (b reconcileBackend) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
+	return b.client.List(ctx, project, environment)
+}
+
+func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (provider.Host, error) {
+	server, err := b.client.CreateServer(ctx, plan, b.sshKeys)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return hostFromServer(server), nil
+}
+
+func (c Client) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
 	existing, err := c.ListServers(ctx, project, environment)
 	if err != nil {
-		return ReconcileResult{}, err
+		return nil, err
 	}
-	existingByName := map[string]Server{}
+	hosts := make([]provider.Host, 0, len(existing))
 	for _, server := range existing {
-		existingByName[server.Name] = server
+		hosts = append(hosts, hostFromServer(server))
 	}
+	return hosts, nil
+}
 
-	desiredNames := map[string]bool{}
-	for _, plan := range desired {
-		desiredNames[plan.Name] = true
-		if server, ok := existingByName[plan.Name]; ok {
-			result.Existing = append(result.Existing, server)
-			continue
-		}
-		server, err := c.CreateServer(ctx, plan, env.Provider.Hetzner.SSHKeys)
-		if err != nil {
-			return ReconcileResult{}, err
-		}
-		result.Created = append(result.Created, server)
+func (c Client) Delete(ctx context.Context, host provider.Host) error {
+	if strings.TrimSpace(host.ID) == "" {
+		return fmt.Errorf("server id is required")
 	}
-
-	for _, server := range existing {
-		if !desiredNames[server.Name] {
-			result.Extra = append(result.Extra, server)
-		}
+	id, err := strconv.ParseInt(host.ID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("server id must be numeric: %w", err)
 	}
-
-	return result, nil
+	return c.DeleteServer(ctx, id)
 }
 
 func (c Client) ListServers(ctx context.Context, project, environment string) ([]Server, error) {
@@ -209,22 +205,23 @@ func (c Client) ListServers(ctx context.Context, project, environment string) ([
 	return servers, nil
 }
 
-func (c Client) CreateServer(ctx context.Context, plan ServerPlan, sshKeys []string) (Server, error) {
+func (c Client) CreateServer(ctx context.Context, plan provider.HostPlan, sshKeys []string) (Server, error) {
 	if !c.TokenPresent() {
 		return Server{}, fmt.Errorf("HCLOUD_TOKEN is required")
 	}
+	labels := labelsForPlan(plan)
 	body := map[string]any{
 		"name":        plan.Name,
-		"server_type": plan.ServerType,
+		"server_type": plan.Size,
 		"image":       plan.Image,
 		"location":    plan.Location,
-		"labels":      plan.Labels(),
+		"labels":      labels,
 	}
 	if len(sshKeys) > 0 {
 		body["ssh_keys"] = sshKeys
 	}
 	if c.DryRun {
-		return Server{Name: plan.Name, Labels: plan.Labels()}, nil
+		return Server{Name: plan.Name, Labels: labels}, nil
 	}
 	var out createServerResponse
 	if err := c.request(ctx, http.MethodPost, "/servers", body, &out); err != nil {
@@ -299,16 +296,16 @@ func (c Client) Decommission(ctx context.Context, project, environment string) (
 	if strings.TrimSpace(environment) == "" {
 		return DecommissionResult{}, fmt.Errorf("environment is required")
 	}
-	servers, err := c.ListServers(ctx, project, environment)
+	hosts, err := c.List(ctx, project, environment)
 	if err != nil {
 		return DecommissionResult{}, err
 	}
-	result := DecommissionResult{Deleted: make([]Server, 0, len(servers))}
-	for _, server := range servers {
-		if err := c.DeleteServer(ctx, server.ID); err != nil {
+	result := DecommissionResult{Deleted: make([]provider.Host, 0, len(hosts))}
+	for _, host := range hosts {
+		if err := c.Delete(ctx, host); err != nil {
 			return DecommissionResult{}, err
 		}
-		result.Deleted = append(result.Deleted, server)
+		result.Deleted = append(result.Deleted, host)
 	}
 	return result, nil
 }
@@ -380,6 +377,23 @@ func labelSelector(project, environment string) string {
 		LabelProject + "=" + project,
 		LabelEnvironment + "=" + environment,
 	}, ",")
+}
+
+func labelsForPlan(plan provider.HostPlan) map[string]string {
+	if len(plan.Labels) > 0 {
+		return plan.Labels
+	}
+	return provider.ShipLabels(plan.Project, plan.Environment, plan.Pool)
+}
+
+func hostFromServer(server Server) provider.Host {
+	return provider.Host{
+		ID:            strconv.FormatInt(server.ID, 10),
+		Name:          server.Name,
+		Pool:          server.Labels[LabelPool],
+		PublicAddress: server.IPv4(),
+		Labels:        server.Labels,
+	}
 }
 
 type listServersResponse struct {

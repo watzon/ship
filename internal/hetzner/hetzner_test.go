@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/provider"
 )
+
+var _ provider.Provider = Client{}
 
 func TestDesiredServersUsesPools(t *testing.T) {
 	env := testEnvironment(2)
@@ -29,7 +32,7 @@ func TestDesiredServerLabelsIncludeShipLabels(t *testing.T) {
 	if len(servers) != 1 {
 		t.Fatalf("len = %d", len(servers))
 	}
-	labels := servers[0].Labels()
+	labels := servers[0].Labels
 	want := map[string]string{
 		LabelManagedBy:   "ship",
 		LabelProject:     "demo",
@@ -68,7 +71,7 @@ func TestReconcileCreatesMissingServers(t *testing.T) {
 	if len(create.SSHKeys) != 1 || create.SSHKeys[0] != "ship-key" {
 		t.Fatalf("ssh_keys = %+v", create.SSHKeys)
 	}
-	if result.Created[0].ID == 0 || result.Created[0].IPv4() == "" {
+	if result.Created[0].ID == "" || result.Created[0].PublicAddress == "" {
 		t.Fatalf("created server missing facts: %+v", result.Created[0])
 	}
 }
@@ -84,7 +87,7 @@ func TestReconcileLeavesMatchingServersUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Existing) != 1 || result.Existing[0].ID != 10 {
+	if len(result.Existing) != 1 || result.Existing[0].ID != "10" {
 		t.Fatalf("existing = %+v", result.Existing)
 	}
 	if len(result.Created) != 0 || len(api.creates) != 0 {

@@ -21,6 +21,7 @@ import (
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/hetzner"
+	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/scheduler"
 	secretspkg "github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
@@ -70,6 +71,53 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 	})
 }
 
+type recordingProvider struct {
+	name      string
+	plans     []providerpkg.HostPlan
+	reconcile providerpkg.ReconcileResult
+	listed    []providerpkg.Host
+	deleted   []string
+}
+
+func (p *recordingProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "recording"
+}
+
+func (p *recordingProvider) PlanHosts(string, string, config.Environment) ([]providerpkg.HostPlan, error) {
+	return append([]providerpkg.HostPlan(nil), p.plans...), nil
+}
+
+func (p *recordingProvider) Reconcile(context.Context, string, string, config.Environment) (providerpkg.ReconcileResult, error) {
+	return p.reconcile, nil
+}
+
+func (p *recordingProvider) List(context.Context, string, string) ([]providerpkg.Host, error) {
+	return append([]providerpkg.Host(nil), p.listed...), nil
+}
+
+func (p *recordingProvider) Delete(_ context.Context, host providerpkg.Host) error {
+	p.deleted = append(p.deleted, host.ID)
+	return nil
+}
+
+func (p *recordingProvider) CredentialChecks(func(string) (string, bool)) []providerpkg.CredentialCheck {
+	return nil
+}
+
+func installProviderHook(t *testing.T, provider providerpkg.Provider) {
+	t.Helper()
+	original := newEnvironmentProvider
+	newEnvironmentProvider = func(config.Environment, bool) (providerpkg.Provider, error) {
+		return provider, nil
+	}
+	t.Cleanup(func() {
+		newEnvironmentProvider = original
+	})
+}
+
 func TestProvisionApplyRequiresYes(t *testing.T) {
 	path := writeConfig(t)
 	cmd := provisionCmd(&options{configPath: path})
@@ -105,6 +153,25 @@ func TestProvisionApplyDryRunDoesNotRequireYesOrToken(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, config.LocalStateDir, "environments", "production", "hosts.json")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run wrote hosts.json: %v", err)
+	}
+}
+
+func TestProvisionApplyDryRunUsesConfiguredProvider(t *testing.T) {
+	path := writeConfig(t)
+	prov := &recordingProvider{plans: []providerpkg.HostPlan{
+		{Name: "fake-1", Pool: "fake"},
+	}}
+	installProviderHook(t, prov)
+
+	var out bytes.Buffer
+	cmd := provisionCmd(&options{configPath: path, dryRun: true})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"apply", "production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "would provision fake-1 pool=fake") {
+		t.Fatalf("output = %q", out.String())
 	}
 }
 
@@ -160,18 +227,18 @@ func TestProvisionApplyWithConfigWritesHostFactsNextToConfig(t *testing.T) {
 	}))
 	t.Cleanup(api.Close)
 
-	originalNewHetznerClient := newHetznerClient
-	newHetznerClient = func(dryRun bool) hetzner.Client {
+	originalNewEnvironmentProvider := newEnvironmentProvider
+	newEnvironmentProvider = func(_ config.Environment, dryRun bool) (providerpkg.Provider, error) {
 		return hetzner.Client{
 			Token:        "test-token",
 			DryRun:       dryRun,
 			HTTP:         api.Client(),
 			BaseURL:      api.URL,
 			PollInterval: time.Nanosecond,
-		}
+		}, nil
 	}
 	t.Cleanup(func() {
-		newHetznerClient = originalNewHetznerClient
+		newEnvironmentProvider = originalNewEnvironmentProvider
 	})
 
 	var out bytes.Buffer
@@ -215,6 +282,51 @@ func TestProvisionApplyWithConfigWritesHostFactsNextToConfig(t *testing.T) {
 	}
 }
 
+func TestProvisionApplyWritesGenericProviderHostFacts(t *testing.T) {
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var bootstrapEvents []string
+	installBootstrapHooks(t, &bootstrapEvents)
+	prov := &recordingProvider{
+		name: "fake",
+		reconcile: providerpkg.ReconcileResult{
+			Desired: []providerpkg.HostPlan{{Name: "web-1", Pool: "web", User: "root"}},
+			Created: []providerpkg.Host{{
+				ID:            "instance-abc",
+				Name:          "web-1",
+				Pool:          "web",
+				PublicAddress: "host.example.test",
+			}},
+		},
+	}
+	installProviderHook(t, prov)
+
+	var out bytes.Buffer
+	cmd := provisionCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"apply", "production", "--yes"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "created web-1 pool=web provider_id=instance-abc public_address=host.example.test") {
+		t.Fatalf("output = %q", out.String())
+	}
+	store := state.NewStore(filepath.Join(projectDir, config.LocalStateDir))
+	facts, err := store.ReadHostFacts("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 1 {
+		t.Fatalf("facts = %+v", facts)
+	}
+	if facts[0].Provider != "fake" || facts[0].ProviderID != "instance-abc" || facts[0].ServerID != 0 || facts[0].IPv4 != "" || facts[0].PublicAddress != "host.example.test" {
+		t.Fatalf("host fact = %+v", facts[0])
+	}
+}
+
 func TestProvisionDecommissionRequiresYes(t *testing.T) {
 	path := writeConfig(t)
 	cmd := provisionCmd(&options{configPath: path})
@@ -226,6 +338,41 @@ func TestProvisionDecommissionRequiresYes(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--yes") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestProvisionDecommissionUsesConfiguredProvider(t *testing.T) {
+	projectDir := t.TempDir()
+	path := filepath.Join(projectDir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(filepath.Join(projectDir, config.LocalStateDir))
+	if err := store.SaveHostFacts("production", []state.HostFact{{Name: "web-1", Pool: "web", User: "root"}}); err != nil {
+		t.Fatal(err)
+	}
+	prov := &recordingProvider{listed: []providerpkg.Host{{
+		ID:   "instance-abc",
+		Name: "web-1",
+		Pool: "web",
+	}}}
+	installProviderHook(t, prov)
+
+	var out bytes.Buffer
+	cmd := provisionCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"decommission", "production", "--yes"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(prov.deleted, ","); got != "instance-abc" {
+		t.Fatalf("deleted = %q", got)
+	}
+	if !strings.Contains(out.String(), "decommissioned web-1 provider_id=instance-abc pool=web") {
+		t.Fatalf("output = %q", out.String())
+	}
+	if _, err := store.ReadHostFacts("production"); !os.IsNotExist(err) {
+		t.Fatalf("host facts should be removed, err=%v", err)
 	}
 }
 
@@ -276,18 +423,18 @@ func TestProvisionDecommissionDeletesServersAndClearsHostFacts(t *testing.T) {
 	}))
 	t.Cleanup(api.Close)
 
-	originalNewHetznerClient := newHetznerClient
-	newHetznerClient = func(dryRun bool) hetzner.Client {
+	originalNewEnvironmentProvider := newEnvironmentProvider
+	newEnvironmentProvider = func(_ config.Environment, dryRun bool) (providerpkg.Provider, error) {
 		return hetzner.Client{
 			Token:        "test-token",
 			DryRun:       dryRun,
 			HTTP:         api.Client(),
 			BaseURL:      api.URL,
 			PollInterval: time.Nanosecond,
-		}
+		}, nil
 	}
 	t.Cleanup(func() {
-		newHetznerClient = originalNewHetznerClient
+		newEnvironmentProvider = originalNewEnvironmentProvider
 	})
 
 	var out bytes.Buffer

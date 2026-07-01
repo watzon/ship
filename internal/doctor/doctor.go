@@ -12,6 +12,8 @@ import (
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
+	"github.com/watzon/ship/internal/provider"
+	"github.com/watzon/ship/internal/providers"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
@@ -60,6 +62,7 @@ type Options struct {
 	SSHAvailable func(context.Context) error
 	Remote       RemoteRunner
 	LookupEnv    func(string) (string, bool)
+	ProviderFor  func(config.Environment, bool) (provider.Provider, error)
 }
 
 func NewReport(checks []Check) Report {
@@ -131,6 +134,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) Report {
 	if opts.LookupEnv == nil {
 		opts.LookupEnv = os.LookupEnv
 	}
+	if opts.ProviderFor == nil {
+		opts.ProviderFor = providers.ForEnvironment
+	}
 
 	checks := []Check{pass("config", "configuration is valid")}
 
@@ -139,7 +145,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) Report {
 	checks = append(checks, errCheck("docker buildkit", opts.Docker.BuildKitSupported(ctx), hasBuilds))
 	checks = append(checks, errCheck("registry auth", opts.Docker.RegistryLoggedIn(ctx, cfg.Registry), hasBuilds))
 	checks = append(checks, errCheck("ssh", opts.SSHAvailable(ctx), true))
-	checks = append(checks, hetznerTokenCheck(cfg, opts.LookupEnv))
+	checks = append(checks, providerCredentialChecks(cfg, opts.LookupEnv, opts.ProviderFor)...)
 	checks = append(checks, secretChecks(cfg)...)
 	checks = append(checks, buildPathChecks(cfg, opts.ConfigPath)...)
 	checks = append(checks, remoteChecks(ctx, cfg, opts.ConfigPath, opts.Remote)...)
@@ -157,17 +163,38 @@ func errCheck(name string, err error, hard bool) Check {
 	return warn(name, err.Error())
 }
 
-func hetznerTokenCheck(cfg *config.Config, lookupEnv func(string) (string, bool)) Check {
+func providerCredentialChecks(cfg *config.Config, lookupEnv func(string) (string, bool), providerFor func(config.Environment, bool) (provider.Provider, error)) []Check {
+	var checks []Check
+	seen := map[string]bool{}
 	for _, envName := range sortedEnvironmentNames(cfg) {
 		env := cfg.Environments[envName]
-		if env.Provider.Hetzner != nil {
-			if _, ok := lookupEnv("HCLOUD_TOKEN"); !ok {
-				return fail("hetzner token", "missing HCLOUD_TOKEN")
-			}
-			return pass("hetzner token", "HCLOUD_TOKEN is set")
+		prov, err := providerFor(env, true)
+		if err != nil {
+			checks = append(checks, fail("provider:"+envName, err.Error()))
+			continue
+		}
+		if seen[prov.Name()] {
+			continue
+		}
+		seen[prov.Name()] = true
+		for _, credential := range prov.CredentialChecks(lookupEnv) {
+			checks = append(checks, credentialCheck(credential))
 		}
 	}
-	return warn("hetzner token", "no Hetzner environments configured")
+	if len(checks) == 0 {
+		checks = append(checks, warn("provider credentials", "no provider environments configured"))
+	}
+	return checks
+}
+
+func credentialCheck(check provider.CredentialCheck) Check {
+	if check.Present {
+		return pass(check.Name, check.PresentMessage)
+	}
+	if check.Required {
+		return fail(check.Name, check.MissingMessage)
+	}
+	return warn(check.Name, check.MissingMessage)
 }
 
 func secretChecks(cfg *config.Config) []Check {

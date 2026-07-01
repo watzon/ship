@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,9 +21,10 @@ import (
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/doctor"
-	"github.com/watzon/ship/internal/hetzner"
 	"github.com/watzon/ship/internal/ingress"
 	"github.com/watzon/ship/internal/planner"
+	"github.com/watzon/ship/internal/provider"
+	"github.com/watzon/ship/internal/providers"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
@@ -34,7 +36,7 @@ type options struct {
 	dryRun     bool
 }
 
-var newHetznerClient = hetzner.NewFromEnv
+var newEnvironmentProvider = providers.ForEnvironment
 
 type deployDocker interface {
 	BuildImage(ctx context.Context, opts docker.BuildOptions) error
@@ -161,7 +163,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{Use: "provision", Short: "Plan or apply server provisioning"}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "plan ENV",
-		Short: "Print the Hetzner provisioning plan",
+		Short: "Print the provisioning plan",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
@@ -179,7 +181,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	var yes bool
 	apply := &cobra.Command{
 		Use:   "apply ENV",
-		Short: "Create Hetzner servers and bootstrap Ship",
+		Short: "Create servers and bootstrap Ship",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -192,11 +194,19 @@ func provisionCmd(opts *options) *cobra.Command {
 				return err
 			}
 			if !yes && !opts.dryRun {
-				return fmt.Errorf("provision apply requires --yes (or --dry-run) before creating Hetzner servers")
+				return fmt.Errorf("provision apply requires --yes (or --dry-run) before creating servers")
+			}
+			prov, err := newEnvironmentProvider(env, opts.dryRun)
+			if err != nil {
+				return err
 			}
 			if opts.dryRun {
-				for _, srv := range hetzner.DesiredServersFor(cfg.Project, args[0], env) {
-					fmt.Fprintf(cmd.OutOrStdout(), "would provision %s pool=%s\n", srv.Name, srv.Pool)
+				plans, err := prov.PlanHosts(cfg.Project, args[0], env)
+				if err != nil {
+					return err
+				}
+				for _, host := range plans {
+					fmt.Fprintf(cmd.OutOrStdout(), "would provision %s pool=%s\n", host.Name, host.Pool)
 				}
 				return nil
 			}
@@ -210,33 +220,22 @@ func provisionCmd(opts *options) *cobra.Command {
 			}
 			store := state.NewStore(stateDir)
 			recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "started"})
-			hc := newHetznerClient(opts.dryRun)
-			result, err := hc.Reconcile(ctx, cfg.Project, args[0], env)
+			result, err := prov.Reconcile(ctx, cfg.Project, args[0], env)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "failed", Message: err.Error()})
 				return err
 			}
-			for _, server := range result.Existing {
-				fmt.Fprintf(cmd.OutOrStdout(), "exists %s pool=%s\n", server.Name, server.Labels[hetzner.LabelPool])
+			for _, host := range result.Existing {
+				printProviderHost(cmd.OutOrStdout(), "exists", host)
 			}
-			for _, server := range result.Created {
-				fmt.Fprintf(cmd.OutOrStdout(), "created %s pool=%s", server.Name, server.Labels[hetzner.LabelPool])
-				if server.ID != 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), " server_id=%d", server.ID)
-				}
-				if server.IPv4() != "" {
-					fmt.Fprintf(cmd.OutOrStdout(), " ipv4=%s", server.IPv4())
-				}
-				fmt.Fprintln(cmd.OutOrStdout())
+			for _, host := range result.Created {
+				printProviderHost(cmd.OutOrStdout(), "created", host)
 			}
-			for _, server := range result.Extra {
-				fmt.Fprintf(cmd.OutOrStdout(), "extra %s pool=%s", server.Name, server.Labels[hetzner.LabelPool])
-				if server.ID != 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), " server_id=%d", server.ID)
-				}
+			for _, host := range result.Extra {
+				printProviderHostDetails(cmd.OutOrStdout(), "extra", host)
 				fmt.Fprintln(cmd.OutOrStdout(), " (not deleted)")
 			}
-			facts := hostFactsFromReconcile(result)
+			facts := hostFactsFromReconcile(prov.Name(), result)
 			if err := store.SaveHostFacts(args[0], facts); err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "failed", Message: err.Error()})
 				return err
@@ -262,7 +261,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	var decommissionYes bool
 	decommission := &cobra.Command{
 		Use:   "decommission ENV",
-		Short: "Delete Ship-managed Hetzner servers for an environment",
+		Short: "Delete Ship-managed servers for an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -274,59 +273,45 @@ func provisionCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if env.Provider.Hetzner == nil {
-				return fmt.Errorf("environment %q must define provider.hetzner", args[0])
-			}
 			if !decommissionYes && !opts.dryRun {
-				return fmt.Errorf("provision decommission requires --yes (or --dry-run) before deleting Hetzner servers")
+				return fmt.Errorf("provision decommission requires --yes (or --dry-run) before deleting servers")
+			}
+			prov, err := newEnvironmentProvider(env, opts.dryRun)
+			if err != nil {
+				return err
 			}
 			stateDir, err := localStateDirForConfig(opts.configPath)
 			if err != nil {
 				return err
 			}
 			store := state.NewStore(stateDir)
-			hc := newHetznerClient(opts.dryRun)
-			servers, err := hc.ListServers(ctx, cfg.Project, args[0])
+			hosts, err := prov.List(ctx, cfg.Project, args[0])
 			if err != nil {
 				return err
 			}
 			if opts.dryRun {
-				if len(servers) == 0 {
+				if len(hosts) == 0 {
 					fmt.Fprintln(cmd.OutOrStdout(), "would decommission no servers")
 					return nil
 				}
-				for _, server := range servers {
-					fmt.Fprintf(cmd.OutOrStdout(), "would decommission %s", server.Name)
-					if server.ID != 0 {
-						fmt.Fprintf(cmd.OutOrStdout(), " server_id=%d", server.ID)
-					}
-					if pool := server.Labels[hetzner.LabelPool]; pool != "" {
-						fmt.Fprintf(cmd.OutOrStdout(), " pool=%s", pool)
-					}
-					fmt.Fprintln(cmd.OutOrStdout())
+				for _, host := range hosts {
+					printProviderHost(cmd.OutOrStdout(), "would decommission", host)
 				}
 				return nil
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "started"})
-			for _, server := range servers {
-				if err := hc.DeleteServer(ctx, server.ID); err != nil {
-					recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "failed", Host: server.Name, Message: err.Error()})
+			for _, host := range hosts {
+				if err := prov.Delete(ctx, host); err != nil {
+					recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "failed", Host: host.Name, Message: err.Error()})
 					return err
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "decommissioned %s", server.Name)
-				if server.ID != 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), " server_id=%d", server.ID)
-				}
-				if pool := server.Labels[hetzner.LabelPool]; pool != "" {
-					fmt.Fprintf(cmd.OutOrStdout(), " pool=%s", pool)
-				}
-				fmt.Fprintln(cmd.OutOrStdout())
+				printProviderHost(cmd.OutOrStdout(), "decommissioned", host)
 			}
 			if err := store.DeleteHostFacts(args[0]); err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "failed", Message: err.Error()})
 				return err
 			}
-			recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "succeeded", Message: fmt.Sprintf("deleted=%d", len(servers))})
+			recordEvent(store, state.Event{Environment: args[0], Kind: "decommission", Status: "succeeded", Message: fmt.Sprintf("deleted=%d", len(hosts))})
 			return nil
 		},
 	}
@@ -346,26 +331,74 @@ func localStateDirForConfig(configPath string) (string, error) {
 	return filepath.Join(filepath.Dir(absPath), config.LocalStateDir), nil
 }
 
-func hostFactsFromReconcile(result hetzner.ReconcileResult) []state.HostFact {
-	serversByName := map[string]hetzner.Server{}
-	for _, server := range result.Existing {
-		serversByName[server.Name] = server
+func printProviderHost(w io.Writer, action string, host provider.Host) {
+	printProviderHostDetails(w, action, host)
+	fmt.Fprintln(w)
+}
+
+func printProviderHostDetails(w io.Writer, action string, host provider.Host) {
+	pool := host.Pool
+	if pool == "" {
+		pool = host.Labels[provider.LabelPool]
 	}
-	for _, server := range result.Created {
-		serversByName[server.Name] = server
+	fmt.Fprintf(w, "%s %s", action, host.Name)
+	if strings.Contains(action, "decommission") {
+		printProviderID(w, host.ID)
+		if pool != "" {
+			fmt.Fprintf(w, " pool=%s", pool)
+		}
+	} else {
+		if pool != "" {
+			fmt.Fprintf(w, " pool=%s", pool)
+		}
+		printProviderID(w, host.ID)
+	}
+	if host.PublicAddress != "" {
+		if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
+			fmt.Fprintf(w, " ipv4=%s", host.PublicAddress)
+		} else {
+			fmt.Fprintf(w, " public_address=%s", host.PublicAddress)
+		}
+	}
+}
+
+func printProviderID(w io.Writer, id string) {
+	if id == "" {
+		return
+	}
+	if _, err := strconv.ParseInt(id, 10, 64); err == nil {
+		fmt.Fprintf(w, " server_id=%s", id)
+		return
+	}
+	fmt.Fprintf(w, " provider_id=%s", id)
+}
+
+func hostFactsFromReconcile(providerName string, result provider.ReconcileResult) []state.HostFact {
+	hostsByName := map[string]provider.Host{}
+	for _, host := range result.Existing {
+		hostsByName[host.Name] = host
+	}
+	for _, host := range result.Created {
+		hostsByName[host.Name] = host
 	}
 
 	facts := make([]state.HostFact, 0, len(result.Desired))
 	for _, plan := range result.Desired {
 		fact := state.HostFact{
-			Name: plan.Name,
-			Pool: plan.Pool,
-			User: plan.User,
+			Name:     plan.Name,
+			Pool:     plan.Pool,
+			User:     plan.User,
+			Provider: providerName,
 		}
-		if server, ok := serversByName[plan.Name]; ok {
-			fact.ServerID = server.ID
-			fact.IPv4 = server.IPv4()
-			fact.PublicAddress = server.IPv4()
+		if host, ok := hostsByName[plan.Name]; ok {
+			fact.ProviderID = host.ID
+			if id, err := strconv.ParseInt(host.ID, 10, 64); err == nil {
+				fact.ServerID = id
+			}
+			fact.PublicAddress = host.PublicAddress
+			if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
+				fact.IPv4 = host.PublicAddress
+			}
 		}
 		facts = append(facts, fact)
 	}

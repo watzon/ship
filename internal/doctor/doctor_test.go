@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/watzon/ship/internal/config"
+	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/state"
 )
@@ -49,6 +50,35 @@ func (f *fakeRemote) Run(_ context.Context, host scheduler.Host, command string)
 	return f.outputs[command], nil
 }
 
+type fakeProvider struct {
+	name   string
+	checks []providerpkg.CredentialCheck
+}
+
+func (f fakeProvider) Name() string {
+	return f.name
+}
+
+func (f fakeProvider) PlanHosts(string, string, config.Environment) ([]providerpkg.HostPlan, error) {
+	return nil, nil
+}
+
+func (f fakeProvider) Reconcile(context.Context, string, string, config.Environment) (providerpkg.ReconcileResult, error) {
+	return providerpkg.ReconcileResult{}, nil
+}
+
+func (f fakeProvider) List(context.Context, string, string) ([]providerpkg.Host, error) {
+	return nil, nil
+}
+
+func (f fakeProvider) Delete(context.Context, providerpkg.Host) error {
+	return nil
+}
+
+func (f fakeProvider) CredentialChecks(func(string) (string, bool)) []providerpkg.CredentialCheck {
+	return f.checks
+}
+
 func TestRunAggregatesIndependentLocalFailures(t *testing.T) {
 	cfg, configPath := testConfig(t, nil)
 	t.Setenv("HCLOUD_TOKEN", "token")
@@ -66,6 +96,29 @@ func TestRunAggregatesIndependentLocalFailures(t *testing.T) {
 	assertCheck(t, report, "ssh", StatusFail, "ssh missing")
 	assertCheck(t, report, "docker buildkit", StatusPass, "")
 	assertCheck(t, report, "registry auth", StatusPass, "")
+}
+
+func TestRunUsesProviderCredentialChecks(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+		ProviderFor: func(config.Environment, bool) (providerpkg.Provider, error) {
+			return fakeProvider{
+				name: "fake",
+				checks: []providerpkg.CredentialCheck{{
+					Name:           "fake token",
+					Required:       true,
+					Present:        false,
+					MissingMessage: "missing FAKE_TOKEN",
+				}},
+			}, nil
+		},
+	})
+
+	assertCheck(t, report, "fake token", StatusFail, "missing FAKE_TOKEN")
 }
 
 func TestRunReportsMissingSecretsByName(t *testing.T) {

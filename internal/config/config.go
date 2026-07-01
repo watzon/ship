@@ -16,6 +16,8 @@ const (
 	LocalStateDir     = ".ship"
 	RemoteStateDir    = "/var/lib/ship"
 	RemoteBinaryPath  = "/usr/local/bin/ship"
+
+	ProviderHetzner = "hetzner"
 )
 
 type Config struct {
@@ -34,6 +36,7 @@ type Environment struct {
 
 type ProviderConfig struct {
 	Hetzner *HetznerConfig `yaml:"hetzner"`
+	Unknown []string       `yaml:"-"`
 }
 
 type HetznerConfig struct {
@@ -41,6 +44,72 @@ type HetznerConfig struct {
 	ServerType string   `yaml:"server_type"`
 	Image      string   `yaml:"image"`
 	SSHKeys    []string `yaml:"ssh_keys"`
+}
+
+func (p *ProviderConfig) UnmarshalYAML(value *yaml.Node) error {
+	type providerConfig ProviderConfig
+	var decoded providerConfig
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*p = ProviderConfig(decoded)
+	p.Unknown = nil
+	if value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		name := value.Content[i].Value
+		switch name {
+		case ProviderHetzner:
+		default:
+			p.Unknown = append(p.Unknown, name)
+		}
+	}
+	sort.Strings(p.Unknown)
+	return nil
+}
+
+func (p ProviderConfig) Name() string {
+	if p.Hetzner != nil {
+		return ProviderHetzner
+	}
+	return ""
+}
+
+func (p ProviderConfig) Validate(envName string) []string {
+	var errs []string
+	blocks := p.blocks()
+	if len(blocks) == 0 {
+		return []string{fmt.Sprintf("environment %q must define exactly one provider", envName)}
+	}
+	if len(blocks) > 1 {
+		errs = append(errs, fmt.Sprintf("environment %q must define exactly one provider (found %s)", envName, strings.Join(blocks, ", ")))
+	}
+	if len(p.Unknown) > 0 {
+		errs = append(errs, fmt.Sprintf("environment %q defines unsupported provider(s): %s", envName, strings.Join(p.Unknown, ", ")))
+	}
+	if p.Hetzner != nil {
+		if p.Hetzner.Location == "" {
+			errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.location is required", envName))
+		}
+		if p.Hetzner.ServerType == "" {
+			errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.server_type is required", envName))
+		}
+		if p.Hetzner.Image == "" {
+			errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.image is required", envName))
+		}
+	}
+	return errs
+}
+
+func (p ProviderConfig) blocks() []string {
+	var blocks []string
+	if p.Hetzner != nil {
+		blocks = append(blocks, ProviderHetzner)
+	}
+	blocks = append(blocks, p.Unknown...)
+	sort.Strings(blocks)
+	return blocks
 }
 
 type HostsConfig struct {
@@ -142,19 +211,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, "at least one service is required")
 	}
 	for envName, env := range c.Environments {
-		if env.Provider.Hetzner == nil {
-			errs = append(errs, fmt.Sprintf("environment %q must define provider.hetzner", envName))
-		} else {
-			if env.Provider.Hetzner.Location == "" {
-				errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.location is required", envName))
-			}
-			if env.Provider.Hetzner.ServerType == "" {
-				errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.server_type is required", envName))
-			}
-			if env.Provider.Hetzner.Image == "" {
-				errs = append(errs, fmt.Sprintf("environment %q provider.hetzner.image is required", envName))
-			}
-		}
+		errs = append(errs, env.Provider.Validate(envName)...)
 		if len(env.Hosts.Pools) == 0 {
 			errs = append(errs, fmt.Sprintf("environment %q must define hosts.pools", envName))
 		}

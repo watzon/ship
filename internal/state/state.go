@@ -37,6 +37,8 @@ type HostFact struct {
 	User          string `json:"user"`
 	IPv4          string `json:"ipv4,omitempty"`
 	PublicAddress string `json:"public_address,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	ProviderID    string `json:"provider_id,omitempty"`
 	ServerID      int64  `json:"server_id,omitempty"`
 }
 

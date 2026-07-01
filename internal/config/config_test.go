@@ -45,6 +45,43 @@ func TestValidateReportsMissingPool(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsHetznerProvider(t *testing.T) {
+	cfg := minimalValidConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+	if got := cfg.Environments["production"].Provider.Name(); got != ProviderHetzner {
+		t.Fatalf("provider name = %q, want %q", got, ProviderHetzner)
+	}
+}
+
+func TestValidateRequiresProvider(t *testing.T) {
+	cfg := minimalValidConfig()
+	cfg.Environments["production"] = Environment{
+		Hosts: HostsConfig{Pools: map[string]Pool{"web": {Count: 1}}},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), `environment "production" must define exactly one provider`) {
+		t.Fatalf("expected missing provider error, got %v", err)
+	}
+}
+
+func TestLoadReportsUnsupportedProvider(t *testing.T) {
+	cfgText := strings.Replace(minimalConfigYAML(), "hetzner:", "digitalocean:", 1)
+	_, err := loadConfigText(t, cfgText)
+	if err == nil || !strings.Contains(err.Error(), `unsupported provider(s): digitalocean`) {
+		t.Fatalf("expected unsupported provider error, got %v", err)
+	}
+}
+
+func TestLoadReportsMultipleProviderBlocks(t *testing.T) {
+	cfgText := strings.Replace(minimalConfigYAML(), "      hetzner:", "      digitalocean:\n        region: nyc1\n      hetzner:", 1)
+	_, err := loadConfigText(t, cfgText)
+	if err == nil || !strings.Contains(err.Error(), `must define exactly one provider`) {
+		t.Fatalf("expected multiple provider error, got %v", err)
+	}
+}
+
 func TestValidateBuildOptionsRequireBuild(t *testing.T) {
 	cfg := &Config{
 		Project:  "x",
@@ -104,4 +141,55 @@ func TestValidateAccessoryBackupRequiredRequiresCommand(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `accessory "redis" requires backup.command`) {
 		t.Fatalf("expected accessory backup command validation error, got %v", err)
 	}
+}
+
+func minimalValidConfig() *Config {
+	return &Config{
+		Project:  "x",
+		Registry: "ghcr.io/acme/x",
+		Environments: map[string]Environment{
+			"production": {
+				Provider: ProviderConfig{Hetzner: &HetznerConfig{Location: "ash", ServerType: "cpx31", Image: "ubuntu-24.04"}},
+				Hosts:    HostsConfig{Pools: map[string]Pool{"web": {Count: 1}}},
+			},
+		},
+		Services: map[string]Service{
+			"web": {Pool: "web", Scale: 1, Image: ImageSpec{Ref: "example/web"}},
+		},
+	}
+}
+
+func loadConfigText(t *testing.T, text string) (*Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+func minimalConfigYAML() string {
+	return `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+    hosts:
+      pools:
+        web:
+          count: 1
+
+services:
+  web:
+    image:
+      ref: example/web
+    pool: web
+    scale: 1
+`
 }

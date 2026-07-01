@@ -23,6 +23,7 @@ import (
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/hetzner"
+	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/state"
 )
@@ -74,18 +75,18 @@ func TestAcceptanceFakeInfrastructureWorkflow(t *testing.T) {
 	installBootstrapHooks(t, &events)
 
 	fakeHetzner := newAcceptanceHetznerAPI(t)
-	originalNewHetznerClient := newHetznerClient
-	newHetznerClient = func(dryRun bool) hetzner.Client {
+	originalNewEnvironmentProvider := newEnvironmentProvider
+	newEnvironmentProvider = func(_ config.Environment, dryRun bool) (providerpkg.Provider, error) {
 		return hetzner.Client{
 			Token:        "acceptance-token",
 			DryRun:       dryRun,
 			HTTP:         fakeHetzner.server.Client(),
 			BaseURL:      fakeHetzner.server.URL,
 			PollInterval: time.Nanosecond,
-		}
+		}, nil
 	}
 	t.Cleanup(func() {
-		newHetznerClient = originalNewHetznerClient
+		newEnvironmentProvider = originalNewEnvironmentProvider
 	})
 
 	out := runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "apply", "production", "--yes")
