@@ -73,8 +73,22 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building ship $VERSION for ${{ matrix.goos }}/${{ matrix.goarch }}"
 
+      - name: Detect signing config
+        id: signing
+        if: matrix.sign
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Apple signing secrets not configured — macOS build will be UNSIGNED."
+          fi
+
       - name: Import signing certificate
-        if: matrix.sign && secrets.APPLE_CERTIFICATE != ''
+        if: matrix.sign && steps.signing.outputs.enabled == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -111,7 +125,7 @@ jobs:
           "dist/${BINARY}" version
 
       - name: Sign and notarize macOS binary
-        if: matrix.sign && secrets.APPLE_SIGNING_IDENTITY != ''
+        if: matrix.sign && steps.signing.outputs.enabled == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
