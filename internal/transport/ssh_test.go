@@ -11,7 +11,7 @@ import (
 
 func TestSSHRunUsesCommandTimeout(t *testing.T) {
 	dir := t.TempDir()
-	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\nsleep 5\n")
+	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\n/bin/sleep 5\n")
 	t.Setenv("PATH", dir)
 
 	_, err := (SSH{User: "root", Host: "example.test", Timeout: 10 * time.Millisecond}).Run(context.Background(), "true")
@@ -25,7 +25,7 @@ func TestSSHRunUsesCommandTimeout(t *testing.T) {
 
 func TestSSHRunWithStdinUsesCommandTimeout(t *testing.T) {
 	dir := t.TempDir()
-	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\ncat >/dev/null\nsleep 5\n")
+	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\n/bin/cat >/dev/null\n/bin/sleep 5\n")
 	t.Setenv("PATH", dir)
 
 	_, err := (SSH{User: "root", Host: "example.test", Timeout: 10 * time.Millisecond}).RunWithStdin(context.Background(), "cat", "payload")
