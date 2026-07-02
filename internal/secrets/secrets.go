@@ -15,6 +15,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/fsatomic"
 )
 
 const digestLength = 12
@@ -538,11 +539,7 @@ func WriteRecipients(opts SourceOptions, recipients []string) error {
 		}
 		fmt.Fprintln(&b, recipient)
 	}
-	path := RecipientsPath(opts)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return fsatomic.WriteFile(RecipientsPath(opts), []byte(b.String()), 0o644)
 }
 
 func WriteStoreWithRecipients(opts SourceOptions, values map[string]string, recipients []age.Recipient) error {
@@ -573,11 +570,7 @@ func WriteStoreWithRecipients(opts SourceOptions, values map[string]string, reci
 	if err := writer.Close(); err != nil {
 		return err
 	}
-	path := StorePath(opts)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, encrypted.Bytes(), 0o644)
+	return fsatomic.WriteFile(StorePath(opts), encrypted.Bytes(), 0o644)
 }
 
 func SetStoredSecret(opts SourceOptions, recipientText, name, value string) error {

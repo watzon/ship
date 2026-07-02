@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/watzon/ship/internal/fsatomic"
 )
 
 const (
@@ -104,18 +106,15 @@ func NewStore(dir string) Store {
 }
 
 func (s Store) SaveHostFacts(environment string, hosts []HostFact) error {
-	if strings.TrimSpace(environment) == "" {
-		return errors.New("environment is required")
-	}
-	dir := filepath.Join(s.Dir, "environments", environment)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	environment = strings.TrimSpace(environment)
+	if err := validateStateName("environment", environment); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(hosts, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "hosts.json"), data, 0o644)
+	return fsatomic.WriteFile(filepath.Join(s.Dir, "environments", environment, "hosts.json"), data, 0o644)
 }
 
 func (s Store) ReadHostFacts(environment string) ([]HostFact, error) {
@@ -162,7 +161,7 @@ func (s Store) SaveDeployLock(lock DeployLock) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(s.deployLockPath(environment), data, 0o644)
+	return fsatomic.WriteFile(s.deployLockPath(environment), data, 0o644)
 }
 
 func (s Store) ReadDeployLock(environment string) (DeployLock, error) {
@@ -291,7 +290,7 @@ func (s Store) SaveAccessoryState(accessory AccessoryState) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(s.accessoryStatePath(environment, name), data, 0o644)
+	return fsatomic.WriteFile(s.accessoryStatePath(environment, name), data, 0o644)
 }
 
 func (s Store) ReadAccessoryState(environment, name string) (AccessoryState, error) {
@@ -406,7 +405,7 @@ func (s Store) RecordEvent(event Event) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(s.eventsPath(event.Environment), data, 0o644)
+	return fsatomic.WriteFile(s.eventsPath(event.Environment), data, 0o644)
 }
 
 func (s Store) Events(environment string) ([]Event, error) {
@@ -485,7 +484,7 @@ func (s Store) SaveReleaseRecord(release Release) error {
 		return err
 	}
 	path := filepath.Join(releasesDir, release.ID+".json")
-	if err := atomicWriteFile(path, data, 0o644); err != nil {
+	if err := fsatomic.WriteFile(path, data, 0o644); err != nil {
 		return err
 	}
 	return nil
@@ -500,10 +499,10 @@ func (s Store) PromoteRelease(id string) error {
 		return errors.New("release environment is required")
 	}
 	data := []byte(release.ID + "\n")
-	if err := atomicWriteFile(s.currentReleasePath(release.Environment), data, 0o644); err != nil {
+	if err := fsatomic.WriteFile(s.currentReleasePath(release.Environment), data, 0o644); err != nil {
 		return err
 	}
-	return atomicWriteFile(s.legacyCurrentReleasePath(), data, 0o644)
+	return fsatomic.WriteFile(s.legacyCurrentReleasePath(), data, 0o644)
 }
 
 func (s Store) MarkReleaseHealthy(id string, at time.Time) (Release, error) {
@@ -723,52 +722,4 @@ func validateStateName(kind, value string) error {
 		return fmt.Errorf("invalid %s %q", kind, value)
 	}
 	return nil
-}
-
-func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".ship-state-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	cleanup = false
-	_ = syncDir(dir)
-	return nil
-}
-
-func syncDir(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
 }

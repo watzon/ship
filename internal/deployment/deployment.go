@@ -15,6 +15,7 @@ import (
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
+	"github.com/watzon/ship/internal/fsatomic"
 	"github.com/watzon/ship/internal/ingress"
 	"github.com/watzon/ship/internal/scheduler"
 )
@@ -549,7 +550,7 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 		}
 		return fmt.Errorf("prepare ingress state: %w", err)
 	}
-	if err := os.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
+	if err := fsatomic.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
 		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
 			return fmt.Errorf("write ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}

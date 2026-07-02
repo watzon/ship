@@ -36,6 +36,22 @@ func TestSaveHostFactsWritesEnvironmentHosts(t *testing.T) {
 	}
 }
 
+func TestSaveHostFactsRejectsInvalidEnvironmentName(t *testing.T) {
+	store := NewStore(t.TempDir())
+	hosts := []HostFact{{Name: "web-1", Pool: "web"}}
+
+	for _, environment := range []string{"../evil", "a/b"} {
+		t.Run(environment, func(t *testing.T) {
+			if err := store.SaveHostFacts(environment, hosts); err == nil {
+				t.Fatal("expected error")
+			}
+			if _, err := os.Stat(filepath.Join(store.Dir, "environments", environment, "hosts.json")); !os.IsNotExist(err) {
+				t.Fatalf("hosts.json should not exist: %v", err)
+			}
+		})
+	}
+}
+
 func TestReadHostFactsReadsEnvironmentHosts(t *testing.T) {
 	store := NewStore(t.TempDir())
 	hosts := []HostFact{{
@@ -417,40 +433,6 @@ func TestMarkReleaseHealthyPromotesCurrent(t *testing.T) {
 	}
 	if current.ID != "new" {
 		t.Fatalf("current = %+v", current)
-	}
-}
-
-func TestAtomicWriteFileReplacesAndCleansTempFile(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "current")
-	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicWriteFile(path, []byte("new\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "new\n" {
-		t.Fatalf("data = %q", data)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode = %v", info.Mode().Perm())
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".ship-state-") {
-			t.Fatalf("temporary file was not cleaned up: %s", entry.Name())
-		}
 	}
 }
 
