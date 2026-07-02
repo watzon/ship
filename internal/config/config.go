@@ -2572,6 +2572,9 @@ func validateServices(prefix string, services map[string]Service) []string {
 		if svc.Rolling.HealthIntervalSeconds < 0 {
 			errs = append(errs, fmt.Sprintf("%s rolling.health_interval_seconds cannot be negative", label))
 		}
+		if strings.ContainsAny(svc.Health.HTTP, " \t\r\n") {
+			errs = append(errs, fmt.Sprintf("%s health.http cannot contain whitespace", label))
+		}
 		errs = append(errs, validateBuildpackConfig(label+" image.buildpack", svc.Image.Buildpack)...)
 		if svc.Image.Buildpack.Enabled() {
 			if strings.TrimSpace(svc.Image.Build) == "" {
@@ -2802,6 +2805,9 @@ func validateIngressHealth(label string, health IngressHealth) []string {
 	}
 	if health.Path != "" && !strings.HasPrefix(health.Path, "/") {
 		errs = append(errs, fmt.Sprintf("%s.path must start with /", label))
+	}
+	if strings.ContainsAny(health.Path, " \t\r\n") {
+		errs = append(errs, fmt.Sprintf("%s.path cannot contain whitespace", label))
 	}
 	for i, status := range health.UnhealthyStatus {
 		status = strings.TrimSpace(status)
