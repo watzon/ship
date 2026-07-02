@@ -1937,8 +1937,8 @@ type ImageSpec struct {
 	Buildpack     BuildpackConfig   `yaml:"buildpack"`
 	Platform      string            `yaml:"platform"`
 	Platforms     []string          `yaml:"platforms"`
-	Pull          bool              `yaml:"pull"`
-	NoCache       bool              `yaml:"no_cache"`
+	Pull          *bool             `yaml:"pull"`
+	NoCache       *bool             `yaml:"no_cache"`
 	NoCacheFilter []string          `yaml:"no_cache_filter"`
 	CacheFrom     []string          `yaml:"cache_from"`
 	CacheTo       []string          `yaml:"cache_to"`
@@ -1953,9 +1953,17 @@ type BuildpackConfig struct {
 	Buildpacks   []string          `yaml:"buildpacks"`
 	Env          map[string]string `yaml:"env"`
 	Descriptor   string            `yaml:"descriptor"`
-	Publish      bool              `yaml:"publish"`
+	Publish      *bool             `yaml:"publish"`
 	PullPolicy   string            `yaml:"pull_policy"`
-	TrustBuilder bool              `yaml:"trust_builder"`
+	TrustBuilder *bool             `yaml:"trust_builder"`
+}
+
+func (i ImageSpec) PullEnabled() bool {
+	return i.Pull != nil && *i.Pull
+}
+
+func (i ImageSpec) NoCacheEnabled() bool {
+	return i.NoCache != nil && *i.NoCache
 }
 
 func (b BuildpackConfig) Enabled() bool {
@@ -1963,9 +1971,17 @@ func (b BuildpackConfig) Enabled() bool {
 		len(b.Buildpacks) > 0 ||
 		len(b.Env) > 0 ||
 		strings.TrimSpace(b.Descriptor) != "" ||
-		b.Publish ||
+		b.PublishEnabled() ||
 		strings.TrimSpace(b.PullPolicy) != "" ||
-		b.TrustBuilder
+		b.TrustBuilderEnabled()
+}
+
+func (b BuildpackConfig) PublishEnabled() bool {
+	return b.Publish != nil && *b.Publish
+}
+
+func (b BuildpackConfig) TrustBuilderEnabled() bool {
+	return b.TrustBuilder != nil && *b.TrustBuilder
 }
 
 type BuildxFlag string
@@ -2170,7 +2186,7 @@ type Accessory struct {
 	Image          string            `yaml:"image"`
 	Command        string            `yaml:"command"`
 	Pool           string            `yaml:"pool"`
-	Primary        bool              `yaml:"primary"`
+	Primary        *bool             `yaml:"primary"`
 	Labels         map[string]string `yaml:"labels"`
 	NetworkAliases []string          `yaml:"network_aliases"`
 	Volumes        []string          `yaml:"volumes"`
@@ -2190,10 +2206,22 @@ type BackupSpec struct {
 	ExportCommand        string         `yaml:"export_command"`
 	RestoreCommand       string         `yaml:"restore_command"`
 	ArtifactDir          string         `yaml:"artifact_dir"`
-	Required             bool           `yaml:"required"`
-	RestoreCheck         bool           `yaml:"restore_check"`
+	Required             *bool          `yaml:"required"`
+	RestoreCheck         *bool          `yaml:"restore_check"`
 	ExportTimeoutSeconds int            `yaml:"export_timeout_seconds"`
 	Schedule             BackupSchedule `yaml:"schedule"`
+}
+
+func (a Accessory) IsPrimary() bool {
+	return a.Primary != nil && *a.Primary
+}
+
+func (b BackupSpec) BackupRequired() bool {
+	return b.Required != nil && *b.Required
+}
+
+func (b BackupSpec) RestoreCheckEnabled() bool {
+	return b.RestoreCheck != nil && *b.RestoreCheck
 }
 
 type BackupSchedule struct {
@@ -2595,10 +2623,10 @@ func validateServices(prefix string, services map[string]Service) []string {
 			if len(svc.Image.Platforms) > 0 {
 				errs = append(errs, fmt.Sprintf("%s image.platforms cannot be combined with image.buildpack", label))
 			}
-			if svc.Image.Pull {
+			if svc.Image.PullEnabled() {
 				errs = append(errs, fmt.Sprintf("%s image.pull cannot be combined with image.buildpack; use image.buildpack.pull_policy", label))
 			}
-			if svc.Image.NoCache {
+			if svc.Image.NoCacheEnabled() {
 				errs = append(errs, fmt.Sprintf("%s image.no_cache cannot be combined with image.buildpack", label))
 			}
 			if len(svc.Image.NoCacheFilter) > 0 {
@@ -2648,10 +2676,10 @@ func validateServices(prefix string, services map[string]Service) []string {
 			if len(svc.Image.Platforms) > 0 {
 				errs = append(errs, fmt.Sprintf("%s image.platforms requires image.build", label))
 			}
-			if svc.Image.Pull {
+			if svc.Image.PullEnabled() {
 				errs = append(errs, fmt.Sprintf("%s image.pull requires image.build", label))
 			}
-			if svc.Image.NoCache {
+			if svc.Image.NoCacheEnabled() {
 				errs = append(errs, fmt.Sprintf("%s image.no_cache requires image.build", label))
 			}
 			if len(svc.Image.NoCacheFilter) > 0 {
@@ -3238,7 +3266,7 @@ func validateAccessories(prefix string, accessories map[string]Accessory) []stri
 		if acc.Pool == "" {
 			errs = append(errs, fmt.Sprintf("%s pool is required", label))
 		}
-		if acc.Backup.Required && acc.Backup.Command == "" {
+		if acc.Backup.BackupRequired() && acc.Backup.Command == "" {
 			errs = append(errs, fmt.Sprintf("%s requires backup.command", label))
 		}
 		if strings.TrimSpace(acc.Backup.ExportCommand) != "" {
@@ -3266,7 +3294,7 @@ func validateAccessories(prefix string, accessories map[string]Accessory) []stri
 		if acc.Backup.Schedule.TimeoutSeconds < 0 {
 			errs = append(errs, fmt.Sprintf("%s backup.schedule.timeout_seconds cannot be negative", label))
 		}
-		if acc.Backup.RestoreCheck && !acc.Backup.Required {
+		if acc.Backup.RestoreCheckEnabled() && !acc.Backup.BackupRequired() {
 			errs = append(errs, fmt.Sprintf("%s backup.restore_check requires backup.required", label))
 		}
 		errs = append(errs, validateRestartPolicy(label+" restart_policy", acc.RestartPolicy)...)
@@ -3511,11 +3539,23 @@ func mergeService(base, override Service) Service {
 	out.Resources = mergeResourceConfig(base.Resources, override.Resources)
 	out.Runtime = mergeRuntimeConfig(base.Runtime, override.Runtime)
 	out.Rolling = mergeRollingConfig(base.Rolling, override.Rolling)
-	if strings.TrimSpace(override.Release.Command) != "" || override.Release.Replica > 0 || override.Release.TimeoutSeconds > 0 {
-		out.Release = override.Release
-	}
+	out.Release = mergeReleaseCommand(base.Release, override.Release)
 	if len(override.Schedules) > 0 {
 		out.Schedules = copySchedules(override.Schedules)
+	}
+	return out
+}
+
+func mergeReleaseCommand(base, override ReleaseCommand) ReleaseCommand {
+	out := base
+	if strings.TrimSpace(override.Command) != "" {
+		out.Command = override.Command
+	}
+	if override.Replica > 0 {
+		out.Replica = override.Replica
+	}
+	if override.TimeoutSeconds > 0 {
+		out.TimeoutSeconds = override.TimeoutSeconds
 	}
 	return out
 }
@@ -3531,8 +3571,8 @@ func mergeAccessory(base, override Accessory) Accessory {
 	if strings.TrimSpace(override.Pool) != "" {
 		out.Pool = override.Pool
 	}
-	if override.Primary {
-		out.Primary = override.Primary
+	if primary := override.Primary; primary != nil {
+		out.Primary = primary
 	}
 	if len(override.Labels) > 0 {
 		out.Labels = mergeStringMap(base.Labels, override.Labels)
@@ -3597,11 +3637,11 @@ func mergeImageSpec(base, override ImageSpec) ImageSpec {
 	if len(override.Platforms) > 0 {
 		out.Platforms = append([]string(nil), override.Platforms...)
 	}
-	if override.Pull {
-		out.Pull = override.Pull
+	if pull := override.Pull; pull != nil {
+		out.Pull = pull
 	}
-	if override.NoCache {
-		out.NoCache = override.NoCache
+	if noCache := override.NoCache; noCache != nil {
+		out.NoCache = noCache
 	}
 	if len(override.NoCacheFilter) > 0 {
 		out.NoCacheFilter = append([]string(nil), override.NoCacheFilter...)
@@ -3641,13 +3681,13 @@ func mergeBuildpackConfig(base, override BuildpackConfig) BuildpackConfig {
 	if strings.TrimSpace(override.Descriptor) != "" {
 		out.Descriptor = override.Descriptor
 	}
-	if override.Publish {
+	if override.Publish != nil {
 		out.Publish = override.Publish
 	}
 	if strings.TrimSpace(override.PullPolicy) != "" {
 		out.PullPolicy = override.PullPolicy
 	}
-	if override.TrustBuilder {
+	if override.TrustBuilder != nil {
 		out.TrustBuilder = override.TrustBuilder
 	}
 	return out
@@ -3776,17 +3816,26 @@ func mergeBackupSpec(base, override BackupSpec) BackupSpec {
 	if strings.TrimSpace(override.ArtifactDir) != "" {
 		out.ArtifactDir = override.ArtifactDir
 	}
-	if override.Required {
-		out.Required = override.Required
+	if required := override.Required; required != nil {
+		out.Required = required
 	}
-	if override.RestoreCheck {
-		out.RestoreCheck = override.RestoreCheck
+	if restoreCheck := override.RestoreCheck; restoreCheck != nil {
+		out.RestoreCheck = restoreCheck
 	}
 	if override.ExportTimeoutSeconds > 0 {
 		out.ExportTimeoutSeconds = override.ExportTimeoutSeconds
 	}
-	if strings.TrimSpace(override.Schedule.Cron) != "" || override.Schedule.TimeoutSeconds > 0 {
-		out.Schedule = override.Schedule
+	out.Schedule = mergeBackupSchedule(base.Schedule, override.Schedule)
+	return out
+}
+
+func mergeBackupSchedule(base, override BackupSchedule) BackupSchedule {
+	out := base
+	if strings.TrimSpace(override.Cron) != "" {
+		out.Cron = override.Cron
+	}
+	if override.TimeoutSeconds > 0 {
+		out.TimeoutSeconds = override.TimeoutSeconds
 	}
 	return out
 }

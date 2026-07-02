@@ -1239,9 +1239,9 @@ func TestPrepareDeployImagesPassesBuildpackOptions(t *testing.T) {
 							"BP_NODE_RUN_SCRIPTS": "build",
 						},
 						Descriptor:   "project.production.toml",
-						Publish:      true,
+						Publish:      boolPtr(true),
 						PullPolicy:   "if-not-present",
-						TrustBuilder: true,
+						TrustBuilder: boolPtr(true),
 					},
 				},
 			},
@@ -2800,8 +2800,8 @@ func TestRollbackBlockersDetectStatefulAccessories(t *testing.T) {
 	cfg := &config.Config{
 		Accessories: map[string]config.Accessory{
 			"cache":    {Image: "redis:7", Pool: "data"},
-			"postgres": {Image: "postgres:17", Pool: "data", Primary: true, Backup: config.BackupSpec{Required: true}},
-			"search":   {Image: "opensearch:2", Pool: "data", Backup: config.BackupSpec{Required: true}},
+			"postgres": {Image: "postgres:17", Pool: "data", Primary: boolPtr(true), Backup: config.BackupSpec{Required: boolPtr(true)}},
+			"search":   {Image: "opensearch:2", Pool: "data", Backup: config.BackupSpec{Required: boolPtr(true)}},
 		},
 	}
 	blockers := rollbackBlockers(cfg)
@@ -6530,4 +6530,8 @@ func TestStatusRequiresEnvironment(t *testing.T) {
 	if !strings.Contains(err.Error(), "missing environment") {
 		t.Fatalf("err = %v", err)
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

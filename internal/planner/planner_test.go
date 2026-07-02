@@ -54,9 +54,13 @@ func sampleConfig() *config.Config {
 			"postgres": {
 				Image:   "postgres:17",
 				Pool:    "worker",
-				Primary: true,
-				Backup:  config.BackupSpec{Command: "pg_dumpall", Required: true, RestoreCheck: true},
+				Primary: boolPtr(true),
+				Backup:  config.BackupSpec{Command: "pg_dumpall", Required: boolPtr(true), RestoreCheck: boolPtr(true)},
 			},
 		},
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

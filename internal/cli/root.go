@@ -2818,14 +2818,14 @@ func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Confi
 					Buildpacks:   svc.Image.Buildpack.Buildpacks,
 					Env:          svc.Image.Buildpack.Env,
 					Descriptor:   svc.Image.Buildpack.Descriptor,
-					Publish:      svc.Image.Buildpack.Publish,
+					Publish:      svc.Image.Buildpack.PublishEnabled(),
 					PullPolicy:   svc.Image.Buildpack.PullPolicy,
-					TrustBuilder: svc.Image.Buildpack.TrustBuilder,
+					TrustBuilder: svc.Image.Buildpack.TrustBuilderEnabled(),
 				},
 				Platform:      svc.Image.Platform,
 				Platforms:     svc.Image.Platforms,
-				Pull:          svc.Image.Pull,
-				NoCache:       svc.Image.NoCache,
+				Pull:          svc.Image.PullEnabled(),
+				NoCache:       svc.Image.NoCacheEnabled(),
 				NoCacheFilter: svc.Image.NoCacheFilter,
 				CacheFrom:     svc.Image.CacheFrom,
 				CacheTo:       svc.Image.CacheTo,
@@ -5295,11 +5295,11 @@ func rollbackBlockers(cfg *config.Config) []rollbackBlocker {
 	for _, name := range accessory.SortedNames(cfg, "") {
 		acc := cfg.Accessories[name]
 		switch {
-		case acc.Primary && acc.Backup.Required:
+		case acc.IsPrimary() && acc.Backup.BackupRequired():
 			blockers = append(blockers, rollbackBlocker{Accessory: name, Reason: "primary backup-required accessory"})
-		case acc.Primary:
+		case acc.IsPrimary():
 			blockers = append(blockers, rollbackBlocker{Accessory: name, Reason: "primary accessory"})
-		case acc.Backup.Required:
+		case acc.Backup.BackupRequired():
 			blockers = append(blockers, rollbackBlocker{Accessory: name, Reason: "backup-required accessory"})
 		}
 	}

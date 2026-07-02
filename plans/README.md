@@ -20,7 +20,7 @@ into a plan.
 |------|-------|----------|--------|------------|--------|
 | 001  | CI gates: gofmt, vet, race, govulncheck | P1 | S | — | DONE |
 | 002  | Atomic state/secrets file writes + hosts.json validation | P1 | S | — | DONE |
-| 003  | Env-override merge semantics (explicit false, sibling wipes) | P1 | M | in-flight config work committed; 001 recommended | TODO |
+| 003  | Env-override merge semantics (explicit false, sibling wipes) | P1 | M | in-flight config work committed; 001 recommended | DONE |
 | 004  | Secrets scoping contract tests | P2 | S | — | TODO |
 | 005  | SSH option overrides + ingress health path validation | P2 | S | — | TODO |
 

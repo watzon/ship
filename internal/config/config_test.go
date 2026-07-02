@@ -1740,8 +1740,8 @@ func TestValidateBuildOptionsRequireBuild(t *testing.T) {
 					Builder:   "ship\ncloud",
 					Platform:  "linux/amd64",
 					Platforms: []string{"linux/amd64", ""},
-					Pull:      true,
-					NoCache:   true,
+					Pull:      boolPtr(true),
+					NoCache:   boolPtr(true),
 					NoCacheFilter: []string{
 						"install",
 						"",
@@ -1814,8 +1814,8 @@ func TestValidateBuildpackImageOptions(t *testing.T) {
 					Builder:    "ship-cloud",
 					Platform:   "linux/amd64",
 					Platforms:  []string{"linux/arm64"},
-					Pull:       true,
-					NoCache:    true,
+					Pull:       boolPtr(true),
+					NoCache:    boolPtr(true),
 					NoCacheFilter: []string{
 						"install",
 					},
@@ -1841,7 +1841,7 @@ func TestValidateBuildpackImageOptions(t *testing.T) {
 				Pool:  "worker",
 				Scale: 1,
 				Image: ImageSpec{
-					Buildpack: BuildpackConfig{Publish: true},
+					Buildpack: BuildpackConfig{Publish: boolPtr(true)},
 				},
 			},
 		},
@@ -2862,7 +2862,7 @@ func TestValidateAccessoryBackupRequiredRequiresCommand(t *testing.T) {
 			"redis": {
 				Image:  "redis:7",
 				Pool:   "data",
-				Backup: BackupSpec{Required: true},
+				Backup: BackupSpec{Required: boolPtr(true)},
 			},
 		},
 	}
@@ -3031,6 +3031,175 @@ services:
 	}
 	if web.Ingress == nil || web.Ingress.Domains[0] != "staging.example.com" {
 		t.Fatalf("merged ingress = %+v", web.Ingress)
+	}
+}
+
+func TestResolveEnvironmentMergesPartialReleaseOverrides(t *testing.T) {
+	cfg, err := loadConfigText(t, `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.0.1]
+    services:
+      web:
+        release:
+          command: bin/release-staging
+
+services:
+  web:
+    image:
+      ref: example/web
+    pool: web
+    scale: 3
+    release:
+      command: bin/release
+      replica: 2
+      timeout_seconds: 30
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := resolved.Services["web"].Release
+	if release.Command != "bin/release-staging" || release.Replica != 2 || release.TimeoutSeconds != 30 {
+		t.Fatalf("merged release = %+v", release)
+	}
+}
+
+func TestResolveEnvironmentMergesPartialBackupScheduleOverrides(t *testing.T) {
+	cfg, err := loadConfigText(t, `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.0.1]
+        data:
+          hosts: [10.0.0.2]
+    accessories:
+      postgres:
+        backup:
+          schedule:
+            cron: "0 2 * * *"
+
+accessories:
+  postgres:
+    image: postgres:17
+    pool: data
+    backup:
+      command: pg_dumpall
+      schedule:
+        cron: "0 1 * * *"
+        timeout_seconds: 900
+
+services:
+  web:
+    image:
+      ref: example/web
+    pool: web
+    scale: 1
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule := resolved.Accessories["postgres"].Backup.Schedule
+	if schedule.Cron != "0 2 * * *" || schedule.TimeoutSeconds != 900 {
+		t.Fatalf("merged backup schedule = %+v", schedule)
+	}
+}
+
+func TestResolveEnvironmentOverridesBooleanFlagsToFalse(t *testing.T) {
+	cfg, err := loadConfigText(t, `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  production:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.0.1]
+        data:
+          hosts: [10.0.0.2]
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.1.1]
+        data:
+          hosts: [10.0.1.2]
+    services:
+      web:
+        image:
+          pull: false
+    accessories:
+      postgres:
+        primary: false
+        backup:
+          required: false
+
+services:
+  web:
+    image:
+      build: .
+      pull: true
+    pool: web
+    scale: 1
+
+accessories:
+  postgres:
+    image: postgres:17
+    pool: data
+    primary: true
+    backup:
+      command: pg_dumpall
+      required: true
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging, _, err := cfg.ResolveEnvironment("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staging.Services["web"].Image.PullEnabled() {
+		t.Fatalf("staging image.pull resolved true")
+	}
+	postgres := staging.Accessories["postgres"]
+	if postgres.IsPrimary() || postgres.Backup.BackupRequired() {
+		t.Fatalf("staging postgres = %+v", postgres)
+	}
+
+	production, _, err := cfg.ResolveEnvironment("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !production.Services["web"].Image.PullEnabled() {
+		t.Fatalf("production image.pull resolved false")
+	}
+	prodPostgres := production.Accessories["postgres"]
+	if !prodPostgres.IsPrimary() || !prodPostgres.Backup.BackupRequired() {
+		t.Fatalf("production postgres = %+v", prodPostgres)
 	}
 }
 
