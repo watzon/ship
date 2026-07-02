@@ -99,6 +99,72 @@ func TestSSHUsesConnectionOptions(t *testing.T) {
 	}
 }
 
+func TestSSHDefaultsEmittedWithoutOverrides(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\nprintf '%s\\n' \"$@\" >"+shellQuote(logPath)+"\n")
+	t.Setenv("PATH", dir)
+
+	if _, err := (SSH{User: "root", Host: "example.test"}).Run(context.Background(), "true"); err != nil {
+		t.Fatal(err)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(logged)
+	for _, want := range []string{
+		"BatchMode=yes",
+		"StrictHostKeyChecking=accept-new",
+		"ConnectTimeout=15",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("ssh args missing %q:\n%s", want, args)
+		}
+	}
+}
+
+func TestSSHOptionsOverrideDefaultConnectionOptions(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ssh.log")
+	writeExecutable(t, filepath.Join(dir, "ssh"), "#!/bin/sh\nprintf '%s\\n' \"$@\" >"+shellQuote(logPath)+"\n")
+	t.Setenv("PATH", dir)
+
+	_, err := (SSH{
+		User: "root",
+		Host: "example.test",
+		Options: map[string]string{
+			"StrictHostKeyChecking": "yes",
+			"connecttimeout":        "30",
+		},
+	}).Run(context.Background(), "true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(logged)
+	for _, want := range []string{
+		"BatchMode=yes",
+		"StrictHostKeyChecking=yes",
+		"connecttimeout=30",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("ssh args missing %q:\n%s", want, args)
+		}
+	}
+	for _, unexpected := range []string{
+		"StrictHostKeyChecking=accept-new",
+		"ConnectTimeout=15",
+	} {
+		if strings.Contains(args, unexpected) {
+			t.Fatalf("ssh args included overridden default %q:\n%s", unexpected, args)
+		}
+	}
+}
+
 func writeExecutable(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
