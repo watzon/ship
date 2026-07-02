@@ -1192,6 +1192,9 @@ func stopCandidates(cfg *config.Config, envName string, observed []ObservedConta
 		if !matchesShipScope(cfg, envName, labels) {
 			continue
 		}
+		if labels[docker.LabelService] == "" || labels[docker.LabelAccessory] != "" {
+			continue
+		}
 		if _, desired := desiredNames[item.Container.Names]; desired {
 			continue
 		}

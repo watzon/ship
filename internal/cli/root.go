@@ -1789,6 +1789,49 @@ func remoteCurrentRelease(ctx context.Context, hosts []scheduler.Host, envName s
 	return nil, warnings, nil
 }
 
+func currentReleaseForServiceMutation(ctx context.Context, cfg *config.Config, envName string, store state.Store, hosts []scheduler.Host) (state.Release, error) {
+	var local state.Release
+	var localErr error
+	localID := ""
+	if release, err := store.CurrentRelease(envName); err == nil {
+		local = release
+		localID = release.ID
+	} else {
+		localErr = err
+	}
+
+	observed, err := deployment.InspectObservedOnHosts(ctx, hosts, deploymentAgentFactory())
+	if err != nil {
+		return state.Release{}, fmt.Errorf("determine current release for %q: %w", envName, err)
+	}
+	runningReleases := observedRunningServiceReleases(cfg, envName, observed)
+	if localErr != nil && len(runningReleases) == 0 {
+		return state.Release{}, localErr
+	}
+	if !shouldUseRemoteReleaseState(localID, cfg, envName, observed) {
+		if localErr == nil {
+			return local, nil
+		}
+		return state.Release{}, localErr
+	}
+
+	remote, warnings, err := remoteCurrentRelease(ctx, hosts, envName)
+	if err != nil {
+		return state.Release{}, fmt.Errorf("determine current release for %q from host state: %w", envName, err)
+	}
+	if remote != nil {
+		return *remote, nil
+	}
+	detail := "host release state is unavailable"
+	if len(warnings) > 0 {
+		detail = strings.Join(warnings, "; ")
+	}
+	if localID != "" {
+		return state.Release{}, fmt.Errorf("could not determine current release for %q: local release %s is not running and %s", envName, localID, detail)
+	}
+	return state.Release{}, fmt.Errorf("could not determine current release for %q: %s", envName, detail)
+}
+
 func renderStatusText(w io.Writer, view statusView) {
 	var fields []ui.HeaderField
 	if view.CurrentRelease == nil {
@@ -4652,7 +4695,7 @@ func restartCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			release, err := store.CurrentRelease(envName)
+			release, err := currentReleaseForServiceMutation(cmd.Context(), cfg, envName, store, hosts)
 			if err != nil {
 				return err
 			}
@@ -4801,7 +4844,7 @@ func countChangedAccessories(results []accessoryEnsureResult) int {
 }
 
 func restartCurrentServicesAfterAccessoryChange(ctx context.Context, w io.Writer, cfg *config.Config, envName string, store state.Store, hosts []scheduler.Host) error {
-	release, err := store.CurrentRelease(envName)
+	release, err := currentReleaseForServiceMutation(ctx, cfg, envName, store, hosts)
 	if err != nil {
 		if strings.Contains(err.Error(), "no current release") {
 			return nil
