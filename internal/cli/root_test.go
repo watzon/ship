@@ -2212,6 +2212,40 @@ func TestDeployStopsFixedPortOldBeforeStartAndPromotesHealthyRelease(t *testing.
 	}
 }
 
+func TestDeployFromEmptyStateDoesNotStopConfiguredLiveAccessory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployWithAccessoryConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	observed := []docker.ContainerSummary{accessoryContainer("redis", "web-1", "Up 2 minutes")}
+	fakeDocker := &recordingDeployDocker{events: &events}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		return &scriptedDeployAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(events, "\n")
+	accessoryName := accessorypkg.ContainerName("demo", "production", "redis")
+	if strings.Contains(joined, "stop:"+accessoryName) {
+		t.Fatalf("deploy stopped configured accessory from empty local state:\n%s", joined)
+	}
+	if strings.Contains(joined, "run:"+accessoryName) || strings.Contains(joined, "pull:redis:7-alpine") {
+		t.Fatalf("deploy recreated already-running accessory:\n%s", joined)
+	}
+	if !strings.Contains(joined, "agent:web-1:run:ship_demo_production_web_1_abc123def456-20260630T183456.123456789Z") {
+		t.Fatalf("deploy did not roll service:\n%s", joined)
+	}
+}
+
 func TestDeployFailedPullMarksReleaseFailedAndKeepsCurrent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -4321,7 +4355,102 @@ func TestRestartRecreatesCurrentReleaseReplicaAndRecordsEvents(t *testing.T) {
 	}
 }
 
-func TestRestartDryRunDoesNotTouchAgents(t *testing.T) {
+func TestRestartUsesRemoteCurrentReleaseWhenLocalStateIsStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-old",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("0", 64)},
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := state.Release{
+		ID:          "release-new",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
+		CreatedAt:   time.Unix(20, 0),
+		Healthy:     true,
+		Status:      state.ReleaseStatusHealthy,
+	}
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds")},
+		"web-2": {serviceContainer("web-2", "web", 2, "release-new", "Up 10 seconds")},
+	}
+
+	var events []string
+	var runs []agent.RunContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &restartDeployAgent{host: host.Name, events: &events, observed: observed, current: &remote, runs: &runs}
+	})
+
+	var out bytes.Buffer
+	cmd := restartCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "web", "--replica", "1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 1, "release-new")
+	if len(runs) != 1 || runs[0].Name != wantName || runs[0].Image != remote.Images["web"] {
+		t.Fatalf("restart runs = %+v", runs)
+	}
+	joined := strings.Join(events, "\n")
+	if !strings.Contains(joined, "agent:web-1:read_release_state") || !strings.Contains(joined, "agent:web-2:read_release_state") {
+		t.Fatalf("remote release state was not read:\n%s", joined)
+	}
+	if strings.Contains(joined, "release-old") || strings.Contains(out.String(), "release-old") {
+		t.Fatalf("restart used stale local release:\nevents=%s\nout=%s", joined, out.String())
+	}
+}
+
+func TestRestartStaleLocalReleaseFailsBeforeRunWhenRemoteCurrentUnknown(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-old",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("0", 64)},
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds")},
+	}
+
+	var events []string
+	var runs []agent.RunContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &restartDeployAgent{host: host.Name, events: &events, observed: observed, runs: &runs}
+	})
+
+	cmd := restartCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production", "web", "--replica", "1"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "could not determine current release") {
+		t.Fatalf("expected current release resolution error, got %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("restart ran containers despite unknown current release: %+v", runs)
+	}
+	if strings.Contains(strings.Join(events, "\n"), ":run:") {
+		t.Fatalf("restart mutated agents despite unknown current release: %#v", events)
+	}
+}
+
+func TestRestartDryRunInspectsStateWithoutMutatingAgents(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
 	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
@@ -4345,8 +4474,12 @@ func TestRestartDryRunDoesNotTouchAgents(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 0 {
-		t.Fatalf("dry-run restart touched agents: %#v", events)
+	joined := strings.Join(events, "\n")
+	if !strings.Contains(joined, "agent:web-1:list_ship_containers") || !strings.Contains(joined, "agent:web-2:list_ship_containers") {
+		t.Fatalf("dry-run restart did not inspect observed state: %#v", events)
+	}
+	if strings.Contains(joined, ":run:") || strings.Contains(joined, ":health_check:") {
+		t.Fatalf("dry-run restart mutated agents: %#v", events)
 	}
 	if !strings.Contains(out.String(), "would restart "+deployment.ContainerName("demo", "production", "web", 1, "release-1")) ||
 		!strings.Contains(out.String(), "would restart "+deployment.ContainerName("demo", "production", "web", 2, "release-1")) {
@@ -4662,6 +4795,8 @@ func TestAccessoryDeployPersistsPlacementAndRunsOneContainer(t *testing.T) {
 		"agent:data-a:pull:postgres:17",
 		"agent:data-a:ensure_volume:postgres-data:999:999",
 		"agent:data-a:run:ship_demo_production_accessory_postgres:postgres:17",
+		"agent:data-a:list_ship_containers",
+		"agent:data-b:list_ship_containers",
 	}
 	if strings.Join(events, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("events = %#v, want %#v", events, want)
@@ -4740,6 +4875,58 @@ func TestAccessoryDeployRestartsCurrentServicesAfterRecreate(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "restarted ship_demo_production_web_1_release-1 on web-1 after accessory change") {
 		t.Fatalf("output missing dependent restart:\n%s", out.String())
+	}
+}
+
+func TestAccessoryDeployRestartsRemoteCurrentReleaseWhenLocalStateIsStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployWithAccessoryConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-old",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("0", 64)},
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := state.Release{
+		ID:          "release-new",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
+		CreatedAt:   time.Unix(20, 0),
+		Healthy:     true,
+		Status:      state.ReleaseStatusHealthy,
+	}
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds")},
+	}
+
+	var events []string
+	installAccessoryHooks(t, func(host scheduler.Host) deployAgent {
+		return &scriptedAccessoryAgent{host: host.Name, events: &events, observed: observed, current: &remote}
+	})
+
+	var out bytes.Buffer
+	cmd := accessoryCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"deploy", "production", "redis"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(events, "\n")
+	if !strings.Contains(joined, "agent:web-1:read_release_state") {
+		t.Fatalf("remote release state was not read:\n%s", joined)
+	}
+	if !strings.Contains(joined, "agent:web-1:run:ship_demo_production_web_1_release-new:registry.local/acme/web@sha256:") {
+		t.Fatalf("dependent restart did not use remote current release:\n%s", joined)
+	}
+	if strings.Contains(joined, "ship_demo_production_web_1_release-old") || strings.Contains(out.String(), "release-old") {
+		t.Fatalf("accessory deploy used stale local release:\nevents=%s\nout=%s", joined, out.String())
 	}
 }
 
@@ -4924,6 +5111,8 @@ func TestAccessoryDeployWritesRemoteSecretFile(t *testing.T) {
 		"agent:data-a:pull:postgres:17",
 		"agent:data-a:ensure_volume:postgres-data:999:999",
 		"agent:data-a:run:ship_demo_production_accessory_postgres:postgres:17",
+		"agent:data-a:list_ship_containers",
+		"agent:data-b:list_ship_containers",
 	}
 	if strings.Join(events, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("events = %#v, want %#v", events, want)
@@ -6355,6 +6544,7 @@ type scriptedAccessoryAgent struct {
 	host       string
 	events     *[]string
 	observed   map[string][]docker.ContainerSummary
+	current    *state.Release
 	runs       *[]agent.RunContainerParams
 	writes     *[]agent.WriteFileParams
 	logCalls   *[]agent.LogsParams
@@ -6368,6 +6558,13 @@ func (s *scriptedAccessoryAgent) Call(ctx context.Context, method string, params
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:list_ship_containers", s.host))
 		if containers, ok := out.(*[]docker.ContainerSummary); ok {
 			*containers = append([]docker.ContainerSummary(nil), s.observed[s.host]...)
+		}
+	case "read_release_state":
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:read_release_state", s.host))
+		if s.current != nil {
+			if release, ok := out.(*state.Release); ok {
+				*release = *s.current
+			}
 		}
 	case "pull":
 		image := params.(map[string]string)["image"]
@@ -6643,13 +6840,27 @@ func (r recordingDeployAgent) Call(ctx context.Context, method string, params an
 }
 
 type restartDeployAgent struct {
-	host   string
-	events *[]string
-	runs   *[]agent.RunContainerParams
+	host     string
+	events   *[]string
+	observed map[string][]docker.ContainerSummary
+	current  *state.Release
+	runs     *[]agent.RunContainerParams
 }
 
 func (r *restartDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
+	case "list_ship_containers":
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:list_ship_containers", r.host))
+		if containers, ok := out.(*[]docker.ContainerSummary); ok {
+			*containers = append([]docker.ContainerSummary(nil), r.observed[r.host]...)
+		}
+	case "read_release_state":
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:read_release_state", r.host))
+		if r.current != nil {
+			if release, ok := out.(*state.Release); ok {
+				*release = *r.current
+			}
+		}
 	case "ensure_network":
 		return nil
 	case "run_container":
