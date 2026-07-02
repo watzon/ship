@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/agent"
+	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"

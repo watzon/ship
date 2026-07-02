@@ -7,8 +7,8 @@ import (
 )
 
 type HeaderField struct {
-	Label string
-	Value string
+	Label  string
+	Value  string
 	Accent bool
 }
 
