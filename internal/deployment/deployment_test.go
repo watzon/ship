@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1219,6 +1220,13 @@ func (f *fixedPortAgent) Call(ctx context.Context, method string, params any, ou
 	switch method {
 	case "pull":
 		f.events = append(f.events, "pull")
+	case "run_oneoff_container", "write_file", "ensure_network":
+		return nil
+	case "docker_inspect":
+		if result, ok := out.(*agent.DockerInspectResult); ok {
+			result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+		}
+		return nil
 	case "run_container":
 		p := params.(agent.RunContainerParams)
 		f.events = append(f.events, "run_container:"+p.Name)
@@ -1267,13 +1275,21 @@ func (f *ingressAgent) Call(ctx context.Context, method string, params any, out 
 	case "write_file":
 		p := params.(agent.WriteFileParams)
 		f.reloads = append(f.reloads, p.Content)
-		f.validated = append(f.validated, true)
 		f.clears = append(f.clears, strings.TrimSpace(p.Content) == "")
+	case "run_oneoff_container":
+		f.validated = append(f.validated, true)
+		if f.failReload {
+			return fmt.Errorf("validate failed on %s", f.host)
+		}
 	case "run_container":
 		if f.failReload {
 			return fmt.Errorf("reload failed on %s", f.host)
 		}
 		f.runs = append(f.runs, params.(agent.RunContainerParams))
+	case "docker_inspect":
+		if result, ok := out.(*agent.DockerInspectResult); ok {
+			result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+		}
 	case "ensure_network":
 		return nil
 	case "caddy_reload":

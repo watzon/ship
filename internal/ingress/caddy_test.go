@@ -16,12 +16,14 @@ func TestGenerateCaddyfile(t *testing.T) {
 			Ingress: &config.Ingress{Domains: []string{"example.com"}},
 		},
 	}}
-	file := GenerateCaddyfile(cfg, []scheduler.Placement{
+	file := GenerateCaddyfile(cfg, nil, []scheduler.Placement{
 		{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}},
 		{Service: "web", Replica: 2, Host: scheduler.Host{Name: "web-2"}},
 	})
 	for _, needle := range []string{
 		"example.com {",
+		"handle /_ship/health {",
+		"respond \"ok\" 200",
 		"reverse_proxy web-1:3000 web-2:3000",
 		"lb_policy round_robin",
 		"lb_try_duration 5s",
@@ -58,7 +60,7 @@ func TestGenerateCaddyfileUsesConfiguredProxyHealth(t *testing.T) {
 			},
 		},
 	}}
-	file := GenerateCaddyfile(cfg, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
+	file := GenerateCaddyfile(cfg, nil, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
 	for _, needle := range []string{
 		"lb_try_duration 4s",
 		"fail_duration 12s",
@@ -88,7 +90,7 @@ func TestGenerateCaddyfileCanDisableProxyHealth(t *testing.T) {
 			},
 		},
 	}}
-	file := GenerateCaddyfile(cfg, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
+	file := GenerateCaddyfile(cfg, nil, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
 	for _, unexpected := range []string{"health_uri", "fail_duration", "unhealthy_status", "lb_try_duration"} {
 		if strings.Contains(file, unexpected) {
 			t.Fatalf("unexpected %q:\n%s", unexpected, file)
@@ -109,10 +111,10 @@ func TestGenerateCaddyfileIncludesIngressRedirects(t *testing.T) {
 			},
 		},
 	}}
-	file := GenerateCaddyfile(cfg, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
+	file := GenerateCaddyfile(cfg, nil, []scheduler.Placement{{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1"}}})
 	for _, needle := range []string{
 		"example.com {",
-		"reverse_proxy web-1:3000",
+		"reverse_proxy web:3000",
 		"legacy.example.com, old.example.com {",
 		"redir https://example.com/new{uri} 301",
 		"www.example.com {",
@@ -144,14 +146,15 @@ func TestGenerateCaddyfileCanDisableRedirectURIPreservation(t *testing.T) {
 	}
 }
 
-func TestGenerateCaddyfileUsesHostContactForUpstreams(t *testing.T) {
+func TestGenerateCaddyfileUsesHostContactForDedicatedIngress(t *testing.T) {
 	cfg := &config.Config{Services: map[string]config.Service{
 		"web": {
 			Ports:   []int{3000},
 			Ingress: &config.Ingress{Domains: []string{"example.com"}},
 		},
 	}}
-	file := GenerateCaddyfile(cfg, []scheduler.Placement{
+	ingressHosts := []scheduler.Host{{Name: "ingress-1", Pool: "ingress"}}
+	file := GenerateCaddyfile(cfg, ingressHosts, []scheduler.Placement{
 		{Service: "web", Replica: 1, Host: scheduler.Host{Name: "web-1", Contact: "198.51.100.10"}},
 	})
 	if !strings.Contains(file, "reverse_proxy 198.51.100.10:3000") {
@@ -159,6 +162,25 @@ func TestGenerateCaddyfileUsesHostContactForUpstreams(t *testing.T) {
 	}
 	if strings.Contains(file, "web-1:3000") {
 		t.Fatalf("logical host name leaked into upstream:\n%s", file)
+	}
+}
+
+func TestGenerateCaddyfileUsesServiceNameForCoLocatedIngress(t *testing.T) {
+	cfg := &config.Config{Services: map[string]config.Service{
+		"web": {
+			Ports:   []int{4185},
+			Ingress: &config.Ingress{Domains: []string{"api.example.com"}},
+		},
+	}}
+	host := scheduler.Host{Name: "npxray-staging", Pool: "web", Contact: "npxray-staging"}
+	file := GenerateCaddyfile(cfg, []scheduler.Host{host}, []scheduler.Placement{
+		{Service: "web", Replica: 1, Host: host},
+	})
+	if !strings.Contains(file, "reverse_proxy web:4185") {
+		t.Fatalf("docker service alias upstream missing:\n%s", file)
+	}
+	if strings.Contains(file, "npxray-staging:4185") {
+		t.Fatalf("ssh host alias leaked into upstream:\n%s", file)
 	}
 }
 

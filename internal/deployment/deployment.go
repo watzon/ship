@@ -2,6 +2,7 @@ package deployment
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -277,7 +278,7 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		stateDir = config.LocalStateDir
 	}
 	ingressPath := filepath.Join(stateDir, "ingress", input.EnvName+".Caddyfile")
-	caddyfile := ingress.GenerateCaddyfile(input.Config, placements)
+	caddyfile := ingress.GenerateCaddyfile(input.Config, inputHosts(input.Environment, input.Hosts), placements)
 	if strings.TrimSpace(caddyfile) != "" {
 		actions = append(actions, Action{
 			Kind:              ActionIngress,
@@ -677,6 +678,9 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 	if err := ensureNetwork(ctx, client, action); err != nil {
 		return err
 	}
+	if err := validateCaddyfile(ctx, client, remotePath, image); err != nil {
+		return err
+	}
 	args := []string{
 		"--restart", config.DefaultRestartPolicy,
 		"-p", "80:80",
@@ -686,14 +690,76 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 		"-v", dataVolume + ":/data",
 		"-v", configVolume + ":/config",
 	}
-	return client.Call(ctx, "run_container", agent.RunContainerParams{
+	if err := client.Call(ctx, "run_container", agent.RunContainerParams{
 		Name:    name,
 		Image:   image,
 		Command: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile",
 		Args:    args,
 		Labels:  action.CaddyLabels,
 		Network: action.Network,
+	}, nil); err != nil {
+		return err
+	}
+	return waitForCaddyContainer(ctx, client, name)
+}
+
+const caddyValidateTimeoutSeconds = 30
+const caddyStartupGraceSeconds = 5
+
+func validateCaddyfile(ctx context.Context, client Agent, remotePath, image string) error {
+	validateName := "ship_caddy_validate_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	return client.Call(ctx, "run_oneoff_container", agent.RunOneOffContainerParams{
+		Name:           validateName,
+		Image:          image,
+		Command:        "caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile",
+		Args:           []string{"-v", remotePath + ":/etc/caddy/Caddyfile:ro"},
+		TimeoutSeconds: caddyValidateTimeoutSeconds,
 	}, nil)
+}
+
+func waitForCaddyContainer(ctx context.Context, client Agent, name string) error {
+	deadline := time.Now().Add(caddyStartupGraceSeconds * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		var result agent.DockerInspectResult
+		err := client.Call(ctx, "docker_inspect", agent.DockerInspectParams{Name: name}, &result)
+		if err != nil {
+			lastErr = err
+		} else if running, err := containerRunning(result.Inspect); err != nil {
+			lastErr = err
+		} else if running {
+			return nil
+		} else {
+			lastErr = fmt.Errorf("container %q is not running", name)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for caddy container %q: %w", name, ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("container %q did not start", name)
+	}
+	return fmt.Errorf("caddy container failed to stay running: %w", lastErr)
+}
+
+func containerRunning(inspect json.RawMessage) (bool, error) {
+	var items []struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if len(inspect) == 0 {
+		return false, errors.New("inspect payload is empty")
+	}
+	if err := json.Unmarshal(inspect, &items); err != nil {
+		return false, err
+	}
+	if len(items) == 0 {
+		return false, errors.New("inspect payload is empty")
+	}
+	return items[0].State.Running, nil
 }
 
 func ensureNetwork(ctx context.Context, client Agent, action Action) error {

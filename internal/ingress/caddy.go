@@ -36,11 +36,13 @@ type redirectBlock struct {
 	Code    int
 }
 
-func GenerateCaddyfile(cfg *config.Config, placements []scheduler.Placement) string {
-	return GenerateCaddyfileFromReplicas(cfg, ReplicasFromPlacements(cfg, placements))
+func GenerateCaddyfile(cfg *config.Config, hosts []scheduler.Host, placements []scheduler.Placement) string {
+	ingressHosts := HostsFor(cfg, hosts, placements)
+	return GenerateCaddyfileFromReplicas(cfg, ReplicasFromPlacements(cfg, placements, ingressHosts))
 }
 
-func ReplicasFromPlacements(cfg *config.Config, placements []scheduler.Placement) []Replica {
+func ReplicasFromPlacements(cfg *config.Config, placements []scheduler.Placement, ingressHosts []scheduler.Host) []Replica {
+	dockerUpstream := dockerUpstreamServices(cfg, placements, ingressHosts)
 	var replicas []Replica
 	for _, placement := range placements {
 		svc := cfg.Services[placement.Service]
@@ -49,11 +51,55 @@ func ReplicasFromPlacements(cfg *config.Config, placements []scheduler.Placement
 		}
 		replicas = append(replicas, Replica{
 			Service: placement.Service,
-			Host:    placement.Host.ContactTarget(),
+			Host:    upstreamHost(placement, dockerUpstream[placement.Service]),
 			Port:    svc.Ports[0],
 		})
 	}
 	return replicas
+}
+
+func dockerUpstreamServices(cfg *config.Config, placements []scheduler.Placement, ingressHosts []scheduler.Host) map[string]bool {
+	coLocated := ingressHostNames(ingressHosts)
+	hostsByService := map[string]map[string]struct{}{}
+	for _, placement := range placements {
+		svc := cfg.Services[placement.Service]
+		if svc.Ingress == nil || len(svc.Ingress.Domains) == 0 || len(svc.Ports) == 0 {
+			continue
+		}
+		if hostsByService[placement.Service] == nil {
+			hostsByService[placement.Service] = map[string]struct{}{}
+		}
+		hostsByService[placement.Service][placement.Host.Name] = struct{}{}
+	}
+	out := map[string]bool{}
+	for serviceName, hostNames := range hostsByService {
+		if len(hostNames) != 1 {
+			continue
+		}
+		var hostName string
+		for name := range hostNames {
+			hostName = name
+		}
+		if _, ok := coLocated[hostName]; ok {
+			out[serviceName] = true
+		}
+	}
+	return out
+}
+
+func ingressHostNames(hosts []scheduler.Host) map[string]struct{} {
+	names := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		names[host.Name] = struct{}{}
+	}
+	return names
+}
+
+func upstreamHost(placement scheduler.Placement, useDocker bool) string {
+	if useDocker {
+		return placement.Service
+	}
+	return placement.Host.ContactTarget()
 }
 
 func GenerateCaddyfileFromReplicas(cfg *config.Config, replicas []Replica) string {
@@ -100,7 +146,9 @@ func GenerateCaddyfileFromReplicas(cfg *config.Config, replicas []Replica) strin
 		fmt.Fprintf(&b, "%s {\n", strings.Join(domains, ", "))
 		b.WriteString("  encode zstd gzip\n")
 		if svc.Health.HTTP != "" {
-			fmt.Fprintf(&b, "  handle /_ship/health { respond \"ok\" 200 }\n")
+			b.WriteString("  handle /_ship/health {\n")
+			b.WriteString("    respond \"ok\" 200\n")
+			b.WriteString("  }\n")
 		}
 		b.WriteString("  reverse_proxy")
 		for _, upstream := range upstreams[serviceName] {

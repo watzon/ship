@@ -134,10 +134,19 @@ func RenderForEnv(cfg *config.Config, opts SourceOptions) (RenderedEnvFile, erro
 	return renderEnvFileFromValues(names, values)
 }
 
-func RenderScopedForEnv(cfg *config.Config, opts SourceOptions) (ScopedRenderedEnvFiles, error) {
+func RenderScopedForEnv(cfg *config.Config, opts SourceOptions, onlyScopes ...string) (ScopedRenderedEnvFiles, error) {
 	scopes, err := RequiredScopes(cfg)
 	if err != nil {
 		return ScopedRenderedEnvFiles{}, err
+	}
+	if len(onlyScopes) > 0 {
+		filtered := map[string][]string{}
+		for _, scope := range onlyScopes {
+			if names, ok := scopes[scope]; ok {
+				filtered[scope] = names
+			}
+		}
+		scopes = filtered
 	}
 	allNames := map[string]struct{}{}
 	for _, names := range scopes {
@@ -251,12 +260,8 @@ func RequiredScopes(cfg *config.Config) (map[string][]string, error) {
 	if cfg == nil {
 		return scopes, nil
 	}
-	shared, err := RequiredNames(cfg)
-	if err != nil {
-		return nil, err
-	}
 	for serviceName, svc := range cfg.Services {
-		names, err := mergeSecretNames(shared, svc.Secrets)
+		names, err := mergeSecretNames(svc.Secrets)
 		if err != nil {
 			return nil, err
 		}
@@ -265,7 +270,7 @@ func RequiredScopes(cfg *config.Config) (map[string][]string, error) {
 		}
 	}
 	for accessoryName, acc := range cfg.Accessories {
-		names, err := mergeSecretNames(shared, acc.Secrets)
+		names, err := mergeSecretNames(acc.Secrets)
 		if err != nil {
 			return nil, err
 		}

@@ -58,6 +58,7 @@ type RemoteRunner interface {
 
 type Options struct {
 	ConfigPath   string
+	Environment  string
 	Docker       Docker
 	SSHAvailable func(context.Context) error
 	Remote       RemoteRunner
@@ -148,7 +149,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) Report {
 	checks = append(checks, providerCredentialChecks(cfg, opts.LookupEnv, opts.ProviderFor)...)
 	checks = append(checks, secretChecks(cfg)...)
 	checks = append(checks, buildPathChecks(cfg, opts.ConfigPath)...)
-	checks = append(checks, remoteChecks(ctx, cfg, opts.ConfigPath, opts.Remote)...)
+	checks = append(checks, remoteChecks(ctx, cfg, opts.ConfigPath, opts.Environment, opts.Remote)...)
 
 	return NewReport(checks)
 }
@@ -258,8 +259,8 @@ func pathCheck(name, path string, wantDir bool) Check {
 	return Check{Name: name, Status: StatusPass, Message: "found", Details: map[string]string{"path": path}}
 }
 
-func remoteChecks(ctx context.Context, cfg *config.Config, configPath string, runner RemoteRunner) []Check {
-	hosts, diagnostics := remoteHosts(cfg, configPath)
+func remoteChecks(ctx context.Context, cfg *config.Config, configPath string, envName string, runner RemoteRunner) []Check {
+	hosts, diagnostics := remoteHosts(cfg, configPath, envName)
 	checks := append([]Check(nil), diagnostics...)
 	if len(hosts) == 0 {
 		return append(checks, warn("remote hosts", "no explicit or provisioned hosts configured; remote checks skipped"))
@@ -331,11 +332,18 @@ type remoteHost struct {
 	Host        scheduler.Host
 }
 
-func remoteHosts(cfg *config.Config, configPath string) ([]remoteHost, []Check) {
+func remoteHosts(cfg *config.Config, configPath string, onlyEnv string) ([]remoteHost, []Check) {
 	store := state.NewStore(localStateDir(configPath))
 	var hosts []remoteHost
 	var diagnostics []Check
-	for _, envName := range sortedEnvironmentNames(cfg) {
+	envNames := sortedEnvironmentNames(cfg)
+	if strings.TrimSpace(onlyEnv) != "" {
+		if _, ok := cfg.Environments[onlyEnv]; !ok {
+			return nil, []Check{fail("remote hosts:"+onlyEnv, fmt.Sprintf("environment %q is not configured", onlyEnv))}
+		}
+		envNames = []string{onlyEnv}
+	}
+	for _, envName := range envNames {
 		env := cfg.Environments[envName]
 		resolved, ok, err := provisionedHosts(store, envName, env)
 		if err != nil {
@@ -348,7 +356,21 @@ func remoteHosts(cfg *config.Config, configPath string) ([]remoteHost, []Check) 
 		}
 		hosts = append(hosts, explicitHostsForEnvironment(envName, env)...)
 	}
-	return hosts, diagnostics
+	return dedupeRemoteHosts(hosts), diagnostics
+}
+
+func dedupeRemoteHosts(hosts []remoteHost) []remoteHost {
+	seen := map[string]struct{}{}
+	out := make([]remoteHost, 0, len(hosts))
+	for _, host := range hosts {
+		key := host.Environment + "\x00" + host.Host.User + "\x00" + host.Host.ContactTarget()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, host)
+	}
+	return out
 }
 
 func provisionedHosts(store state.Store, envName string, env config.Environment) ([]remoteHost, bool, error) {
