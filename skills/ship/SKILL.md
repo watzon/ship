@@ -23,10 +23,56 @@ Repo docs live in `docs/`. This skill is the agent playbook for setup, migration
 
 ## Install
 
+Requires Go 1.26+ for `go install`, and Docker on the machine that runs deploys.
+
+### Option A: `go install` (recommended for dev and CI)
+
 ```bash
-go install ./cmd/ship   # from the Ship repo
-# or install a release binary, then:
+go install github.com/watzon/ship/cmd/ship@latest
+```
+
+Pin a branch or tag instead of floating on `@latest`:
+
+```bash
+go install github.com/watzon/ship/cmd/ship@main
+go install github.com/watzon/ship/cmd/ship@v0.1.0
+```
+
+From a Ship repo clone:
+
+```bash
+git clone https://github.com/watzon/ship.git
+cd ship
+go install ./cmd/ship
+```
+
+Ensure `$(go env GOPATH)/bin` is on your `PATH` (or set `GOBIN`).
+
+### Option B: release binary
+
+Download a published asset from [GitHub Releases](https://github.com/watzon/ship/releases). Archives are named `ship_<version>_<os>_<arch>.tar.gz` for `linux`/`darwin` × `amd64`/`arm64`.
+
+```bash
+VERSION=v0.1.0                          # release tag
+VER="${VERSION#v}"                      # filename uses version without v prefix
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
+
+curl -fsSL -o ship.tar.gz \
+  "https://github.com/watzon/ship/releases/download/${VERSION}/ship_${VER}_${OS}_${ARCH}.tar.gz"
+tar -xzf ship.tar.gz ship
+install -m 755 ship ~/.local/bin/ship   # or sudo install to /usr/local/bin
+rm ship ship.tar.gz
+```
+
+Use a release that publishes assets for your local OS/arch before relying on `ship agent upgrade` from a release install (Ship downloads matching release binaries for remote hosts when cross-compile is unavailable).
+
+### Verify
+
+```bash
 ship --help
+ship version
 ```
 
 ## First-time setup workflow
