@@ -1119,6 +1119,92 @@ func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 	}
 }
 
+func TestDeployEnsuresMissingAccessoryBeforeRollout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployWithAccessoryConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	fakeDocker := &recordingDeployDocker{events: &events}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(events, "\n")
+	for _, needle := range []string{
+		"agent:web-1:pull:redis:7-alpine",
+		"agent:web-1:run:redis:7-alpine",
+		"agent:web-1:pull:registry.local/acme/web:stable@sha256:",
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("events missing %q:\n%s", needle, joined)
+		}
+	}
+	if strings.Index(joined, "agent:web-1:run:redis:7-alpine") > strings.Index(joined, "agent:web-1:pull:registry.local/acme/web:stable@sha256:") {
+		t.Fatalf("accessory was not ensured before service rollout:\n%s", joined)
+	}
+	if !strings.Contains(out.String(), "ensured accessory redis on web-1") {
+		t.Fatalf("output missing accessory ensure:\n%s", out.String())
+	}
+}
+
+func TestDeploySkipsAlreadyRunningAccessory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployWithAccessoryConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	containerName := accessorypkg.ContainerName("demo", "production", "redis")
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {{
+			Names:  containerName,
+			Image:  "redis:7-alpine",
+			Status: "Up 10 minutes",
+			Labels: map[string]string{
+				docker.LabelManagedBy:   docker.LabelManagedByValue,
+				docker.LabelProject:     "demo",
+				docker.LabelEnvironment: "production",
+				docker.LabelAccessory:   "redis",
+			},
+		}},
+	}
+
+	var events []string
+	fakeDocker := &recordingDeployDocker{events: &events}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, observed: observed}
+	})
+
+	var out bytes.Buffer
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(events, "\n")
+	if strings.Contains(joined, "agent:web-1:pull:redis:7-alpine") || strings.Contains(joined, "agent:web-1:run:redis:7-alpine") {
+		t.Fatalf("running accessory was redeployed:\n%s", joined)
+	}
+	if !strings.Contains(out.String(), "accessory redis already running on web-1") {
+		t.Fatalf("output missing accessory skip:\n%s", out.String())
+	}
+	if _, err := state.NewStore(filepath.Join(dir, config.LocalStateDir)).ReadAccessoryState("production", "redis"); err != nil {
+		t.Fatalf("running accessory placement was not persisted: %v", err)
+	}
+}
+
 func TestPrepareDeployImagesPublishesAttestedBuilds(t *testing.T) {
 	events := []string{}
 	releaseID := "abc123def456-20260630T183456.123456789Z"
@@ -3292,6 +3378,59 @@ func TestStatusReportsConfigDrift(t *testing.T) {
 	}
 }
 
+func TestStatusUsesRemoteCurrentReleaseWhenLocalStateIsStale(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-old",
+		Environment: "production",
+		Images:      map[string]string{"web": "old"},
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := state.Release{
+		ID:          "release-new",
+		Environment: "production",
+		Images:      map[string]string{"web": "new"},
+		ConfigHash:  "remote-config",
+		CreatedAt:   time.Unix(20, 0),
+		Healthy:     true,
+		Status:      state.ReleaseStatusHealthy,
+	}
+	observed := map[string][]docker.ContainerSummary{
+		"web-1": {serviceContainer("web-1", "web", 1, "release-new", "Up 10 seconds")},
+	}
+
+	var events []string
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, observed: observed, current: &remote}
+	})
+
+	var out bytes.Buffer
+	cmd := statusCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var view statusView
+	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.CurrentRelease == nil || view.CurrentRelease.ID != "release-new" || view.Summary.WrongRelease != 0 || view.Summary.Drift {
+		t.Fatalf("status view = %+v", view)
+	}
+	if !strings.Contains(strings.Join(events, "\n"), "agent:web-1:read_release_state") {
+		t.Fatalf("remote release state was not read: %#v", events)
+	}
+}
+
 func TestPSListsObservedContainersTextAndJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -4474,6 +4613,49 @@ func TestAccessoryDeployPersistsPlacementAndRunsOneContainer(t *testing.T) {
 	}
 }
 
+func TestAccessoryDeployRestartsCurrentServicesAfterRecreate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployWithAccessoryConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-1",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
+		CreatedAt:   time.Unix(10, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installAccessoryHooks(t, func(host scheduler.Host) deployAgent {
+		return &scriptedAccessoryAgent{host: host.Name, events: &events}
+	})
+
+	var out bytes.Buffer
+	cmd := accessoryCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"deploy", "production", "redis"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(events, "\n")
+	for _, needle := range []string{
+		"agent:web-1:run:ship_demo_production_accessory_redis:redis:7-alpine",
+		"agent:web-1:run:ship_demo_production_web_1_release-1:registry.local/acme/web@sha256:",
+	} {
+		if !strings.Contains(joined, needle) {
+			t.Fatalf("events missing %q:\n%s", needle, joined)
+		}
+	}
+	if !strings.Contains(out.String(), "restarted ship_demo_production_web_1_release-1 on web-1 after accessory change") {
+		t.Fatalf("output missing dependent restart:\n%s", out.String())
+	}
+}
+
 func TestAccessoryExecUsesPersistedPlacementAndJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -5453,6 +5635,38 @@ services:
 `
 }
 
+func deployWithAccessoryConfig() string {
+	return `project: demo
+registry: registry.local/acme/demo
+
+environments:
+  production:
+    provider:
+      hetzner:
+        location: ash
+        server_type: cpx31
+        image: ubuntu-24.04
+        ssh_allowed_cidrs: [0.0.0.0/0]
+    hosts:
+      pools:
+        web:
+          count: 1
+
+services:
+  web:
+    image:
+      ref: registry.local/acme/web:stable
+    command: ./bin/server
+    pool: web
+    scale: 1
+
+accessories:
+  redis:
+    image: redis:7-alpine
+    pool: web
+`
+}
+
 func promoteConfig() string {
 	return `project: demo
 registry: registry.local/acme/demo
@@ -6267,7 +6481,9 @@ func (r *recordingDeployDocker) RegistryAuth(ctx context.Context, image string) 
 type recordingDeployAgent struct {
 	host          string
 	events        *[]string
+	observed      map[string][]docker.ContainerSummary
 	releaseWrites *[]releaseStateWrite
+	current       *state.Release
 	cronSyncs     *[]agent.SyncCronFilesParams
 	oneOffRuns    *[]agent.RunOneOffContainerParams
 	writes        *[]agent.WriteFileParams
@@ -6284,7 +6500,14 @@ func (r recordingDeployAgent) Call(ctx context.Context, method string, params an
 	case "list_ship_containers":
 		*r.events = append(*r.events, fmt.Sprintf("agent:%s:list_ship_containers", r.host))
 		if containers, ok := out.(*[]docker.ContainerSummary); ok {
-			*containers = nil
+			*containers = append([]docker.ContainerSummary(nil), r.observed[r.host]...)
+		}
+	case "read_release_state":
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:read_release_state", r.host))
+		if r.current != nil {
+			if release, ok := out.(*state.Release); ok {
+				*release = *r.current
+			}
 		}
 	case "pull":
 		image := params.(map[string]string)["image"]

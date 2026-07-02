@@ -36,6 +36,9 @@ func TestGenerateCaddyfile(t *testing.T) {
 			t.Fatalf("missing %q:\n%s", needle, file)
 		}
 	}
+	if strings.Contains(file, "handle /_ship/health { respond") {
+		t.Fatalf("health handler must be multiline:\n%s", file)
+	}
 }
 
 func TestGenerateCaddyfileUsesConfiguredProxyHealth(t *testing.T) {

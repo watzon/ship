@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,18 @@ func TestGeneratedCaddyfileValidatesWithCaddyBinary(t *testing.T) {
 	file := GenerateCaddyfileFromReplicas(cfg, []Replica{
 		{Service: "web", Host: "127.0.0.1", Port: 3000},
 	})
+	if strings.Contains(file, "handle /_ship/health { respond") {
+		t.Fatalf("health handler must be multiline:\n%s", file)
+	}
+	for _, needle := range []string{
+		"  handle /_ship/health {\n",
+		"    respond \"ok\" 200\n",
+		"  }\n",
+	} {
+		if !strings.Contains(file, needle) {
+			t.Fatalf("missing multiline health block %q:\n%s", needle, file)
+		}
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "Caddyfile")
 	if err := os.WriteFile(path, []byte(file), 0o644); err != nil {

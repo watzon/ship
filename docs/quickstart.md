@@ -8,6 +8,15 @@ go install ./cmd/ship
 ship --help
 ```
 
+In application CI, pin Ship to an explicit released version instead of floating on `@latest`:
+
+```bash
+go install github.com/watzon/ship/cmd/ship@v0.4.1
+ship version
+```
+
+Use a version that publishes release assets for your host platforms before relying on `ship agent upgrade` from CI.
+
 From a blank application repo:
 
 ```bash
@@ -113,4 +122,3 @@ ship scale production web=10
 ship --dry-run deploy production
 ship deploy production
 ```
-

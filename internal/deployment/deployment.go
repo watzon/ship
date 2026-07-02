@@ -742,7 +742,18 @@ func waitForCaddyContainer(ctx context.Context, client Agent, name string) error
 	if lastErr == nil {
 		lastErr = fmt.Errorf("container %q did not start", name)
 	}
+	if logs := containerLogTail(ctx, client, name); strings.TrimSpace(logs) != "" {
+		return fmt.Errorf("caddy container failed to stay running: %w; recent logs: %s", lastErr, logs)
+	}
 	return fmt.Errorf("caddy container failed to stay running: %w", lastErr)
+}
+
+func containerLogTail(ctx context.Context, client Agent, name string) string {
+	var result map[string]string
+	if err := client.Call(ctx, "logs", agent.LogsParams{Name: name, Lines: 20}, &result); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(result["logs"])
 }
 
 func containerRunning(inspect json.RawMessage) (bool, error) {

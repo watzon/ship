@@ -19,7 +19,7 @@ ship --dry-run provision decommission production
 ship provision decommission production --yes
 ```
 
-Deploy builds or resolves service images, writes release state, rolls services through the SSH-framed agent, runs health checks, and promotes only healthy releases.
+Deploy builds or resolves service images, writes release state, ensures configured accessories are running, rolls services through the SSH-framed agent, runs health checks, and promotes only healthy releases. Accessory ensure is conservative: an already-running accessory is left in place, while a missing or stopped accessory is created before release commands and service rollout. If an accessory is created or explicitly redeployed, Ship restarts current-release service containers so database or Redis clients reconnect to the current container address.
 
 ```bash
 ship --dry-run deploy production
@@ -61,7 +61,7 @@ services:
       drain_timeout_seconds: 10
 ```
 
-Each release stores a hash of the resolved `ship.yml` environment config. `ship status` and `ship inspect --json` report config drift when the current config differs from the config that produced the deployed release, so operators can spot undeployed changes before chasing container drift.
+Each release stores a hash of the resolved `ship.yml` environment config. `ship status` and `ship inspect --json` report config drift when the current config differs from the config that produced the deployed release, so operators can spot undeployed changes before chasing container drift. When local `.ship/` state is missing or stale, `ship status` asks the remote agents for their current release state and uses it when reachable hosts agree; this keeps ephemeral CI runners from making healthy remote releases look like wrong-release drift.
 
 `ship ps ENV` lists observed Ship-managed service, ingress, and accessory containers for the desired placement. Use `--all` to include extra old or wrong-release containers, `--service NAME` to narrow the view, and `--json` for automation.
 
@@ -69,7 +69,7 @@ Each release stores a hash of the resolved `ship.yml` environment config. `ship 
 
 `ship version` prints the local Ship binary version and supported agent protocol range. `ship version ENV` also asks every resolved host agent for its version, protocol, Docker readiness, state directory, and supported RPC methods; use `--json` for fleet audits and upgrade checks.
 
-`ship agent upgrade ENV` uploads the currently running local Ship binary to every resolved host through the SSH-framed agent RPC, verifies the SHA-256 checksum, and records upgrade events per host. Use `--dry-run` to preview the target path and digest, and `--json` for upgrade reports.
+`ship agent upgrade ENV` uploads a host-compatible Ship binary through the SSH-framed agent RPC, verifies the SHA-256 checksum, and records upgrade events per host. From a Ship repository checkout with Go installed, Ship can cross-compile for the remote platform. From a release install, use a version with published release assets for the remote OS/architecture, such as `ship_*_linux_amd64.tar.gz` or `ship_*_linux_arm64.tar.gz`. Use `--dry-run` to preview the target path and digest, and `--json` for upgrade reports.
 
 `ship health ENV [SERVICE]` runs the configured command or HTTP health checks against the current release without deploying. Use `--replica N` to check one placed service replica and `--json` for monitors or incident tooling.
 
@@ -117,6 +117,8 @@ services:
 ```
 
 Use `ingress.health.path` to check a different proxy-only endpoint, or `ingress.health.enabled: false` to omit Ship-managed proxy health directives for that service.
+
+When Caddy ingress is co-located on the same Docker host as a single ingressed service replica, Ship points Caddy at the service's Docker network alias, for example `web:3000`. Dedicated ingress hosts use the target host contact address instead. This keeps single-host deployments from accidentally routing through SSH host aliases that may resolve to loopback addresses inside the Caddy container.
 
 Set root `logging` defaults, or `services.<service>.logging` overrides, to pass Docker logging driver settings to service containers and release one-offs. This is useful for disk-safe rotation with `json-file` or for routing logs to drivers such as `local`, `journald`, `fluentd`, or `awslogs`.
 
@@ -415,7 +417,7 @@ services:
         timeout_seconds: 300
 ```
 
-Accessory backups can be scheduled the same way. Add `accessories.<name>.backup.schedule` and Ship syncs a cron file to the persisted accessory host on deploy. Scheduled backups require `backup.command` and a saved accessory placement, so run `ship accessory deploy ENV NAME` once before relying on the recurring job. Add `backup.export_command` to copy the completed artifact to off-host storage such as S3, R2, B2, restic, or rclone remotes; Ship runs it with `SHIP_BACKUP_ARTIFACT` set and records the first output line as the exported artifact URI.
+Accessory backups can be scheduled the same way. Add `accessories.<name>.backup.schedule` and Ship syncs a cron file to the persisted accessory host on deploy. Scheduled backups require `backup.command` and a saved accessory placement; `ship deploy ENV` creates that placement when it auto-ensures the accessory, and `ship accessory deploy ENV NAME` can create or repair it explicitly. Add `backup.export_command` to copy the completed artifact to off-host storage such as S3, R2, B2, restic, or rclone remotes; Ship runs it with `SHIP_BACKUP_ARTIFACT` set and records the first output line as the exported artifact URI.
 
 ```yaml
 accessories:
@@ -430,7 +432,7 @@ accessories:
         timeout_seconds: 600
 ```
 
-Accessories are managed explicitly:
+Accessories are auto-ensured by `ship deploy`, but the accessory commands remain the explicit day-2 interface. `ship accessory deploy` force-recreates the accessory container and then restarts current-release services so clients reconnect:
 
 ```bash
 ship accessory deploy production postgres
@@ -439,4 +441,3 @@ ship accessory backup production postgres
 ship --dry-run accessory restore production postgres --artifact /var/lib/ship/backups/postgres-20260630T120000.000000000Z.backup
 ship accessory restore production postgres --artifact /var/lib/ship/backups/postgres-20260630T120000.000000000Z.backup --yes
 ```
-

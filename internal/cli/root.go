@@ -736,6 +736,7 @@ type statusView struct {
 	CurrentConfig  string                            `json:"current_config_hash,omitempty"`
 	DeployedConfig string                            `json:"deployed_config_hash,omitempty"`
 	ConfigDrift    bool                              `json:"config_drift,omitempty"`
+	Warnings       []string                          `json:"warnings,omitempty"`
 	Desired        []deployment.DesiredReplicaStatus `json:"desired"`
 	Observed       []deployment.ContainerStatus      `json:"observed"`
 	ExtraObserved  []deployment.ContainerStatus      `json:"extra_observed,omitempty"`
@@ -795,6 +796,19 @@ type execEntry struct {
 	Replica   int    `json:"replica,omitempty"`
 	Container string `json:"container"`
 	Output    string `json:"output,omitempty"`
+}
+
+type accessoryEnsureMode string
+
+const (
+	accessoryEnsureOnly  accessoryEnsureMode = "ensure"
+	accessoryForceDeploy accessoryEnsureMode = "force"
+)
+
+type accessoryEnsureResult struct {
+	Name    string
+	Host    scheduler.Host
+	Changed bool
 }
 
 type healthView struct {
@@ -1596,13 +1610,7 @@ func buildStatusView(ctx context.Context, cfg *config.Config, env config.Environ
 		currentRelease = &current
 		desiredReleaseID = current.ID
 		deployedConfigHash = current.ConfigHash
-	} else if len(releases) > 0 {
-		latest := releases[len(releases)-1]
-		currentRelease = &latest
-		deployedConfigHash = latest.ConfigHash
 	}
-	currentConfigHash := configHash(cfg)
-	configDrift := deployedConfigHash != "" && currentConfigHash != "" && deployedConfigHash != currentConfigHash
 
 	hosts, err := resolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
@@ -1612,6 +1620,26 @@ func buildStatusView(ctx context.Context, cfg *config.Config, env config.Environ
 	if err != nil {
 		return statusView{}, deployment.StatusReport{}, err
 	}
+	var warnings []string
+	if shouldUseRemoteReleaseState(desiredReleaseID, cfg, envName, observed) {
+		if remote, remoteWarnings, err := remoteCurrentRelease(ctx, hosts, envName); err != nil {
+			warnings = append(warnings, err.Error())
+		} else {
+			warnings = append(warnings, remoteWarnings...)
+			if remote != nil {
+				currentRelease = remote
+				desiredReleaseID = remote.ID
+				deployedConfigHash = remote.ConfigHash
+			}
+		}
+	}
+	if currentRelease == nil && len(releases) > 0 {
+		latest := releases[len(releases)-1]
+		currentRelease = &latest
+		deployedConfigHash = latest.ConfigHash
+	}
+	currentConfigHash := configHash(cfg)
+	configDrift := deployedConfigHash != "" && currentConfigHash != "" && deployedConfigHash != currentConfigHash
 	report, err := deployment.AggregateStatus(deployment.StatusInput{
 		Config:         cfg,
 		Environment:    env,
@@ -1629,12 +1657,105 @@ func buildStatusView(ctx context.Context, cfg *config.Config, env config.Environ
 		CurrentConfig:  currentConfigHash,
 		DeployedConfig: deployedConfigHash,
 		ConfigDrift:    configDrift,
+		Warnings:       warnings,
 		Desired:        report.Desired,
 		Observed:       report.Observed,
 		ExtraObserved:  report.ExtraObserved,
 		Summary:        report.Summary,
 	}
 	return view, report, nil
+}
+
+func shouldUseRemoteReleaseState(localRelease string, cfg *config.Config, envName string, observed []deployment.ObservedContainer) bool {
+	if strings.TrimSpace(localRelease) == "" {
+		return true
+	}
+	running := observedRunningServiceReleases(cfg, envName, observed)
+	if len(running) == 0 {
+		return false
+	}
+	_, ok := running[localRelease]
+	return !ok
+}
+
+func observedRunningServiceReleases(cfg *config.Config, envName string, observed []deployment.ObservedContainer) map[string]struct{} {
+	releases := map[string]struct{}{}
+	for _, item := range observed {
+		labels := item.Container.Labels
+		if labels[docker.LabelManagedBy] != docker.LabelManagedByValue ||
+			labels[docker.LabelProject] != statusLabelValue(cfg.Project) ||
+			labels[docker.LabelEnvironment] != statusLabelValue(envName) ||
+			strings.TrimSpace(labels[docker.LabelService]) == "" ||
+			!strings.HasPrefix(item.Container.Status, "Up ") {
+			continue
+		}
+		if release := strings.TrimSpace(labels[docker.LabelRelease]); release != "" {
+			releases[release] = struct{}{}
+		}
+	}
+	return releases
+}
+
+func statusLabelValue(value string) string {
+	value = strings.TrimSpace(value)
+	var b strings.Builder
+	lastDash := false
+	for _, r := range value {
+		allowed := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == '.' || r == '-'
+		if allowed {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), ".-_")
+	if out == "" {
+		return "unknown"
+	}
+	return out
+}
+
+func remoteCurrentRelease(ctx context.Context, hosts []scheduler.Host, envName string) (*state.Release, []string, error) {
+	byID := map[string]state.Release{}
+	var failures []string
+	for _, host := range hosts {
+		var release state.Release
+		err := newDeployAgent(host).Call(ctx, "read_release_state", agent.ReadReleaseStateParams{Environment: envName}, &release)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", host.Name, err))
+			continue
+		}
+		if strings.TrimSpace(release.ID) != "" {
+			byID[release.ID] = release
+		}
+	}
+	var warnings []string
+	if len(failures) > 0 {
+		warnings = append(warnings, fmt.Sprintf("remote release state unavailable on %d/%d hosts", len(failures), len(hosts)))
+	}
+	if len(byID) == 0 {
+		return nil, warnings, nil
+	}
+	if len(byID) > 1 {
+		ids := make([]string, 0, len(byID))
+		for id := range byID {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		warnings = append(warnings, "remote release state disagrees across hosts: "+strings.Join(ids, ", "))
+		return nil, warnings, nil
+	}
+	for _, release := range byID {
+		return &release, warnings, nil
+	}
+	return nil, warnings, nil
 }
 
 func renderStatusText(w io.Writer, view statusView) {
@@ -1653,6 +1774,9 @@ func renderStatusText(w io.Writer, view statusView) {
 	ui.PrintHeader(w, view.Environment, fields...)
 	if view.ConfigDrift {
 		ui.PrintWarn(w, fmt.Sprintf("config drift  current=%s  deployed=%s", view.CurrentConfig, view.DeployedConfig))
+	}
+	for _, warning := range view.Warnings {
+		ui.PrintWarn(w, warning)
 	}
 	if len(view.Desired) == 0 {
 		ui.PrintNotice(w, "no placements")
@@ -2378,6 +2502,45 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_mark_failed", Status: "succeeded", Release: releaseID})
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
+			}
+			accessoryNames := accessory.SortedNames(cfg, "")
+			if len(accessoryNames) > 0 {
+				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "started", Release: releaseID, Message: fmt.Sprintf("accessories=%d", len(accessoryNames))})
+				results, err := ensureAccessories(ctx, cmd.OutOrStdout(), opts, cfg, env, envName, store, accessoryNames, accessoryEnsureOnly)
+				if err != nil {
+					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "failed", Release: releaseID, Message: err.Error()})
+					failedRelease, markErr := store.MarkReleaseFailed(releaseID, err.Error(), deployNow())
+					if markErr != nil {
+						recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_mark_failed", Status: "failed", Release: releaseID, Message: markErr.Error()})
+						return fmt.Errorf("%w; additionally failed to mark release failed: %v", err, markErr)
+					}
+					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_mark_failed", Status: "succeeded", Release: releaseID})
+					if syncErr := syncRemoteReleaseStateWithEvents(ctx, store, args[0], hosts, "deploy_release_state_write", failedRelease); syncErr != nil {
+						recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: fmt.Sprintf("%v; additionally failed to write failed release state: %v", err, syncErr)})
+						return fmt.Errorf("%w; additionally failed to write failed release state: %v", err, syncErr)
+					}
+					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
+					return err
+				}
+				changed := countChangedAccessories(results)
+				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "succeeded", Release: releaseID, Message: fmt.Sprintf("changed=%d", changed)})
+				if changed > 0 {
+					if err := restartCurrentServicesAfterAccessoryChange(ctx, cmd.OutOrStdout(), cfg, envName, store, hosts); err != nil {
+						recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_restart", Status: "failed", Release: releaseID, Message: err.Error()})
+						failedRelease, markErr := store.MarkReleaseFailed(releaseID, err.Error(), deployNow())
+						if markErr != nil {
+							recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_mark_failed", Status: "failed", Release: releaseID, Message: markErr.Error()})
+							return fmt.Errorf("%w; additionally failed to mark release failed: %v", err, markErr)
+						}
+						recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_mark_failed", Status: "succeeded", Release: releaseID})
+						if syncErr := syncRemoteReleaseStateWithEvents(ctx, store, args[0], hosts, "deploy_release_state_write", failedRelease); syncErr != nil {
+							recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: fmt.Sprintf("%v; additionally failed to write failed release state: %v", err, syncErr)})
+							return fmt.Errorf("%w; additionally failed to write failed release state: %v", err, syncErr)
+						}
+						recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
+						return err
+					}
+				}
 			}
 			secretEnvFiles, secretWrites, err := serviceSecretEnvFiles(cfg, hosts, args[0], secretFiles)
 			if err != nil {
@@ -4435,6 +4598,48 @@ func restartActions(cfg *config.Config, envName string, release state.Release, t
 	return actions, nil
 }
 
+func countChangedAccessories(results []accessoryEnsureResult) int {
+	var changed int
+	for _, result := range results {
+		if result.Changed {
+			changed++
+		}
+	}
+	return changed
+}
+
+func restartCurrentServicesAfterAccessoryChange(ctx context.Context, w io.Writer, cfg *config.Config, envName string, store state.Store, hosts []scheduler.Host) error {
+	release, err := store.CurrentRelease(envName)
+	if err != nil {
+		if strings.Contains(err.Error(), "no current release") {
+			return nil
+		}
+		return err
+	}
+	targets, err := restartTargets(cfg, hosts, "", 0)
+	if err != nil {
+		return nil
+	}
+	secretEnvFiles, err := deployedServiceSecretEnvFiles(cfg, envName)
+	if err != nil {
+		return err
+	}
+	actions, err := restartActions(cfg, envName, release, targets, secretEnvFiles)
+	if err != nil {
+		return err
+	}
+	recordEvent(store, state.Event{Environment: envName, Kind: "deploy_accessory_restart", Status: "started", Release: release.ID, Message: fmt.Sprintf("containers=%d", len(targets))})
+	if err := deployment.ExecuteActions(ctx, actions, deploymentAgentFactory(), nil); err != nil {
+		return err
+	}
+	for _, target := range targets {
+		name := deployment.ContainerName(cfg.Project, envName, target.Service, target.Replica, release.ID)
+		fmt.Fprintf(w, "restarted %s on %s after accessory change\n", name, target.Host.Name)
+	}
+	recordEvent(store, state.Event{Environment: envName, Kind: "deploy_accessory_restart", Status: "succeeded", Release: release.ID, Message: fmt.Sprintf("containers=%d", len(targets))})
+	return nil
+}
+
 func execServiceCmd(opts *options) *cobra.Command {
 	var replica int
 	var all bool
@@ -5858,12 +6063,24 @@ func accessoryTargets(cfg *config.Config, args []string) ([]string, error) {
 }
 
 func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *config.Config, env config.Environment, envName string, store state.Store, names []string) error {
+	results, err := ensureAccessories(ctx, w, opts, cfg, env, envName, store, names, accessoryForceDeploy)
+	if err != nil || opts.dryRun || countChangedAccessories(results) == 0 {
+		return err
+	}
+	hosts, err := resolvedHostsForEnvironment(store, envName, env)
+	if err != nil {
+		return err
+	}
+	return restartCurrentServicesAfterAccessoryChange(ctx, w, cfg, envName, store, hosts)
+}
+
+func ensureAccessories(ctx context.Context, w io.Writer, opts *options, cfg *config.Config, env config.Environment, envName string, store state.Store, names []string, mode accessoryEnsureMode) ([]accessoryEnsureResult, error) {
 	var secretFile secrets.ScopedRenderedEnvFiles
 	var err error
 	if !opts.dryRun {
 		secretOpts, err := secretSourceOptions(opts, envName)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		scopes := make([]string, 0, len(names))
 		for _, name := range names {
@@ -5871,57 +6088,77 @@ func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *co
 		}
 		secretFile, err = secrets.RenderScopedForEnv(cfg, secretOpts, scopes...)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	hosts, err := resolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	observed := map[string][]accessoryObservation{}
+	if !opts.dryRun && len(names) > 0 {
+		observed, err = collectAccessoryObservations(ctx, cfg, hosts, envName, names)
+		if err != nil {
+			return nil, err
+		}
+	}
+	results := make([]accessoryEnsureResult, 0, len(names))
 	for _, name := range names {
 		acc := cfg.Accessories[name]
 		if err := accessory.ValidateDeploy(acc); err != nil {
-			return fmt.Errorf("accessory %q: %w", name, err)
+			return nil, fmt.Errorf("accessory %q: %w", name, err)
 		}
 		placement, err := accessory.PlacementForHosts(cfg, hosts, envName, name, store)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if opts.dryRun {
-			fmt.Fprintf(w, "would deploy accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+			if mode == accessoryEnsureOnly {
+				fmt.Fprintf(w, "would ensure accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+			} else {
+				fmt.Fprintf(w, "would deploy accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+			}
+			results = append(results, accessoryEnsureResult{Name: name, Host: placement.Host, Changed: true})
 			continue
-		}
-		observed, err := collectAccessoryObservations(ctx, cfg, hosts, envName, []string{name})
-		if err != nil {
-			return err
 		}
 		containerName := accessory.ContainerName(cfg.Project, envName, name)
 		if err := validateSingleAccessory(name, placement, containerName, observed[name]); err != nil {
-			return err
+			return nil, err
+		}
+		if mode == accessoryEnsureOnly && accessoryObservationRunning(containerName, observed[name]) {
+			if !placement.Persisted {
+				placement, err = accessory.EnsurePlacementForHosts(cfg, hosts, envName, name, store, deployNow())
+				if err != nil {
+					return nil, err
+				}
+			}
+			fmt.Fprintf(w, "accessory %s already running on %s image=%s\n", name, placement.Host.Name, acc.Image)
+			results = append(results, accessoryEnsureResult{Name: name, Host: placement.Host})
+			continue
 		}
 		placement, err = accessory.EnsurePlacementForHosts(cfg, hosts, envName, name, store, deployNow())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		client := newDeployAgent(placement.Host)
 		secretEnvFile, secretContent := accessorySecretEnvFile(envName, name, secretFile)
 		if err := writeRemoteSecretFile(ctx, placement.Host, secretEnvFile, secretContent); err != nil {
-			return err
+			return nil, err
 		}
 		if err := syncRemoteRegistryAuth(ctx, newDeployDocker(), []scheduler.Host{placement.Host}, []string{acc.Image}); err != nil {
-			return fmt.Errorf("write registry auth for accessory %s on %s: %w", name, placement.Host.Name, err)
+			return nil, fmt.Errorf("write registry auth for accessory %s on %s: %w", name, placement.Host.Name, err)
 		}
 		if err := client.Call(ctx, "pull", map[string]string{"image": acc.Image}, nil); err != nil {
-			return fmt.Errorf("pull accessory %s on %s: %w", name, placement.Host.Name, err)
+			return nil, fmt.Errorf("pull accessory %s on %s: %w", name, placement.Host.Name, err)
 		}
 		networkName := deployment.DockerNetworkName(cfg, envName)
 		if err := ensureManagedDockerNetwork(ctx, client, cfg, envName); err != nil {
-			return fmt.Errorf("ensure network %s for accessory %s on %s: %w", networkName, name, placement.Host.Name, err)
+			return nil, fmt.Errorf("ensure network %s for accessory %s on %s: %w", networkName, name, placement.Host.Name, err)
 		}
 		for _, volume := range accessory.NamedVolumes(acc) {
 			params := agent.EnsureVolumeParams{Name: volume, Owner: acc.VolumeOwner}
 			if err := client.Call(ctx, "ensure_volume", params, nil); err != nil {
-				return fmt.Errorf("ensure volume %s for accessory %s on %s: %w", volume, name, placement.Host.Name, err)
+				return nil, fmt.Errorf("ensure volume %s for accessory %s on %s: %w", volume, name, placement.Host.Name, err)
 			}
 		}
 		params := agent.RunContainerParams{
@@ -5934,11 +6171,25 @@ func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *co
 			NetworkAliases: accessory.NetworkAliases(name, acc),
 		}
 		if err := client.Call(ctx, "run_container", params, nil); err != nil {
-			return fmt.Errorf("deploy accessory %s on %s: %w", name, placement.Host.Name, err)
+			return nil, fmt.Errorf("deploy accessory %s on %s: %w", name, placement.Host.Name, err)
 		}
-		fmt.Fprintf(w, "deployed accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+		if mode == accessoryEnsureOnly {
+			fmt.Fprintf(w, "ensured accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+		} else {
+			fmt.Fprintf(w, "deployed accessory %s on %s image=%s\n", name, placement.Host.Name, acc.Image)
+		}
+		results = append(results, accessoryEnsureResult{Name: name, Host: placement.Host, Changed: true})
 	}
-	return nil
+	return results, nil
+}
+
+func accessoryObservationRunning(containerName string, observed []accessoryObservation) bool {
+	for _, item := range observed {
+		if item.Container.Names == containerName && strings.HasPrefix(item.Container.Status, "Up ") {
+			return true
+		}
+	}
+	return false
 }
 
 func runAccessoryStatus(ctx context.Context, w io.Writer, cfg *config.Config, env config.Environment, envName string, store state.Store, names []string) error {
