@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -105,6 +106,53 @@ func TestDiffClassifiesMissingChangedAndExtraDigests(t *testing.T) {
 	}
 }
 
+func TestRequiredScopesBuildsPerServiceAndAccessoryScopes(t *testing.T) {
+	cfg := &config.Config{
+		Secrets: []string{"ROOT_ONLY", "SHARED"},
+		Services: map[string]config.Service{
+			"web": {
+				Secrets: []string{"SHARED", "WEB_KEY", "WEB_KEY", " "},
+			},
+			"worker": {},
+		},
+		Accessories: map[string]config.Accessory{
+			"db": {
+				Secrets: []string{"DB_PASS"},
+			},
+		},
+	}
+
+	scopes, err := RequiredScopes(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"accessory-db": {"DB_PASS"},
+		"service-web":  {"SHARED", "WEB_KEY"},
+	}
+	if !reflect.DeepEqual(scopes, want) {
+		t.Fatalf("scopes = %#v, want %#v", scopes, want)
+	}
+	for scope, names := range scopes {
+		for _, name := range names {
+			if name == "ROOT_ONLY" {
+				t.Fatalf("root-only secret leaked into %s scope: %#v", scope, names)
+			}
+		}
+	}
+
+	_, err = RequiredScopes(&config.Config{
+		Services: map[string]config.Service{
+			"web": {
+				Secrets: []string{"1BAD"},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid secret name error")
+	}
+}
+
 func TestRenderForEnvUsesEncryptedStoreDotenvAndEnvPrecedence(t *testing.T) {
 	dir := t.TempDir()
 	identity, err := age.GenerateX25519Identity()
@@ -148,6 +196,161 @@ func TestRenderForEnvUsesEncryptedStoreDotenvAndEnvPrecedence(t *testing.T) {
 		if !strings.Contains(rendered.Content, needle) {
 			t.Fatalf("rendered content missing %q:\n%s", needle, rendered.Content)
 		}
+	}
+}
+
+func TestRenderScopedForEnvRendersAndFiltersScopes(t *testing.T) {
+	dir := t.TempDir()
+	identity, identityFile := newTestIdentityFile(t, dir, "identity.txt")
+	opts := SourceOptions{
+		EnvName:      "production",
+		StateDir:     dir,
+		IdentityFile: identityFile,
+	}
+	if err := InitStore(opts, identity.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStoredSecret(opts, "", "WEB_KEY", "web-value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStoredSecret(opts, "", "DB_PASS", "db-value"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		Services: map[string]config.Service{
+			"web": {
+				Secrets: []string{"WEB_KEY"},
+			},
+		},
+		Accessories: map[string]config.Accessory{
+			"db": {
+				Secrets: []string{"DB_PASS"},
+			},
+		},
+	}
+
+	rendered, err := RenderScopedForEnv(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rendered.Scopes["service-web"].Content, "WEB_KEY=web-value\n"; got != want {
+		t.Fatalf("service-web content = %q, want %q", got, want)
+	}
+	if strings.Contains(rendered.Scopes["accessory-db"].Content, "WEB_KEY") {
+		t.Fatalf("accessory-db content leaked WEB_KEY: %q", rendered.Scopes["accessory-db"].Content)
+	}
+	wantDigests := map[string]string{
+		"accessory-db:DB_PASS": Digest("db-value"),
+		"service-web:WEB_KEY":  Digest("web-value"),
+	}
+	if !reflect.DeepEqual(rendered.Digests, wantDigests) {
+		t.Fatalf("digests = %#v, want %#v", rendered.Digests, wantDigests)
+	}
+	assertChecksPresent(t, rendered.Checks, []string{"DB_PASS", "WEB_KEY"})
+	if strings.Contains(rendered.Scopes["service-web"].Redacted, "web-value") {
+		t.Fatalf("redacted service-web output leaked value: %q", rendered.Scopes["service-web"].Redacted)
+	}
+
+	filtered, err := RenderScopedForEnv(cfg, opts, "service-web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filtered.Scopes) != 1 {
+		t.Fatalf("filtered scopes = %#v, want only service-web", filtered.Scopes)
+	}
+	if _, ok := filtered.Scopes["service-web"]; !ok {
+		t.Fatalf("filtered scopes missing service-web: %#v", filtered.Scopes)
+	}
+}
+
+func TestUnsetStoredSecretRemovesValue(t *testing.T) {
+	dir := t.TempDir()
+	identity, identityFile := newTestIdentityFile(t, dir, "identity.txt")
+	opts := SourceOptions{
+		EnvName:      "production",
+		StateDir:     dir,
+		IdentityFile: identityFile,
+	}
+	if err := InitStore(opts, identity.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetStoredSecret(opts, "", "SHIP_TEST_NAME", "stored-value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := UnsetStoredSecret(opts, "", "SHIP_TEST_NAME"); err != nil {
+		t.Fatal(err)
+	}
+	values, err := ReadStore(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := values["SHIP_TEST_NAME"]; ok {
+		t.Fatalf("SHIP_TEST_NAME still present after unset: %#v", values)
+	}
+	if err := UnsetStoredSecret(opts, "", "SHIP_TEST_MISSING"); err != nil {
+		t.Fatalf("unset missing secret returned error: %v", err)
+	}
+}
+
+func TestWriteStoreSupportsMultipleRecipients(t *testing.T) {
+	dir := t.TempDir()
+	identity1, identityFile1 := newTestIdentityFile(t, dir, "identity-1.txt")
+	identity2, identityFile2 := newTestIdentityFile(t, dir, "identity-2.txt")
+	opts := SourceOptions{
+		EnvName:      "production",
+		StateDir:     dir,
+		IdentityFile: identityFile1,
+	}
+	want := map[string]string{
+		"SHIP_TEST_ALPHA": "one",
+		"SHIP_TEST_BETA":  "two",
+	}
+	if err := WriteStoreWithRecipients(opts, want, []age.Recipient{identity1.Recipient(), identity2.Recipient()}); err != nil {
+		t.Fatal(err)
+	}
+
+	got1, err := ReadStore(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.IdentityFile = identityFile2
+	got2, err := ReadStore(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got1, want) {
+		t.Fatalf("identity 1 values = %#v, want %#v", got1, want)
+	}
+	if !reflect.DeepEqual(got2, want) {
+		t.Fatalf("identity 2 values = %#v, want %#v", got2, want)
+	}
+}
+
+func newTestIdentityFile(t *testing.T, dir, name string) (*age.X25519Identity, string) {
+	t.Helper()
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityFile := filepath.Join(dir, name)
+	if err := os.WriteFile(identityFile, []byte(identity.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return identity, identityFile
+}
+
+func assertChecksPresent(t *testing.T, checks []Check, names []string) {
+	t.Helper()
+	got := map[string]bool{}
+	for _, check := range checks {
+		got[check.Name] = check.Present
+	}
+	want := map[string]bool{}
+	for _, name := range names {
+		want[name] = true
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("checks = %#v, want present names %#v", checks, names)
 	}
 }
 
