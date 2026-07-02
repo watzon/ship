@@ -2992,6 +2992,107 @@ secrets: [GLOBAL_SECRET]
 	}
 }
 
+func TestResolveEnvironmentDeepMergesPartialServiceOverrides(t *testing.T) {
+	cfg, err := loadConfigText(t, `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.0.1]
+    services:
+      web:
+        ingress:
+          domains: [staging.example.com]
+        scale: 1
+
+services:
+  web:
+    image:
+      ref: example/web
+    pool: web
+    scale: 3
+    ports: [3000]
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := resolved.Services["web"]
+	if web.Image.Ref != "example/web" || web.Pool != "web" || web.Scale != 1 {
+		t.Fatalf("merged web = %+v", web)
+	}
+	if web.Ingress == nil || web.Ingress.Domains[0] != "staging.example.com" {
+		t.Fatalf("merged ingress = %+v", web.Ingress)
+	}
+}
+
+func TestResolveEnvironmentMergesServiceAndAccessoryEnvOverrides(t *testing.T) {
+	cfg, err := loadConfigText(t, `project: x
+registry: ghcr.io/acme/x
+
+environments:
+  staging:
+    provider:
+      manual: {}
+    hosts:
+      pools:
+        web:
+          hosts: [10.0.0.1]
+        data:
+          hosts: [10.0.0.2]
+    services:
+      web:
+        env:
+          - SHARED=staging
+          - STAGING_ONLY=1
+    accessories:
+      redis:
+        env:
+          - REDIS_SHARED=staging
+          - REDIS_STAGING_ONLY=1
+
+services:
+  web:
+    image:
+      ref: example/web
+    pool: web
+    scale: 1
+    env:
+      - ROOT_ONLY=1
+      - SHARED=root
+      - HOST_PASSTHROUGH
+
+accessories:
+  redis:
+    image: redis:7
+    pool: data
+    env:
+      - REDIS_ROOT_ONLY=1
+      - REDIS_SHARED=root
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, err := cfg.ResolveEnvironment("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(resolved.Services["web"].Env, ","); got != "ROOT_ONLY=1,SHARED=staging,HOST_PASSTHROUGH,STAGING_ONLY=1" {
+		t.Fatalf("service env = %q", got)
+	}
+	if got := strings.Join(resolved.Accessories["redis"].Env, ","); got != "REDIS_ROOT_ONLY=1,REDIS_SHARED=staging,REDIS_STAGING_ONLY=1" {
+		t.Fatalf("accessory env = %q", got)
+	}
+}
+
 func TestResolveEnvironmentAppliesRuntimeDefaults(t *testing.T) {
 	cfg, err := loadConfigText(t, `project: x
 registry: ghcr.io/acme/x

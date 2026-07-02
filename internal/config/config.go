@@ -2168,6 +2168,7 @@ func (h *HookCommand) UnmarshalYAML(value *yaml.Node) error {
 
 type Accessory struct {
 	Image          string            `yaml:"image"`
+	Command        string            `yaml:"command"`
 	Pool           string            `yaml:"pool"`
 	Primary        bool              `yaml:"primary"`
 	Labels         map[string]string `yaml:"labels"`
@@ -2340,7 +2341,11 @@ func (c *Config) ResolveEnvironment(name string) (*Config, Environment, error) {
 		if resolved.Services == nil {
 			resolved.Services = map[string]Service{}
 		}
-		resolved.Services[serviceName] = svc
+		if base, ok := resolved.Services[serviceName]; ok {
+			resolved.Services[serviceName] = mergeService(base, svc)
+		} else {
+			resolved.Services[serviceName] = svc
+		}
 	}
 	resolved.Services = applyLoggingDefaults(resolved.Services, c.Logging)
 	resolved.Accessories = copyAccessories(c.Accessories)
@@ -2348,7 +2353,11 @@ func (c *Config) ResolveEnvironment(name string) (*Config, Environment, error) {
 		if resolved.Accessories == nil {
 			resolved.Accessories = map[string]Accessory{}
 		}
-		resolved.Accessories[accessoryName] = acc
+		if base, ok := resolved.Accessories[accessoryName]; ok {
+			resolved.Accessories[accessoryName] = mergeAccessory(base, acc)
+		} else {
+			resolved.Accessories[accessoryName] = acc
+		}
 	}
 	runtimeDefaults := mergeRuntimeConfig(c.Runtime, env.Runtime)
 	resolved.Services = applyRuntimeDefaultsToServices(resolved.Services, runtimeDefaults)
@@ -2484,8 +2493,6 @@ func (c *Config) Validate() error {
 	errs = append(errs, validateSecretNames("root", c.Secrets)...)
 	for envName, env := range c.Environments {
 		errs = append(errs, validateSecretNames(fmt.Sprintf("environment %q", envName), env.Secrets)...)
-		errs = append(errs, validateServices(fmt.Sprintf("environment %q ", envName), env.Services)...)
-		errs = append(errs, validateAccessories(fmt.Sprintf("environment %q ", envName), env.Accessories)...)
 	}
 	for envName := range c.Environments {
 		resolved, env, err := c.resolvedForValidation(envName)
@@ -2496,6 +2503,8 @@ func (c *Config) Validate() error {
 		if len(resolved.Services) == 0 {
 			errs = append(errs, fmt.Sprintf("environment %q must resolve at least one service", envName))
 		}
+		errs = append(errs, validateServices(fmt.Sprintf("environment %q ", envName), resolved.Services)...)
+		errs = append(errs, validateAccessories(fmt.Sprintf("environment %q ", envName), resolved.Accessories)...)
 		for svcName, svc := range resolved.Services {
 			if _, ok := env.Hosts.Pools[svc.Pool]; !ok {
 				errs = append(errs, fmt.Sprintf("service %q references missing pool %q in environment %q", svcName, svc.Pool, envName))
@@ -3282,7 +3291,11 @@ func (c *Config) resolvedForValidation(envName string) (*Config, Environment, er
 		if resolved.Services == nil {
 			resolved.Services = map[string]Service{}
 		}
-		resolved.Services[serviceName] = svc
+		if base, ok := resolved.Services[serviceName]; ok {
+			resolved.Services[serviceName] = mergeService(base, svc)
+		} else {
+			resolved.Services[serviceName] = svc
+		}
 	}
 	resolved.Services = applyLoggingDefaults(resolved.Services, c.Logging)
 	resolved.Accessories = copyAccessories(c.Accessories)
@@ -3290,7 +3303,11 @@ func (c *Config) resolvedForValidation(envName string) (*Config, Environment, er
 		if resolved.Accessories == nil {
 			resolved.Accessories = map[string]Accessory{}
 		}
-		resolved.Accessories[accessoryName] = acc
+		if base, ok := resolved.Accessories[accessoryName]; ok {
+			resolved.Accessories[accessoryName] = mergeAccessory(base, acc)
+		} else {
+			resolved.Accessories[accessoryName] = acc
+		}
 	}
 	runtimeDefaults := mergeRuntimeConfig(c.Runtime, env.Runtime)
 	resolved.Services = applyRuntimeDefaultsToServices(resolved.Services, runtimeDefaults)
@@ -3448,6 +3465,343 @@ func copyAccessories(in map[string]Accessory) map[string]Accessory {
 	return out
 }
 
+func mergeService(base, override Service) Service {
+	out := base
+	out.Image = mergeImageSpec(base.Image, override.Image)
+	if strings.TrimSpace(override.Command) != "" {
+		out.Command = override.Command
+	}
+	if strings.TrimSpace(override.Pool) != "" {
+		out.Pool = override.Pool
+	}
+	if override.Scale > 0 {
+		out.Scale = override.Scale
+	}
+	if len(override.Labels) > 0 {
+		out.Labels = mergeStringMap(base.Labels, override.Labels)
+	}
+	if len(override.NetworkAliases) > 0 {
+		out.NetworkAliases = append([]string(nil), override.NetworkAliases...)
+	}
+	if len(override.Ports) > 0 {
+		out.Ports = append([]int(nil), override.Ports...)
+	}
+	if len(override.Publish) > 0 {
+		out.Publish = append([]string(nil), override.Publish...)
+	}
+	if override.Health.HTTP != "" || override.Health.Command != "" {
+		out.Health = override.Health
+	}
+	if override.Ingress != nil {
+		out.Ingress = mergeIngressPtr(base.Ingress, override.Ingress)
+	}
+	if len(override.Env) > 0 {
+		out.Env = mergeEnvList(base.Env, override.Env)
+	}
+	if len(override.Secrets) > 0 {
+		out.Secrets = append([]string(nil), override.Secrets...)
+	}
+	if strings.TrimSpace(override.RestartPolicy) != "" {
+		out.RestartPolicy = override.RestartPolicy
+	}
+	if len(override.Volumes) > 0 {
+		out.Volumes = append([]string(nil), override.Volumes...)
+	}
+	out.Logging = mergeLoggingConfig(base.Logging, override.Logging)
+	out.Resources = mergeResourceConfig(base.Resources, override.Resources)
+	out.Runtime = mergeRuntimeConfig(base.Runtime, override.Runtime)
+	out.Rolling = mergeRollingConfig(base.Rolling, override.Rolling)
+	if strings.TrimSpace(override.Release.Command) != "" || override.Release.Replica > 0 || override.Release.TimeoutSeconds > 0 {
+		out.Release = override.Release
+	}
+	if len(override.Schedules) > 0 {
+		out.Schedules = copySchedules(override.Schedules)
+	}
+	return out
+}
+
+func mergeAccessory(base, override Accessory) Accessory {
+	out := base
+	if strings.TrimSpace(override.Image) != "" {
+		out.Image = override.Image
+	}
+	if strings.TrimSpace(override.Command) != "" {
+		out.Command = override.Command
+	}
+	if strings.TrimSpace(override.Pool) != "" {
+		out.Pool = override.Pool
+	}
+	if override.Primary {
+		out.Primary = override.Primary
+	}
+	if len(override.Labels) > 0 {
+		out.Labels = mergeStringMap(base.Labels, override.Labels)
+	}
+	if len(override.NetworkAliases) > 0 {
+		out.NetworkAliases = append([]string(nil), override.NetworkAliases...)
+	}
+	if len(override.Volumes) > 0 {
+		out.Volumes = append([]string(nil), override.Volumes...)
+	}
+	if strings.TrimSpace(override.VolumeOwner) != "" {
+		out.VolumeOwner = override.VolumeOwner
+	}
+	if strings.TrimSpace(override.RestartPolicy) != "" {
+		out.RestartPolicy = override.RestartPolicy
+	}
+	out.Resources = mergeResourceConfig(base.Resources, override.Resources)
+	if len(override.Ports) > 0 {
+		out.Ports = append([]int(nil), override.Ports...)
+	}
+	if len(override.Publish) > 0 {
+		out.Publish = append([]string(nil), override.Publish...)
+	}
+	out.Runtime = mergeRuntimeConfig(base.Runtime, override.Runtime)
+	if len(override.Env) > 0 {
+		out.Env = mergeEnvList(base.Env, override.Env)
+	}
+	if len(override.Secrets) > 0 {
+		out.Secrets = append([]string(nil), override.Secrets...)
+	}
+	out.Backup = mergeBackupSpec(base.Backup, override.Backup)
+	return out
+}
+
+func mergeImageSpec(base, override ImageSpec) ImageSpec {
+	out := base
+	if strings.TrimSpace(override.Build) != "" {
+		out.Build = override.Build
+	}
+	if strings.TrimSpace(override.Dockerfile) != "" {
+		out.Dockerfile = override.Dockerfile
+	}
+	if strings.TrimSpace(override.Ref) != "" {
+		out.Ref = override.Ref
+	}
+	if len(override.Tags) > 0 {
+		out.Tags = append([]string(nil), override.Tags...)
+	}
+	if len(override.BuildArgs) > 0 {
+		out.BuildArgs = mergeStringMap(base.BuildArgs, override.BuildArgs)
+	}
+	if strings.TrimSpace(override.Target) != "" {
+		out.Target = override.Target
+	}
+	if strings.TrimSpace(override.Builder) != "" {
+		out.Builder = override.Builder
+	}
+	out.Buildpack = mergeBuildpackConfig(base.Buildpack, override.Buildpack)
+	if strings.TrimSpace(override.Platform) != "" {
+		out.Platform = override.Platform
+	}
+	if len(override.Platforms) > 0 {
+		out.Platforms = append([]string(nil), override.Platforms...)
+	}
+	if override.Pull {
+		out.Pull = override.Pull
+	}
+	if override.NoCache {
+		out.NoCache = override.NoCache
+	}
+	if len(override.NoCacheFilter) > 0 {
+		out.NoCacheFilter = append([]string(nil), override.NoCacheFilter...)
+	}
+	if len(override.CacheFrom) > 0 {
+		out.CacheFrom = append([]string(nil), override.CacheFrom...)
+	}
+	if len(override.CacheTo) > 0 {
+		out.CacheTo = append([]string(nil), override.CacheTo...)
+	}
+	if len(override.Secrets) > 0 {
+		out.Secrets = append([]string(nil), override.Secrets...)
+	}
+	if len(override.SSH) > 0 {
+		out.SSH = append([]string(nil), override.SSH...)
+	}
+	if strings.TrimSpace(string(override.SBOM)) != "" {
+		out.SBOM = override.SBOM
+	}
+	if strings.TrimSpace(string(override.Provenance)) != "" {
+		out.Provenance = override.Provenance
+	}
+	return out
+}
+
+func mergeBuildpackConfig(base, override BuildpackConfig) BuildpackConfig {
+	out := base
+	if strings.TrimSpace(override.Builder) != "" {
+		out.Builder = override.Builder
+	}
+	if len(override.Buildpacks) > 0 {
+		out.Buildpacks = append([]string(nil), override.Buildpacks...)
+	}
+	if len(override.Env) > 0 {
+		out.Env = mergeStringMap(base.Env, override.Env)
+	}
+	if strings.TrimSpace(override.Descriptor) != "" {
+		out.Descriptor = override.Descriptor
+	}
+	if override.Publish {
+		out.Publish = override.Publish
+	}
+	if strings.TrimSpace(override.PullPolicy) != "" {
+		out.PullPolicy = override.PullPolicy
+	}
+	if override.TrustBuilder {
+		out.TrustBuilder = override.TrustBuilder
+	}
+	return out
+}
+
+func mergeIngressPtr(base *Ingress, override *Ingress) *Ingress {
+	if override == nil {
+		return base
+	}
+	if base == nil {
+		merged := *override
+		return &merged
+	}
+	merged := *base
+	if len(override.Domains) > 0 {
+		merged.Domains = append([]string(nil), override.Domains...)
+	}
+	if len(override.Redirects) > 0 {
+		merged.Redirects = append([]IngressRedirect(nil), override.Redirects...)
+	}
+	merged.Health = mergeIngressHealth(base.Health, override.Health)
+	return &merged
+}
+
+func mergeIngressHealth(base, override IngressHealth) IngressHealth {
+	out := base
+	if override.Enabled != nil {
+		out.Enabled = override.Enabled
+	}
+	if strings.TrimSpace(override.Path) != "" {
+		out.Path = override.Path
+	}
+	if override.IntervalSeconds > 0 {
+		out.IntervalSeconds = override.IntervalSeconds
+	}
+	if override.TimeoutSeconds > 0 {
+		out.TimeoutSeconds = override.TimeoutSeconds
+	}
+	if override.Passes > 0 {
+		out.Passes = override.Passes
+	}
+	if override.Fails > 0 {
+		out.Fails = override.Fails
+	}
+	if override.TryDurationSeconds > 0 {
+		out.TryDurationSeconds = override.TryDurationSeconds
+	}
+	if override.PassiveFailDurationSeconds > 0 {
+		out.PassiveFailDurationSeconds = override.PassiveFailDurationSeconds
+	}
+	if override.PassiveMaxFails > 0 {
+		out.PassiveMaxFails = override.PassiveMaxFails
+	}
+	if len(override.UnhealthyStatus) > 0 {
+		out.UnhealthyStatus = append([]string(nil), override.UnhealthyStatus...)
+	}
+	return out
+}
+
+func mergeResourceConfig(base, override ResourceConfig) ResourceConfig {
+	out := base
+	if strings.TrimSpace(override.CPUs) != "" {
+		out.CPUs = override.CPUs
+	}
+	if strings.TrimSpace(override.Memory) != "" {
+		out.Memory = override.Memory
+	}
+	if strings.TrimSpace(override.MemoryReservation) != "" {
+		out.MemoryReservation = override.MemoryReservation
+	}
+	if strings.TrimSpace(override.MemorySwap) != "" {
+		out.MemorySwap = override.MemorySwap
+	}
+	if override.CPUShares > 0 {
+		out.CPUShares = override.CPUShares
+	}
+	if strings.TrimSpace(override.CPUSetCPUs) != "" {
+		out.CPUSetCPUs = override.CPUSetCPUs
+	}
+	if override.PIDsLimit > 0 {
+		out.PIDsLimit = override.PIDsLimit
+	}
+	return out
+}
+
+func mergeRollingConfig(base, override Rolling) Rolling {
+	out := base
+	if override.MaxSurge > 0 {
+		out.MaxSurge = override.MaxSurge
+	}
+	if override.MaxUnavailable > 0 {
+		out.MaxUnavailable = override.MaxUnavailable
+	}
+	if override.HealthRetries > 0 {
+		out.HealthRetries = override.HealthRetries
+	}
+	if override.DrainTimeoutSeconds > 0 {
+		out.DrainTimeoutSeconds = override.DrainTimeoutSeconds
+	}
+	if override.CanaryReplicas > 0 {
+		out.CanaryReplicas = override.CanaryReplicas
+	}
+	if override.CanaryPauseSeconds > 0 {
+		out.CanaryPauseSeconds = override.CanaryPauseSeconds
+	}
+	if override.HealthTimeoutSeconds > 0 {
+		out.HealthTimeoutSeconds = override.HealthTimeoutSeconds
+	}
+	if override.HealthIntervalSeconds > 0 {
+		out.HealthIntervalSeconds = override.HealthIntervalSeconds
+	}
+	return out
+}
+
+func mergeBackupSpec(base, override BackupSpec) BackupSpec {
+	out := base
+	if strings.TrimSpace(override.Command) != "" {
+		out.Command = override.Command
+	}
+	if strings.TrimSpace(override.ExportCommand) != "" {
+		out.ExportCommand = override.ExportCommand
+	}
+	if strings.TrimSpace(override.RestoreCommand) != "" {
+		out.RestoreCommand = override.RestoreCommand
+	}
+	if strings.TrimSpace(override.ArtifactDir) != "" {
+		out.ArtifactDir = override.ArtifactDir
+	}
+	if override.Required {
+		out.Required = override.Required
+	}
+	if override.RestoreCheck {
+		out.RestoreCheck = override.RestoreCheck
+	}
+	if override.ExportTimeoutSeconds > 0 {
+		out.ExportTimeoutSeconds = override.ExportTimeoutSeconds
+	}
+	if strings.TrimSpace(override.Schedule.Cron) != "" || override.Schedule.TimeoutSeconds > 0 {
+		out.Schedule = override.Schedule
+	}
+	return out
+}
+
+func copySchedules(in map[string]Schedule) map[string]Schedule {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]Schedule, len(in))
+	for name, schedule := range in {
+		out[name] = schedule
+	}
+	return out
+}
+
 func mergeIngressConfig(base, override IngressConfig) IngressConfig {
 	out := base
 	if override.Caddy.Image != "" {
@@ -3544,6 +3898,57 @@ func mergeStringMap(base, override map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func mergeEnvList(base, override []string) []string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(base)+len(override))
+	positions := map[string]int{}
+	for _, raw := range base {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		name := envListName(item)
+		if name == "" {
+			out = append(out, item)
+			continue
+		}
+		if idx, ok := positions[name]; ok {
+			out[idx] = item
+			continue
+		}
+		positions[name] = len(out)
+		out = append(out, item)
+	}
+	for _, raw := range override {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			continue
+		}
+		name := envListName(item)
+		if name == "" {
+			out = append(out, item)
+			continue
+		}
+		if idx, ok := positions[name]; ok {
+			out[idx] = item
+			continue
+		}
+		positions[name] = len(out)
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func envListName(item string) string {
+	name, _, _ := strings.Cut(item, "=")
+	return strings.TrimSpace(name)
 }
 
 func mergeNames(groups ...[]string) []string {
