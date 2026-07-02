@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
@@ -33,6 +34,7 @@ import (
 	"github.com/watzon/ship/internal/provider/providers"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/secrets"
+	"github.com/watzon/ship/internal/shipbinary"
 	"github.com/watzon/ship/internal/state"
 	"github.com/watzon/ship/internal/transport"
 	"gopkg.in/yaml.v3"
@@ -77,6 +79,7 @@ var readCurrentShipBinary = func() ([]byte, error) {
 	}
 	return os.ReadFile(path)
 }
+var resolveShipBinaryForHost = shipBinaryForHost
 
 type bootstrapSSH interface {
 	Run(ctx context.Context, command string) (string, error)
@@ -126,46 +129,92 @@ func sshForHost(host scheduler.Host, dryRun bool) transport.SSH {
 func Execute() error {
 	opts := &options{}
 	root := &cobra.Command{
-		Use:          "ship",
-		Short:        "Deploy Docker apps to ordinary servers with horizontal scaling",
-		SilenceUsage: true,
+		Use:           "ship",
+		Short:         "Deploy Docker apps to ordinary servers with horizontal scaling",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVarP(&opts.configPath, "config", "c", config.DefaultConfigFile, "path to ship.yml")
 	root.PersistentFlags().BoolVar(&opts.dryRun, "dry-run", false, "print the intended operation without mutating remote state")
 	root.PersistentFlags().StringArrayVar(&opts.envFiles, "env-file", nil, "load secrets from a dotenv file (repeatable)")
 	root.PersistentFlags().StringVar(&opts.secretsIdentityFile, "secrets-identity-file", "", "age identity file for encrypted Ship secrets")
+	ui.ConfigureRoot(root)
 
-	root.AddCommand(initCmd(opts))
-	root.AddCommand(doctorCmd(opts))
-	root.AddCommand(configCmd(opts))
-	root.AddCommand(hostsCmd(opts))
-	root.AddCommand(versionCmd(opts))
-	root.AddCommand(provisionCmd(opts))
-	root.AddCommand(agentCmd(opts))
-	root.AddCommand(planCmd(opts))
-	root.AddCommand(deployCmd(opts))
-	root.AddCommand(promoteCmd(opts))
-	root.AddCommand(lockCmd(opts))
-	root.AddCommand(unlockCmd(opts))
-	root.AddCommand(scaleCmd(opts))
-	root.AddCommand(statusCmd(opts))
-	root.AddCommand(psCmd(opts))
-	root.AddCommand(healthCmd(opts))
-	root.AddCommand(maintenanceCmd(opts))
-	root.AddCommand(logsCmd(opts))
-	root.AddCommand(restartCmd(opts))
-	root.AddCommand(execServiceCmd(opts))
-	root.AddCommand(inspectCmd(opts))
-	root.AddCommand(supportCmd(opts))
-	root.AddCommand(eventsCmd(opts))
-	root.AddCommand(releasesCmd(opts))
-	root.AddCommand(rollbackCmd(opts))
-	root.AddCommand(recoverCmd(opts))
-	root.AddCommand(pruneCmd(opts))
-	root.AddCommand(accessoryCmd(opts))
-	root.AddCommand(secretsCmd(opts))
+	init := initCmd(opts)
+	init.GroupID = ui.GroupSetup
+	doctor := doctorCmd(opts)
+	doctor.GroupID = ui.GroupSetup
+	cfg := configCmd(opts)
+	cfg.GroupID = ui.GroupPlan
+	hosts := hostsCmd(opts)
+	hosts.GroupID = ui.GroupPlan
+	plan := planCmd(opts)
+	plan.GroupID = ui.GroupPlan
+	scale := scaleCmd(opts)
+	scale.GroupID = ui.GroupPlan
+	provision := provisionCmd(opts)
+	provision.GroupID = ui.GroupInfra
+	agent := agentCmd(opts)
+	agent.GroupID = ui.GroupInfra
+	version := versionCmd(opts)
+	version.GroupID = ui.GroupInfra
+	deploy := deployCmd(opts)
+	deploy.GroupID = ui.GroupDeploy
+	promote := promoteCmd(opts)
+	promote.GroupID = ui.GroupDeploy
+	status := statusCmd(opts)
+	status.GroupID = ui.GroupOperate
+	ps := psCmd(opts)
+	ps.GroupID = ui.GroupOperate
+	health := healthCmd(opts)
+	health.GroupID = ui.GroupOperate
+	maintenance := maintenanceCmd(opts)
+	maintenance.GroupID = ui.GroupOperate
+	logs := logsCmd(opts)
+	logs.GroupID = ui.GroupOperate
+	restart := restartCmd(opts)
+	restart.GroupID = ui.GroupOperate
+	execSvc := execServiceCmd(opts)
+	execSvc.GroupID = ui.GroupOperate
+	inspect := inspectCmd(opts)
+	inspect.GroupID = ui.GroupOperate
+	support := supportCmd(opts)
+	support.GroupID = ui.GroupOperate
+	events := eventsCmd(opts)
+	events.GroupID = ui.GroupOperate
+	releases := releasesCmd(opts)
+	releases.GroupID = ui.GroupOperate
+	lock := lockCmd(opts)
+	lock.GroupID = ui.GroupOperate
+	unlock := unlockCmd(opts)
+	unlock.GroupID = ui.GroupOperate
+	prune := pruneCmd(opts)
+	prune.GroupID = ui.GroupOperate
+	recover := recoverCmd(opts)
+	recover.GroupID = ui.GroupRecovery
+	rollback := rollbackCmd(opts)
+	rollback.GroupID = ui.GroupRecovery
+	accessory := accessoryCmd(opts)
+	accessory.GroupID = ui.GroupAccessories
+	secrets := secretsCmd(opts)
+	secrets.GroupID = ui.GroupSecrets
 
-	return root.Execute()
+	root.AddCommand(
+		init, doctor,
+		cfg, hosts, plan, scale,
+		provision, agent, version,
+		deploy, promote,
+		status, ps, health, logs, execSvc, restart, inspect, support, events, releases, lock, unlock, maintenance, prune,
+		accessory,
+		secrets,
+		recover, rollback,
+	)
+
+	if err := root.Execute(); err != nil {
+		ui.PrintError(os.Stderr, err)
+		return err
+	}
+	return nil
 }
 
 func configCmd(opts *options) *cobra.Command {
@@ -173,7 +222,7 @@ func configCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config ENV",
 		Short: "Show the resolved Ship config for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -389,15 +438,20 @@ func ensureShipGitignore() error {
 func doctorCmd(opts *options) *cobra.Command {
 	var jsonOutput bool
 	cmd := &cobra.Command{
-		Use:   "doctor",
+		Use:   "doctor [ENV]",
 		Short: "Validate local tools, config, and credentials",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			var report doctor.Report
+			envName := ""
+			if len(args) > 0 {
+				envName = args[0]
+			}
 			if err != nil {
 				report = doctor.ConfigLoadError(err)
 			} else {
-				report = doctor.Run(cmd.Context(), cfg, doctor.Options{ConfigPath: opts.configPath})
+				report = doctor.Run(cmd.Context(), cfg, doctor.Options{ConfigPath: opts.configPath, Environment: envName})
 			}
 			if jsonOutput {
 				if err := report.WriteJSON(cmd.OutOrStdout()); err != nil {
@@ -422,7 +476,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	plan := &cobra.Command{
 		Use:   "plan ENV",
 		Short: "Print the provisioning plan",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -445,7 +499,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	apply := &cobra.Command{
 		Use:   "apply ENV",
 		Short: "Create servers and bootstrap Ship",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			cfg, err := config.Load(opts.configPath)
@@ -478,10 +532,6 @@ func provisionCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			shipBinary, err := readCurrentShipBinary()
-			if err != nil {
-				return fmt.Errorf("read ship binary for bootstrap: %w", err)
-			}
 			store := state.NewStore(stateDir)
 			recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "started"})
 			result, err := prov.Reconcile(ctx, cfg.Project, args[0], env)
@@ -510,6 +560,11 @@ func provisionCmd(opts *options) *cobra.Command {
 				return err
 			}
 			for _, host := range hosts {
+				shipBinary, err := resolveShipBinaryForHost(ctx, host, opts.dryRun)
+				if err != nil {
+					recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "failed", Host: host.Name, Message: err.Error()})
+					return fmt.Errorf("resolve ship binary for %s: %w", host.Name, err)
+				}
 				if err := bootstrapHost(ctx, host, shipBinary, opts.dryRun); err != nil {
 					recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "failed", Host: host.Name, Message: err.Error()})
 					return err
@@ -526,7 +581,7 @@ func provisionCmd(opts *options) *cobra.Command {
 	decommission := &cobra.Command{
 		Use:   "decommission ENV",
 		Short: "Delete Ship-managed servers for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			cfg, err := config.Load(opts.configPath)
@@ -835,7 +890,7 @@ func hostsCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hosts ENV",
 		Short: "Show resolved host inventory for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -893,30 +948,34 @@ func buildHostsView(store state.Store, envName string, env config.Environment) (
 }
 
 func renderHostsText(w io.Writer, view hostsView) {
-	fmt.Fprintf(w, "hosts %s source=%s\n", view.Environment, view.Source)
+	ui.PrintHeader(w, view.Environment, ui.HeaderField{Label: "source", Value: view.Source, Accent: true})
 	if len(view.Hosts) == 0 {
-		fmt.Fprintln(w, "- none")
+		ui.PrintNotice(w, "no hosts")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("NAME", "POOL", "USER", "CONTACT", "SSH", "NOTES")
 	for _, host := range view.Hosts {
-		fmt.Fprintf(w, "- %s pool=%s user=%s contact=%s", host.Name, host.Pool, host.User, host.Contact)
+		ssh := "-"
 		if host.SSHPort > 0 {
-			fmt.Fprintf(w, " ssh_port=%d", host.SSHPort)
+			ssh = fmt.Sprintf(":%d", host.SSHPort)
 		}
+		var notes []string
 		if host.IdentityFile != "" {
-			fmt.Fprintf(w, " identity_file=%s", host.IdentityFile)
+			notes = append(notes, "identity="+host.IdentityFile)
 		}
 		if host.KnownHostsFile != "" {
-			fmt.Fprintf(w, " known_hosts_file=%s", host.KnownHostsFile)
+			notes = append(notes, "known_hosts="+host.KnownHostsFile)
 		}
 		if host.JumpHost != "" {
-			fmt.Fprintf(w, " jump_host=%s", host.JumpHost)
+			notes = append(notes, "jump="+host.JumpHost)
 		}
 		if len(host.SSHOptions) > 0 {
-			fmt.Fprintf(w, " ssh_options=%s", formatStringMap(host.SSHOptions))
+			notes = append(notes, "options="+formatStringMap(host.SSHOptions))
 		}
-		fmt.Fprintln(w)
+		table.AddRow(host.Name, host.Pool, host.User, host.Contact, ssh, ui.Dash(strings.Join(notes, " ")))
 	}
+	ui.RenderTable(w, table)
 }
 
 func formatStringMap(values map[string]string) string {
@@ -1030,41 +1089,40 @@ func buildVersionView(ctx context.Context, store state.Store, envName string, en
 }
 
 func renderVersionText(w io.Writer, view versionView) {
-	fmt.Fprintf(w, "ship version %s protocol=%d-%d\n", view.ShipVersion, view.MinAgentProtocol, view.MaxAgentProtocol)
+	style := ui.NewStyle(w)
+	fmt.Fprint(w, style.Teal("ship "))
+	fmt.Fprint(w, style.White(view.ShipVersion))
+	fmt.Fprint(w, style.Gray("  protocol "))
+	fmt.Fprintln(w, style.White(fmt.Sprintf("%d-%d", view.MinAgentProtocol, view.MaxAgentProtocol)))
 	if view.Environment == "" {
 		return
 	}
-	fmt.Fprintf(w, "environment %s\n", view.Environment)
+	ui.PrintHeader(w, view.Environment)
 	if len(view.Hosts) == 0 {
-		fmt.Fprintln(w, "- none")
+		ui.PrintNotice(w, "no hosts")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("HOST", "POOL", "CONTACT", "AGENT", "DOCKER", "STATE", "DETAIL")
 	for _, host := range view.Hosts {
-		fmt.Fprintf(w, "- %s pool=%s contact=%s", host.Name, host.Pool, host.Contact)
 		if host.Error != "" {
-			fmt.Fprintf(w, " error=%q\n", host.Error)
+			table.AddRow(host.Name, host.Pool, host.Contact, "-", "-", "-", host.Error)
 			continue
-		}
-		if host.Hostname != "" {
-			fmt.Fprintf(w, " hostname=%s", host.Hostname)
 		}
 		agentVersion := host.AgentVersion
 		if agentVersion == "" {
 			agentVersion = "unknown"
 		}
-		fmt.Fprintf(w, " agent=%s", agentVersion)
 		if host.AgentProtocol > 0 {
-			fmt.Fprintf(w, " protocol=%d", host.AgentProtocol)
+			agentVersion = fmt.Sprintf("%s (%d)", agentVersion, host.AgentProtocol)
 		}
-		fmt.Fprintf(w, " docker=%t", host.DockerOK)
-		if host.StateDir != "" {
-			fmt.Fprintf(w, " state=%s", host.StateDir)
-		}
+		detail := ui.Dash(host.Hostname)
 		if len(host.SupportedMethods) > 0 {
-			fmt.Fprintf(w, " methods=%s", strings.Join(host.SupportedMethods, ","))
+			detail = strings.Join(host.SupportedMethods, ",")
 		}
-		fmt.Fprintln(w)
+		table.AddRow(host.Name, host.Pool, host.Contact, agentVersion, fmt.Sprintf("%t", host.DockerOK), ui.Dash(host.StateDir), detail)
 	}
+	ui.RenderTable(w, table)
 }
 
 func countVersionFailures(view versionView) int {
@@ -1081,15 +1139,33 @@ func resolvedHostsForEnvironment(store state.Store, envName string, env config.E
 	hosts := scheduler.HostsForEnvironment(env)
 	facts, err := store.ReadHostFacts(envName)
 	if errors.Is(err, os.ErrNotExist) {
-		return hosts, nil
+		return dedupeHosts(hosts), nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	if len(facts) == 0 {
-		return hosts, nil
+		return dedupeHosts(hosts), nil
 	}
-	return applyHostFacts(envName, hosts, facts)
+	hosts, err = applyHostFacts(envName, hosts, facts)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeHosts(hosts), nil
+}
+
+func dedupeHosts(hosts []scheduler.Host) []scheduler.Host {
+	seen := map[string]struct{}{}
+	out := make([]scheduler.Host, 0, len(hosts))
+	for _, host := range hosts {
+		key := host.User + "\x00" + host.ContactTarget()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, host)
+	}
+	return out
 }
 
 func applyHostFacts(envName string, hosts []scheduler.Host, facts []state.HostFact) ([]scheduler.Host, error) {
@@ -1189,6 +1265,26 @@ func mergeStringMap(base, override map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func shipBinaryForHost(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
+	if dryRun {
+		return readCurrentShipBinary()
+	}
+	ssh := newBootstrapSSH(host, dryRun)
+	sysname, err := ssh.Run(ctx, "uname -s")
+	if err != nil {
+		return nil, fmt.Errorf("detect remote OS on %s: %w", host.Name, err)
+	}
+	machine, err := ssh.Run(ctx, "uname -m")
+	if err != nil {
+		return nil, fmt.Errorf("detect remote architecture on %s: %w", host.Name, err)
+	}
+	target, err := shipbinary.ParseUname(sysname, machine)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported remote platform on %s: %w", host.Name, err)
+	}
+	return shipbinary.Resolve(ctx, target)
 }
 
 func bootstrapHost(ctx context.Context, host scheduler.Host, shipBinary []byte, dryRun bool) error {
@@ -1542,89 +1638,102 @@ func buildStatusView(ctx context.Context, cfg *config.Config, env config.Environ
 }
 
 func renderStatusText(w io.Writer, view statusView) {
-	fmt.Fprintf(w, "environment %s\n", view.Environment)
+	var fields []ui.HeaderField
 	if view.CurrentRelease == nil {
-		fmt.Fprintln(w, "current release none")
+		fields = append(fields, ui.HeaderField{Label: "release", Value: "none"})
 	} else {
-		fmt.Fprintf(w, "current release %s status=%s healthy=%t\n", view.CurrentRelease.ID, view.CurrentRelease.Status, view.CurrentRelease.Healthy)
+		release := fmt.Sprintf("%s (%s)", view.CurrentRelease.ID, view.CurrentRelease.Status)
+		if view.CurrentRelease.Healthy {
+			release += ", healthy"
+		} else {
+			release += ", unhealthy"
+		}
+		fields = append(fields, ui.HeaderField{Label: "release", Value: release, Accent: true})
 	}
+	ui.PrintHeader(w, view.Environment, fields...)
 	if view.ConfigDrift {
-		fmt.Fprintf(w, "config drift current=%s deployed=%s\n", view.CurrentConfig, view.DeployedConfig)
+		ui.PrintWarn(w, fmt.Sprintf("config drift  current=%s  deployed=%s", view.CurrentConfig, view.DeployedConfig))
 	}
-	for _, desired := range view.Desired {
-		fmt.Fprintf(w, "%s.%d desired host=%s", desired.Service, desired.Replica, desired.Host)
-		if desired.DesiredRelease != "" {
-			fmt.Fprintf(w, " release=%s", desired.DesiredRelease)
-		}
-		fmt.Fprintf(w, " state=%s", desired.State)
-		if len(desired.Observed) == 0 {
-			fmt.Fprint(w, " observed=missing")
-		}
-		if len(desired.Drift) > 0 {
-			fmt.Fprintf(w, " drift=%s", strings.Join(desired.Drift, "; "))
-		}
-		fmt.Fprintln(w)
-		for _, observed := range desired.Observed {
-			fmt.Fprintf(w, "  observed host=%s name=%s", observed.Host, observed.Name)
-			if observed.Release != "" {
-				fmt.Fprintf(w, " release=%s", observed.Release)
+	if len(view.Desired) == 0 {
+		ui.PrintNotice(w, "no placements")
+	} else {
+		table := ui.NewTable(w)
+		table.SetHeaders("SERVICE", "HOST", "RELEASE", "STATE", "CONTAINER", "STATUS", "DRIFT")
+		for _, desired := range view.Desired {
+			container := "-"
+			status := "missing"
+			if len(desired.Observed) > 0 {
+				obs := desired.Observed[0]
+				container = obs.Name
+				status = ui.Dash(obs.Status)
 			}
-			if observed.Status != "" {
-				fmt.Fprintf(w, " status=%q", observed.Status)
-			}
-			fmt.Fprintln(w)
+			table.AddRow(
+				fmt.Sprintf("%s.%d", desired.Service, desired.Replica),
+				desired.Host,
+				ui.Dash(desired.DesiredRelease),
+				desired.State,
+				container,
+				status,
+				ui.Dash(strings.Join(desired.Drift, "; ")),
+			)
 		}
+		ui.RenderTable(w, table)
 	}
 	if len(view.ExtraObserved) > 0 {
-		fmt.Fprintln(w, "extra managed containers:")
+		ui.PrintSection(w, "Extra containers")
+		table := ui.NewTable(w)
+		table.SetHeaders("HOST", "NAME", "KIND", "SERVICE", "RELEASE", "STATUS")
 		for _, observed := range view.ExtraObserved {
-			fmt.Fprintf(w, "- host=%s name=%s kind=%s", observed.Host, observed.Name, observed.Kind)
+			service := ""
 			if observed.Service != "" {
-				fmt.Fprintf(w, " service=%s.%d", observed.Service, observed.Replica)
+				service = fmt.Sprintf("%s.%d", observed.Service, observed.Replica)
+			} else if observed.Accessory != "" {
+				service = observed.Accessory
 			}
-			if observed.Accessory != "" {
-				fmt.Fprintf(w, " accessory=%s", observed.Accessory)
-			}
-			if observed.Release != "" {
-				fmt.Fprintf(w, " release=%s", observed.Release)
-			}
-			if observed.Status != "" {
-				fmt.Fprintf(w, " status=%q", observed.Status)
-			}
-			fmt.Fprintln(w)
+			table.AddRow(
+				observed.Host,
+				observed.Name,
+				observed.Kind,
+				ui.Dash(service),
+				ui.Dash(observed.Release),
+				ui.Dash(observed.Status),
+			)
 		}
+		ui.RenderTable(w, table)
 	}
 	if view.Summary.Drift {
-		fmt.Fprintf(w, "drift detected missing=%d wrong_release=%d wrong_host=%d extra=%d\n", view.Summary.Missing, view.Summary.WrongRelease, view.Summary.WrongHost, view.Summary.Extra)
+		ui.PrintWarn(w, fmt.Sprintf("drift detected  missing=%d  wrong_release=%d  wrong_host=%d  extra=%d",
+			view.Summary.Missing, view.Summary.WrongRelease, view.Summary.WrongHost, view.Summary.Extra))
 		return
 	}
-	fmt.Fprintln(w, "status ok")
+	ui.PrintOK(w, "status ok")
 }
 
 func renderEventsText(w io.Writer, events []state.Event) {
 	if len(events) == 0 {
-		fmt.Fprintln(w, "no events")
+		ui.PrintNotice(w, "no events")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("TIME", "KIND", "STATUS", "RELEASE", "HOST", "DETAIL")
 	for _, event := range events {
-		fmt.Fprintf(w, "%s %s %s", event.Time.Format(time.RFC3339), event.Kind, event.Status)
-		if event.Release != "" {
-			fmt.Fprintf(w, " release=%s", event.Release)
-		}
+		detail := event.Message
 		if event.Service != "" {
-			fmt.Fprintf(w, " service=%s", event.Service)
+			detail = strings.TrimSpace("service=" + event.Service + " " + detail)
 		}
 		if event.Accessory != "" {
-			fmt.Fprintf(w, " accessory=%s", event.Accessory)
+			detail = strings.TrimSpace("accessory=" + event.Accessory + " " + detail)
 		}
-		if event.Host != "" {
-			fmt.Fprintf(w, " host=%s", event.Host)
-		}
-		if event.Message != "" {
-			fmt.Fprintf(w, " %s", event.Message)
-		}
-		fmt.Fprintln(w)
+		table.AddRow(
+			event.Time.Format(time.RFC3339),
+			event.Kind,
+			event.Status,
+			ui.Dash(event.Release),
+			ui.Dash(event.Host),
+			ui.Dash(detail),
+		)
 	}
+	table.Render(w)
 }
 
 func agentCmd(opts *options) *cobra.Command {
@@ -1648,7 +1757,7 @@ func agentCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "install ENV",
 		Short: "Print or run host bootstrap commands for every host in an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, env, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -1674,7 +1783,7 @@ func agentCmd(opts *options) *cobra.Command {
 	upgrade := &cobra.Command{
 		Use:   "upgrade ENV",
 		Short: "Upload the current Ship binary to every host agent",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			view, err := upgradeAgents(cmd.Context(), opts, args[0])
 			if upgradeJSON {
@@ -1698,7 +1807,7 @@ func agentCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status ENV",
 		Short: "Ask every host agent for status",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, env, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -1708,15 +1817,14 @@ func agentCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, host := range hosts {
+			renderAgentStatusText(cmd.OutOrStdout(), args[0], hosts, func(host scheduler.Host) (agent.Status, error) {
 				var status agent.Status
 				client := agent.Client{SSH: sshForHost(host, opts.dryRun)}
 				if err := client.Call(cmd.Context(), "status", map[string]any{}, &status); err != nil {
-					fmt.Fprintf(cmd.OutOrStdout(), "%s fail %v\n", host.Name, err)
-					continue
+					return agent.Status{}, err
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%s docker=%t state=%s\n", host.Name, status.DockerOK, status.StateDir)
-			}
+				return status, nil
+			})
 			return nil
 		},
 	})
@@ -1750,23 +1858,18 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 	if err != nil {
 		return agentUpgradeView{}, err
 	}
-	shipBinary, err := readCurrentShipBinary()
-	if err != nil {
-		return agentUpgradeView{}, fmt.Errorf("read ship binary: %w", err)
-	}
-	sum := sha256.Sum256(shipBinary)
-	digest := fmt.Sprintf("%x", sum[:])
 	view := agentUpgradeView{
 		Environment: envName,
 		ShipVersion: agent.AgentVersion,
-		SHA256:      digest,
 		DryRun:      opts.dryRun,
 	}
-	if !opts.dryRun {
-		recordEvent(store, state.Event{Environment: envName, Kind: "agent_upgrade", Status: "started", Message: fmt.Sprintf("hosts=%d sha256=%s", len(hosts), digest)})
-	}
-	content := base64.StdEncoding.EncodeToString(shipBinary)
 	for _, host := range hosts {
+		shipBinary, err := resolveShipBinaryForHost(ctx, host, opts.dryRun)
+		if err != nil {
+			return agentUpgradeView{}, fmt.Errorf("resolve ship binary for %s: %w", host.Name, err)
+		}
+		sum := sha256.Sum256(shipBinary)
+		digest := fmt.Sprintf("%x", sum[:])
 		entry := agentUpgradeHost{
 			Name:    host.Name,
 			Pool:    host.Pool,
@@ -1778,8 +1881,12 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 			view.Hosts = append(view.Hosts, entry)
 			continue
 		}
+		if len(view.Hosts) == 0 {
+			recordEvent(store, state.Event{Environment: envName, Kind: "agent_upgrade", Status: "started", Message: fmt.Sprintf("hosts=%d", len(hosts))})
+		}
+		content := base64.StdEncoding.EncodeToString(shipBinary)
 		var result agent.InstallBinaryResult
-		err := newDeployAgent(host).Call(ctx, "install_binary", agent.InstallBinaryParams{
+		err = newDeployAgent(host).Call(ctx, "install_binary", agent.InstallBinaryParams{
 			Path:          config.RemoteBinaryPath,
 			ContentBase64: content,
 			SHA256:        digest,
@@ -1794,6 +1901,9 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 		entry.Path = result.Path
 		entry.Installed = result.Installed
 		entry.SHA256 = result.SHA256
+		if view.SHA256 == "" {
+			view.SHA256 = digest
+		}
 		status := "unchanged"
 		if result.Installed {
 			status = "installed"
@@ -1804,37 +1914,60 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 	return view, nil
 }
 
-func renderAgentUpgradeText(w io.Writer, view agentUpgradeView) {
-	fmt.Fprintf(w, "agent upgrade %s version=%s sha256=%s", view.Environment, view.ShipVersion, view.SHA256)
-	if view.DryRun {
-		fmt.Fprint(w, " dry_run=true")
-	}
-	fmt.Fprintln(w)
-	if len(view.Hosts) == 0 {
-		fmt.Fprintln(w, "- none")
+func renderAgentStatusText(w io.Writer, envName string, hosts []scheduler.Host, fetch func(scheduler.Host) (agent.Status, error)) {
+	ui.PrintHeader(w, envName)
+	if len(hosts) == 0 {
+		ui.PrintNotice(w, "no hosts")
 		return
 	}
-	for _, host := range view.Hosts {
-		fmt.Fprintf(w, "- %s pool=%s contact=%s", host.Name, host.Pool, host.Contact)
-		if host.Error != "" {
-			fmt.Fprintf(w, " error=%q\n", host.Error)
+	table := ui.NewTable(w)
+	table.SetHeaders("HOST", "DOCKER", "STATE DIR", "AGENT", "DETAIL")
+	for _, host := range hosts {
+		status, err := fetch(host)
+		if err != nil {
+			table.AddRow(host.Name, "-", "-", "-", err.Error())
 			continue
 		}
-		if view.DryRun {
-			fmt.Fprintf(w, " would_install=%s sha256=%s\n", host.Path, host.SHA256)
-			continue
-		}
-		fmt.Fprintf(w, " path=%s", host.Path)
-		if host.Installed {
-			fmt.Fprint(w, " installed=true")
-		} else {
-			fmt.Fprint(w, " installed=false")
-		}
-		if host.SHA256 != "" {
-			fmt.Fprintf(w, " sha256=%s", host.SHA256)
-		}
-		fmt.Fprintln(w)
+		table.AddRow(host.Name, fmt.Sprintf("%t", status.DockerOK), ui.Dash(status.StateDir), ui.Dash(status.AgentVersion), ui.Dash(status.Hostname))
 	}
+	ui.RenderTable(w, table)
+}
+
+func renderAgentUpgradeText(w io.Writer, view agentUpgradeView) {
+	fields := []ui.HeaderField{
+		{Label: "version", Value: view.ShipVersion, Accent: true},
+		{Label: "sha256", Value: view.SHA256},
+	}
+	if view.DryRun {
+		fields = append(fields, ui.HeaderField{Label: "mode", Value: "dry-run"})
+	}
+	ui.PrintHeader(w, view.Environment, fields...)
+	if len(view.Hosts) == 0 {
+		ui.PrintNotice(w, "no hosts")
+		return
+	}
+	table := ui.NewTable(w)
+	table.SetHeaders("HOST", "POOL", "CONTACT", "RESULT", "PATH", "SHA256")
+	for _, host := range view.Hosts {
+		result := "unchanged"
+		if host.Error != "" {
+			result = "failed"
+		} else if view.DryRun {
+			result = "planned"
+		} else if host.Installed {
+			result = "installed"
+		}
+		detail := ui.Dash(host.Error)
+		if host.Error == "" && view.DryRun {
+			detail = "would install"
+		}
+		if host.Error != "" {
+			table.AddRow(host.Name, host.Pool, host.Contact, result, ui.Dash(host.Path), detail)
+			continue
+		}
+		table.AddRow(host.Name, host.Pool, host.Contact, result, ui.Dash(host.Path), ui.Dash(host.SHA256))
+	}
+	ui.RenderTable(w, table)
 }
 
 func countAgentUpgradeFailures(view agentUpgradeView) int {
@@ -1853,7 +1986,7 @@ func planCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plan ENV",
 		Short: "Print the deployment plan",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -1889,6 +2022,7 @@ func planCmd(opts *options) *cobra.Command {
 const plannedReleaseID = "<next-release>"
 
 type observedPlanView struct {
+	Environment    string                  `json:"environment"`
 	Plan           planner.Plan            `json:"plan"`
 	Observed       deployment.StatusReport `json:"observed"`
 	RolloutActions []rolloutActionView     `json:"rollout_actions"`
@@ -1955,6 +2089,7 @@ func buildObservedPlanView(ctx context.Context, opts *options, cfg *config.Confi
 		return observedPlanView{}, err
 	}
 	return observedPlanView{
+		Environment:    envName,
 		Plan:           plan,
 		Observed:       report,
 		RolloutActions: rolloutActionViews(actions),
@@ -2014,74 +2149,74 @@ func rolloutActionViews(actions []deployment.Action) []rolloutActionView {
 
 func renderObservedPlanText(w io.Writer, view observedPlanView) {
 	fmt.Fprint(w, view.Plan.String())
-	fmt.Fprintf(w, "observed state current_release=%s desired=%d observed=%d extra=%d drift=%t\n",
-		emptyAsNone(view.Observed.CurrentRelease),
-		view.Observed.Summary.Desired,
-		view.Observed.Summary.Observed,
-		view.Observed.Summary.Extra,
-		view.Observed.Summary.Drift,
+	ui.PrintHeader(w, view.Environment,
+		ui.HeaderField{Label: "release", Value: emptyAsNone(view.Observed.CurrentRelease), Accent: true},
+		ui.HeaderField{Label: "drift", Value: fmt.Sprintf("%t", view.Observed.Summary.Drift)},
 	)
+	summary := ui.NewTable(w)
+	summary.SetHeaders("DESIRED", "OBSERVED", "EXTRA")
+	summary.AddRow(
+		strconv.Itoa(view.Observed.Summary.Desired),
+		strconv.Itoa(view.Observed.Summary.Observed),
+		strconv.Itoa(view.Observed.Summary.Extra),
+	)
+	ui.RenderTable(w, summary)
+
+	var driftRows []deployment.DesiredReplicaStatus
 	for _, desired := range view.Observed.Desired {
 		if desired.State == "ok" {
 			continue
 		}
-		fmt.Fprintf(w, "- drift %s.%d host=%s state=%s", desired.Service, desired.Replica, desired.Host, desired.State)
-		if len(desired.Drift) > 0 {
-			fmt.Fprintf(w, " details=%q", strings.Join(desired.Drift, "; "))
-		}
-		fmt.Fprintln(w)
+		driftRows = append(driftRows, desired)
 	}
-	for _, observed := range view.Observed.ExtraObserved {
-		fmt.Fprintf(w, "- extra host=%s name=%s", observed.Host, observed.Name)
-		if observed.Service != "" {
-			fmt.Fprintf(w, " service=%s", observed.Service)
+	if len(driftRows) > 0 {
+		ui.PrintSection(w, "Drift")
+		table := ui.NewTable(w)
+		table.SetHeaders("SERVICE", "HOST", "STATE", "DETAIL")
+		for _, desired := range driftRows {
+			table.AddRow(
+				fmt.Sprintf("%s.%d", desired.Service, desired.Replica),
+				desired.Host,
+				desired.State,
+				ui.Dash(strings.Join(desired.Drift, "; ")),
+			)
 		}
-		if observed.Replica > 0 {
-			fmt.Fprintf(w, " replica=%d", observed.Replica)
-		}
-		if observed.Release != "" {
-			fmt.Fprintf(w, " release=%s", observed.Release)
-		}
-		if observed.Status != "" {
-			fmt.Fprintf(w, " status=%q", observed.Status)
-		}
-		fmt.Fprintln(w)
+		ui.RenderTable(w, table)
 	}
-	fmt.Fprintln(w, "rollout actions")
+	if len(view.Observed.ExtraObserved) > 0 {
+		ui.PrintSection(w, "Extra containers")
+		table := ui.NewTable(w)
+		table.SetHeaders("HOST", "NAME", "SERVICE", "RELEASE", "STATUS")
+		for _, observed := range view.Observed.ExtraObserved {
+			service := observed.Service
+			if observed.Replica > 0 {
+				service = fmt.Sprintf("%s.%d", observed.Service, observed.Replica)
+			}
+			table.AddRow(observed.Host, observed.Name, ui.Dash(service), ui.Dash(observed.Release), ui.Dash(observed.Status))
+		}
+		ui.RenderTable(w, table)
+	}
+	ui.PrintSection(w, "Rollout actions")
 	if len(view.RolloutActions) == 0 {
-		fmt.Fprintln(w, "- no changes")
+		ui.PrintNotice(w, "no changes")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("KIND", "TARGET", "HOST", "IMAGE", "DETAIL")
 	for _, action := range view.RolloutActions {
-		renderRolloutActionText(w, action)
+		target := action.Target
+		if target == "" && action.Service != "" && action.Replica > 0 {
+			target = fmt.Sprintf("%s.%d", action.Service, action.Replica)
+		}
+		if target == "" && action.Container != "" {
+			target = action.Container
+		}
+		if target == "" {
+			target = action.Kind
+		}
+		table.AddRow(action.Kind, target, ui.Dash(action.Host), ui.Dash(action.Image), ui.Dash(action.Details))
 	}
-}
-
-func renderRolloutActionText(w io.Writer, action rolloutActionView) {
-	target := action.Target
-	if target == "" && action.Service != "" && action.Replica > 0 {
-		target = fmt.Sprintf("%s.%d", action.Service, action.Replica)
-	}
-	if target == "" && action.Container != "" {
-		target = action.Container
-	}
-	if target == "" {
-		target = action.Kind
-	}
-	fmt.Fprintf(w, "- %s %s", action.Kind, target)
-	if action.Host != "" {
-		fmt.Fprintf(w, " on %s", action.Host)
-	}
-	if action.Image != "" {
-		fmt.Fprintf(w, " image=%s", action.Image)
-	}
-	if action.Container != "" {
-		fmt.Fprintf(w, " container=%s", action.Container)
-	}
-	if action.Details != "" {
-		fmt.Fprintf(w, " details=%q", action.Details)
-	}
-	fmt.Fprintln(w)
+	ui.RenderTable(w, table)
 }
 
 func planIngressDetails(action deployment.Action) string {
@@ -2124,7 +2259,7 @@ func deployCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "deploy ENV",
 		Short: "Build, push, place, and roll services",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := cmd.Context()
 			envName := args[0]
@@ -2405,7 +2540,7 @@ func promoteCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "promote SOURCE_ENV TARGET_ENV",
 		Short: "Promote an existing release image set into another environment",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.SourceEnv, ui.TargetEnv),
 		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := cmd.Context()
 			sourceEnv := args[0]
@@ -3170,7 +3305,7 @@ func lockCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "lock ENV",
 		Short: "Prevent deploys to an environment until unlocked",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			cfg, err := config.Load(opts.configPath)
@@ -3210,7 +3345,7 @@ func unlockCmd(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "unlock ENV",
 		Short: "Allow deploys to a locked environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			cfg, err := config.Load(opts.configPath)
@@ -3247,7 +3382,7 @@ func scaleCmd(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "scale ENV SERVICE=N [SERVICE=N...]",
 		Short: "Preview deterministic manual scaling placement",
-		Args:  cobra.MinimumNArgs(2),
+		Args:  ui.MinimumArgs(2, ui.Env, ui.ScaleAssignments),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -3293,7 +3428,7 @@ func pruneCmd(opts *options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "prune ENV",
 		Short: "Prune unused Ship-managed Docker images on environment hosts",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			_, env, store, err := environmentContext(opts, envName)
@@ -3343,7 +3478,7 @@ func statusCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "status ENV",
 		Short: "Show desired placements and release state",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -3377,7 +3512,7 @@ func psCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ps ENV",
 		Short: "List observed Ship-managed containers",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -3444,34 +3579,43 @@ func buildPSView(status statusView, includeExtra bool, service string) psView {
 }
 
 func renderPSText(w io.Writer, view psView) {
-	fmt.Fprintf(w, "containers %s", view.Environment)
+	style := ui.NewStyle(w)
+	fmt.Fprint(w, style.Teal("environment "))
+	fmt.Fprint(w, style.White(view.Environment))
 	if view.Current != "" {
-		fmt.Fprintf(w, " current=%s", view.Current)
-	}
-	fmt.Fprintln(w)
-	if len(view.Containers) == 0 {
-		fmt.Fprintln(w, "none")
-		return
-	}
-	for _, container := range view.Containers {
-		fmt.Fprintf(w, "- host=%s name=%s kind=%s", container.Host, container.Name, container.Kind)
-		if container.Service != "" {
-			fmt.Fprintf(w, " service=%s.%d", container.Service, container.Replica)
-		}
-		if container.Accessory != "" {
-			fmt.Fprintf(w, " accessory=%s", container.Accessory)
-		}
-		if container.Release != "" {
-			fmt.Fprintf(w, " release=%s", container.Release)
-		}
-		if container.Image != "" {
-			fmt.Fprintf(w, " image=%s", container.Image)
-		}
-		if container.Status != "" {
-			fmt.Fprintf(w, " status=%q", container.Status)
-		}
+		fmt.Fprint(w, style.Gray("  current "))
+		fmt.Fprintln(w, style.Teal(view.Current))
+	} else {
 		fmt.Fprintln(w)
 	}
+	if len(view.Containers) == 0 {
+		fmt.Fprintln(w, style.Gray("no containers"))
+		return
+	}
+
+	table := ui.NewTable(w)
+	table.SetHeaders("HOST", "NAME", "KIND", "SERVICE", "RELEASE", "STATUS")
+	for _, container := range view.Containers {
+		service := ""
+		if container.Service != "" {
+			service = fmt.Sprintf("%s.%d", container.Service, container.Replica)
+		} else if container.Accessory != "" {
+			service = container.Accessory
+		}
+		status := container.Status
+		if status == "" {
+			status = "-"
+		}
+		table.AddRow(
+			container.Host,
+			container.Name,
+			container.Kind,
+			service,
+			container.Release,
+			status,
+		)
+	}
+	ui.RenderTable(w, table)
 }
 
 func healthCmd(opts *options) *cobra.Command {
@@ -3480,7 +3624,7 @@ func healthCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "health ENV [SERVICE]",
 		Short: "Run configured health checks against the current release",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  ui.RangeArgs(1, 2, ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			serviceName := ""
@@ -3592,31 +3736,47 @@ func runHealthChecks(ctx context.Context, dryRun bool, cfg *config.Config, envNa
 }
 
 func renderHealthText(w io.Writer, view healthView) {
-	fmt.Fprintf(w, "health %s", view.Environment)
+	fields := []ui.HeaderField{{Label: "ok", Value: fmt.Sprintf("%t", view.OK)}}
 	if view.Current != "" {
-		fmt.Fprintf(w, " current=%s", view.Current)
+		fields = append([]ui.HeaderField{{Label: "release", Value: view.Current, Accent: true}}, fields...)
 	}
-	fmt.Fprintf(w, " ok=%t\n", view.OK)
+	ui.PrintHeader(w, view.Environment, fields...)
 	if len(view.Checks) == 0 {
-		fmt.Fprintln(w, "none")
+		ui.PrintNotice(w, "no checks")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("HOST", "SERVICE", "CONTAINER", "STATUS", "CODE", "MS", "DETAIL")
 	for _, check := range view.Checks {
-		fmt.Fprintf(w, "- host=%s service=%s.%d container=%s status=%s", check.Host, check.Service, check.Replica, check.Container, check.Status)
-		if check.DurationMS > 0 {
-			fmt.Fprintf(w, " duration_ms=%d", check.DurationMS)
-		}
+		code := "-"
 		if check.StatusCode > 0 {
-			fmt.Fprintf(w, " status_code=%d", check.StatusCode)
+			code = strconv.Itoa(check.StatusCode)
 		}
-		if check.Error != "" {
-			fmt.Fprintf(w, " error=%q", check.Error)
+		ms := "-"
+		if check.DurationMS > 0 {
+			ms = strconv.FormatInt(check.DurationMS, 10)
 		}
-		if check.Output != "" {
-			fmt.Fprintf(w, " output=%q", check.Output)
+		detail := check.Error
+		if detail == "" {
+			detail = check.Output
 		}
-		fmt.Fprintln(w)
+		if detail == "" && check.URL != "" {
+			detail = check.URL
+		}
+		if detail == "" && check.Command != "" {
+			detail = check.Command
+		}
+		table.AddRow(
+			check.Host,
+			fmt.Sprintf("%s.%d", check.Service, check.Replica),
+			check.Container,
+			check.Status,
+			code,
+			ms,
+			ui.Dash(detail),
+		)
 	}
+	ui.RenderTable(w, table)
 }
 
 func maintenanceCmd(opts *options) *cobra.Command {
@@ -3625,7 +3785,7 @@ func maintenanceCmd(opts *options) *cobra.Command {
 	enable := &cobra.Command{
 		Use:   "enable ENV",
 		Short: "Serve a 503 maintenance page for all ingress domains",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMaintenanceEnable(cmd.Context(), cmd.OutOrStdout(), opts, args[0], message)
 		},
@@ -3636,7 +3796,7 @@ func maintenanceCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "disable ENV",
 		Short: "Restore normal ingress routing",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMaintenanceDisable(cmd.Context(), cmd.OutOrStdout(), opts, args[0])
 		},
@@ -3646,7 +3806,7 @@ func maintenanceCmd(opts *options) *cobra.Command {
 	status := &cobra.Command{
 		Use:   "status ENV",
 		Short: "Show maintenance mode state",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir, err := localStateDirForConfig(opts.configPath)
 			if err != nil {
@@ -3806,7 +3966,7 @@ func normalIngressAction(cfg *config.Config, env config.Environment, envName, st
 		return deployment.Action{}, err
 	}
 	hosts := ingress.HostsForEnvironment(cfg, env, placements)
-	caddyfile := ingress.GenerateCaddyfile(cfg, placements)
+	caddyfile := ingress.GenerateCaddyfile(cfg, scheduler.HostsForEnvironment(env), placements)
 	if strings.TrimSpace(caddyfile) == "" && len(fallbackHosts) > 0 {
 		hosts = fallbackHosts
 	}
@@ -3947,7 +4107,7 @@ func logsCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "logs ENV SERVICE",
 		Short: "Fetch service logs from placed hosts",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Service),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -4112,7 +4272,7 @@ func restartCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restart ENV [SERVICE]",
 		Short: "Recreate current release service containers",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  ui.RangeArgs(1, 2, ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			serviceName := ""
@@ -4283,7 +4443,7 @@ func execServiceCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "exec ENV SERVICE -- COMMAND",
 		Short: "Run a command inside deployed service containers",
-		Args:  cobra.MinimumNArgs(3),
+		Args:  ui.MinimumArgs(3, ui.Env, ui.Service, ui.ArgNamed("COMMAND", "command to run inside the container")),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			serviceName := args[1]
@@ -4397,7 +4557,7 @@ func inspectCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inspect ENV",
 		Short: "Show structured environment release, placement, observed state, and events",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -4492,7 +4652,7 @@ func supportCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "support ENV",
 		Short: "Collect a redacted support bundle for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if eventsLimit <= 0 {
 				return fmt.Errorf("--events-limit must be greater than zero")
@@ -4566,26 +4726,32 @@ func newestEvents(events []state.Event, limit int) []state.Event {
 }
 
 func renderSupportText(w io.Writer, bundle supportBundle) {
-	fmt.Fprintf(w, "support bundle %s generated=%s\n", bundle.Environment, bundle.GeneratedAt.Format(time.RFC3339))
-	fmt.Fprintf(w, "doctor passed=%d warnings=%d failed=%d\n", bundle.Doctor.Summary.Passed, bundle.Doctor.Summary.Warnings, bundle.Doctor.Summary.Failed)
+	ui.PrintHeader(w, bundle.Environment,
+		ui.HeaderField{Label: "generated", Value: bundle.GeneratedAt.Format(time.RFC3339)},
+	)
+	table := ui.NewTable(w)
+	table.SetHeaders("SECTION", "SUMMARY")
+	table.AddRow("doctor", fmt.Sprintf("passed=%d warnings=%d failed=%d", bundle.Doctor.Summary.Passed, bundle.Doctor.Summary.Warnings, bundle.Doctor.Summary.Failed))
 	if bundle.Hosts != nil {
-		fmt.Fprintf(w, "hosts count=%d source=%s\n", len(bundle.Hosts.Hosts), bundle.Hosts.Source)
+		table.AddRow("hosts", fmt.Sprintf("count=%d source=%s", len(bundle.Hosts.Hosts), bundle.Hosts.Source))
 	}
 	if bundle.Status != nil {
-		fmt.Fprintf(w, "status desired=%d observed=%d extra=%d drift=%t config_drift=%t\n", len(bundle.Status.Desired), len(bundle.Status.Observed), len(bundle.Status.ExtraObserved), bundle.Status.Summary.Drift, bundle.Status.ConfigDrift)
+		table.AddRow("status", fmt.Sprintf("desired=%d observed=%d extra=%d drift=%t config_drift=%t",
+			len(bundle.Status.Desired), len(bundle.Status.Observed), len(bundle.Status.ExtraObserved), bundle.Status.Summary.Drift, bundle.Status.ConfigDrift))
 	}
 	if bundle.Releases != nil {
-		fmt.Fprintf(w, "releases count=%d\n", len(bundle.Releases.Releases))
+		table.AddRow("releases", fmt.Sprintf("count=%d", len(bundle.Releases.Releases)))
 	}
-	fmt.Fprintf(w, "accessories count=%d\n", len(bundle.Accessories))
-	fmt.Fprintf(w, "events count=%d\n", len(bundle.Events))
+	table.AddRow("accessories", fmt.Sprintf("count=%d", len(bundle.Accessories)))
+	table.AddRow("events", fmt.Sprintf("count=%d", len(bundle.Events)))
+	ui.RenderTable(w, table)
 	if len(bundle.Errors) > 0 {
-		fmt.Fprintln(w, "collection errors:")
+		ui.PrintSection(w, "Collection errors")
 		for _, err := range bundle.Errors {
-			fmt.Fprintf(w, "- %s: %s\n", err.Section, err.Error)
+			ui.PrintErrorLine(w, err.Section+": "+err.Error)
 		}
 	}
-	fmt.Fprintln(w, "use --json for the complete redacted bundle")
+	ui.PrintNotice(w, "use --json for the complete redacted bundle")
 }
 
 func eventsCmd(opts *options) *cobra.Command {
@@ -4593,7 +4759,7 @@ func eventsCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "events ENV",
 		Short: "Show local Ship event timeline",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, _, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -4606,6 +4772,7 @@ func eventsCmd(opts *options) *cobra.Command {
 			if jsonOutput {
 				return writeJSON(cmd.OutOrStdout(), events)
 			}
+			ui.PrintHeader(cmd.OutOrStdout(), args[0])
 			renderEventsText(cmd.OutOrStdout(), events)
 			return nil
 		},
@@ -4631,7 +4798,7 @@ func releasesCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "releases ENV",
 		Short: "Show local release history for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, _, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -4689,7 +4856,7 @@ func releaseDiffCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "diff ENV",
 		Short: "Compare two release records",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(fromID) == "" {
 				return fmt.Errorf("--from release id is required")
@@ -4777,32 +4944,38 @@ func mapDiffEmpty(diff mapDiffView) bool {
 }
 
 func renderReleaseDiffText(w io.Writer, view releaseDiffView) {
-	fmt.Fprintf(w, "release diff %s %s -> %s\n", view.Environment, view.From.ID, view.To.ID)
+	ui.PrintHeader(w, view.Environment,
+		ui.HeaderField{Label: "from", Value: view.From.ID, Accent: true},
+		ui.HeaderField{Label: "to", Value: view.To.ID, Accent: true},
+	)
 	if !view.Changed {
-		fmt.Fprintln(w, "no changes")
+		ui.PrintNotice(w, "no changes")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("KIND", "NAME", "FROM", "TO")
 	if view.Config.Changed {
-		fmt.Fprintf(w, "config changed %s -> %s\n", emptyAsNone(view.Config.From), emptyAsNone(view.Config.To))
+		table.AddRow("config", "ship.yml", emptyAsNone(view.Config.From), emptyAsNone(view.Config.To))
 	}
 	for _, name := range view.Images.Added {
-		fmt.Fprintf(w, "image added %s=%s\n", name, view.To.Images[name])
+		table.AddRow("image", name, "-", view.To.Images[name])
 	}
 	for _, entry := range view.Images.Changed {
-		fmt.Fprintf(w, "image changed %s %s -> %s\n", entry.Name, entry.From, entry.To)
+		table.AddRow("image", entry.Name, entry.From, entry.To)
 	}
 	for _, name := range view.Images.Removed {
-		fmt.Fprintf(w, "image removed %s=%s\n", name, view.From.Images[name])
+		table.AddRow("image", name, view.From.Images[name], "-")
 	}
 	for _, name := range view.Secrets.Missing {
-		fmt.Fprintf(w, "secret added %s\n", name)
+		table.AddRow("secret", name, "-", "added")
 	}
 	for _, name := range view.Secrets.Changed {
-		fmt.Fprintf(w, "secret changed %s\n", name)
+		table.AddRow("secret", name, "changed", "changed")
 	}
 	for _, name := range view.Secrets.Extra {
-		fmt.Fprintf(w, "secret removed %s\n", name)
+		table.AddRow("secret", name, "present", "-")
 	}
+	ui.RenderTable(w, table)
 }
 
 func buildReleaseHistoryView(envName string, store state.Store, limit int) (releaseHistoryView, error) {
@@ -4839,33 +5012,47 @@ func buildReleaseHistoryView(envName string, store state.Store, limit int) (rele
 }
 
 func renderReleaseHistoryText(w io.Writer, view releaseHistoryView) {
-	fmt.Fprintf(w, "releases %s\n", view.Environment)
+	ui.PrintHeader(w, view.Environment)
 	if len(view.Releases) == 0 {
-		fmt.Fprintln(w, "none")
+		ui.PrintNotice(w, "no releases")
 		return
 	}
+	table := ui.NewTable(w)
+	table.SetHeaders("ID", "STATUS", "HEALTHY", "CREATED", "MARKERS")
 	for _, entry := range view.Releases {
 		release := entry.Release
-		markers := releaseHistoryMarkers(entry)
-		if markers != "" {
-			markers = " " + markers
-		}
-		fmt.Fprintf(w, "- %s status=%s healthy=%t created=%s%s\n", release.ID, release.Status, release.Healthy, release.CreatedAt.Format(time.RFC3339), markers)
+		table.AddRow(
+			release.ID,
+			release.Status,
+			fmt.Sprintf("%t", release.Healthy),
+			release.CreatedAt.Format(time.RFC3339),
+			ui.Dash(releaseHistoryMarkers(entry)),
+		)
+	}
+	ui.RenderTable(w, table)
+	style := ui.NewStyle(w)
+	for _, entry := range view.Releases {
+		release := entry.Release
+		var details []string
 		if release.CompletedAt != nil {
-			fmt.Fprintf(w, "  completed=%s\n", release.CompletedAt.Format(time.RFC3339))
+			details = append(details, "completed="+release.CompletedAt.Format(time.RFC3339))
 		}
 		if release.FailedAt != nil {
-			fmt.Fprintf(w, "  failed=%s\n", release.FailedAt.Format(time.RFC3339))
+			details = append(details, "failed="+release.FailedAt.Format(time.RFC3339))
 		}
 		if release.Error != "" {
-			fmt.Fprintf(w, "  error=%q\n", release.Error)
+			details = append(details, fmt.Sprintf("error=%q", release.Error))
 		}
 		if release.ConfigHash != "" {
-			fmt.Fprintf(w, "  config=%s\n", release.ConfigHash)
+			details = append(details, "config="+release.ConfigHash)
 		}
 		for _, service := range sortedMapKeys(release.Images) {
-			fmt.Fprintf(w, "  image %s=%s\n", service, release.Images[service])
+			details = append(details, fmt.Sprintf("image %s=%s", service, release.Images[service]))
 		}
+		if len(details) == 0 {
+			continue
+		}
+		fmt.Fprintf(w, "%s\n", style.Gray("  "+release.ID+": "+strings.Join(details, "  ")))
 	}
 }
 
@@ -4899,7 +5086,7 @@ func rollbackCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rollback ENV",
 		Short: "Apply the previous healthy release",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			ctx := cmd.Context()
 			cfg, err := config.Load(opts.configPath)
@@ -5265,7 +5452,7 @@ func recoverCmd(opts *options) *cobra.Command {
 		Use:     "recover ENV",
 		Aliases: []string{"recovery"},
 		Short:   "Show failed deploy recovery information from local state",
-		Args:    cobra.ExactArgs(1),
+		Args:    ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _, store, err := environmentContext(opts, args[0])
 			if err != nil {
@@ -5350,40 +5537,44 @@ func suggestedRollbackCommand(envName, releaseID string, allowDataRollback bool)
 }
 
 func renderRecoveryText(w io.Writer, view recoveryView) {
-	fmt.Fprintf(w, "recovery %s\n", view.Environment)
+	var fields []ui.HeaderField
 	if view.CurrentRelease == nil {
-		fmt.Fprintln(w, "current release none")
+		fields = append(fields, ui.HeaderField{Label: "release", Value: "none"})
 	} else {
-		fmt.Fprintf(w, "current release %s status=%s healthy=%t\n", view.CurrentRelease.ID, view.CurrentRelease.Status, view.CurrentRelease.Healthy)
+		fields = append(fields, ui.HeaderField{
+			Label:  "release",
+			Value:  fmt.Sprintf("%s (%s, healthy=%t)", view.CurrentRelease.ID, view.CurrentRelease.Status, view.CurrentRelease.Healthy),
+			Accent: true,
+		})
 	}
-	if len(view.FailedReleases) == 0 {
-		fmt.Fprintln(w, "failed releases none")
-	} else {
-		fmt.Fprintln(w, "failed releases:")
+	ui.PrintHeader(w, view.Environment, fields...)
+	if len(view.FailedReleases) > 0 {
+		ui.PrintSection(w, "Failed releases")
+		table := ui.NewTable(w)
+		table.SetHeaders("ID", "ERROR")
 		for _, release := range view.FailedReleases {
-			fmt.Fprintf(w, "- %s", release.ID)
-			if release.Error != "" {
-				fmt.Fprintf(w, " error=%q", release.Error)
-			}
-			fmt.Fprintln(w)
+			table.AddRow(release.ID, ui.Dash(release.Error))
 		}
+		ui.RenderTable(w, table)
+	} else {
+		ui.PrintNotice(w, "no failed releases")
 	}
 	if view.RollbackTarget != nil {
-		fmt.Fprintf(w, "rollback target %s\n", view.RollbackTarget.ID)
+		ui.PrintLine(w, "rollback target:", view.RollbackTarget.ID)
 	} else if view.RollbackError != "" {
-		fmt.Fprintf(w, "rollback target unavailable: %s\n", view.RollbackError)
+		ui.PrintWarn(w, "rollback target unavailable: "+view.RollbackError)
 	}
 	if len(view.RollbackBlockers) > 0 {
-		fmt.Fprintln(w, "rollback blockers:")
+		ui.PrintSection(w, "Rollback blockers")
 		for _, blocker := range view.RollbackBlockers {
-			fmt.Fprintf(w, "- %s\n", blocker)
+			ui.PrintWarn(w, blocker)
 		}
 	}
 	if view.SuggestedCommand != "" {
-		fmt.Fprintf(w, "suggested rollback: %s\n", view.SuggestedCommand)
+		ui.PrintLine(w, "suggested rollback:", view.SuggestedCommand)
 	}
 	if len(view.Events) > 0 {
-		fmt.Fprintln(w, "recent failure events:")
+		ui.PrintSection(w, "Recent failure events")
 		renderEventsText(w, view.Events)
 	}
 }
@@ -5472,7 +5663,7 @@ func printIngressDryRun(w io.Writer, cfg *config.Config, env config.Environment,
 	if err != nil {
 		return err
 	}
-	caddyfile := ingress.GenerateCaddyfile(cfg, placements)
+	caddyfile := ingress.GenerateCaddyfile(cfg, scheduler.HostsForEnvironment(env), placements)
 	if strings.TrimSpace(caddyfile) == "" {
 		return nil
 	}
@@ -5488,7 +5679,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "deploy ENV [NAME]",
 		Short: "Deploy one accessory container per accessory",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  ui.RangeArgs(1, 2, ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := accessoryContext(opts, args[0])
 			if err != nil {
@@ -5504,7 +5695,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status ENV [NAME]",
 		Short: "Show accessory placement and observed containers",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  ui.RangeArgs(1, 2, ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := accessoryContext(opts, args[0])
 			if err != nil {
@@ -5520,7 +5711,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "backup ENV [NAME]",
 		Short: "Run accessory backup commands on placed hosts",
-		Args:  cobra.RangeArgs(1, 2),
+		Args:  ui.RangeArgs(1, 2, ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := accessoryContext(opts, args[0])
 			if err != nil {
@@ -5539,7 +5730,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	logs := &cobra.Command{
 		Use:   "logs ENV NAME",
 		Short: "Fetch logs from a deployed accessory container",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Accessory),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if logsLines <= 0 {
 				return fmt.Errorf("--lines must be greater than zero")
@@ -5563,7 +5754,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	execCmd := &cobra.Command{
 		Use:   "exec ENV NAME -- COMMAND",
 		Short: "Run a command inside a deployed accessory container",
-		Args:  cobra.MinimumNArgs(3),
+		Args:  ui.MinimumArgs(3, ui.Env, ui.Accessory, ui.ArgNamed("COMMAND", "command to run inside the container")),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if execTimeoutSeconds < 0 {
 				return fmt.Errorf("--timeout cannot be negative")
@@ -5590,7 +5781,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	restore := &cobra.Command{
 		Use:   "restore ENV NAME",
 		Short: "Restore one accessory from an explicit backup artifact",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Accessory),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := accessoryContext(opts, args[0])
 			if err != nil {
@@ -5611,7 +5802,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	failover := &cobra.Command{
 		Use:   "failover ENV NAME",
 		Short: "Move a single-primary accessory to another eligible host after backup/restore checks",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Accessory),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, env, store, err := accessoryContext(opts, args[0])
 			if err != nil {
@@ -5674,7 +5865,11 @@ func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *co
 		if err != nil {
 			return err
 		}
-		secretFile, err = secrets.RenderScopedForEnv(cfg, secretOpts)
+		scopes := make([]string, 0, len(names))
+		for _, name := range names {
+			scopes = append(scopes, "accessory-"+name)
+		}
+		secretFile, err = secrets.RenderScopedForEnv(cfg, secretOpts, scopes...)
 		if err != nil {
 			return err
 		}
@@ -5732,6 +5927,7 @@ func runAccessoryDeploy(ctx context.Context, w io.Writer, opts *options, cfg *co
 		params := agent.RunContainerParams{
 			Name:           containerName,
 			Image:          acc.Image,
+			Command:        acc.Command,
 			Args:           accessory.DockerArgs(acc, secretEnvFile),
 			Labels:         accessory.ContainerLabels(cfg.Project, envName, name, acc.Labels),
 			Network:        networkName,
@@ -5754,6 +5950,9 @@ func runAccessoryStatus(ctx context.Context, w io.Writer, cfg *config.Config, en
 	if err != nil {
 		return err
 	}
+	ui.PrintHeader(w, envName)
+	table := ui.NewTable(w)
+	table.SetHeaders("ACCESSORY", "PLACEMENT", "HOST", "IMAGE", "STATUS")
 	for _, name := range names {
 		placement := "unplaced"
 		if saved, err := store.ReadAccessoryState(envName, name); err == nil {
@@ -5764,14 +5963,15 @@ func runAccessoryStatus(ctx context.Context, w io.Writer, cfg *config.Config, en
 		items := observed[name]
 		switch len(items) {
 		case 0:
-			fmt.Fprintf(w, "accessory %s placement=%s status=missing\n", name, placement)
+			table.AddRow(name, placement, "-", "-", "missing")
 		case 1:
 			item := items[0]
-			fmt.Fprintf(w, "accessory %s placement=%s host=%s image=%s status=%s\n", name, placement, item.Host.Name, item.Container.Image, item.Container.Status)
+			table.AddRow(name, placement, item.Host.Name, ui.Dash(item.Container.Image), item.Container.Status)
 		default:
-			fmt.Fprintf(w, "accessory %s placement=%s status=replicated hosts=%s\n", name, placement, observationHosts(items))
+			table.AddRow(name, placement, observationHosts(items), "-", "replicated")
 		}
 	}
+	ui.RenderTable(w, table)
 	return nil
 }
 
@@ -6197,6 +6397,7 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 	params := agent.RunContainerParams{
 		Name:           containerName,
 		Image:          acc.Image,
+		Command:        acc.Command,
 		Args:           accessory.DockerArgs(acc, secretEnvFile),
 		Labels:         accessory.ContainerLabels(cfg.Project, envName, name, acc.Labels),
 		Network:        networkName,
@@ -6322,7 +6523,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	initCmd := &cobra.Command{
 		Use:   "init ENV",
 		Short: "Create an encrypted secret store for an environment",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
@@ -6343,7 +6544,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	setCmd := &cobra.Command{
 		Use:   "set ENV NAME",
 		Short: "Set a secret in the encrypted store",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Secret),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
@@ -6370,7 +6571,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	unsetCmd := &cobra.Command{
 		Use:   "unset ENV NAME",
 		Short: "Remove a secret from the encrypted store",
-		Args:  cobra.ExactArgs(2),
+		Args:  ui.ExactArgs(ui.Env, ui.Secret),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
@@ -6388,7 +6589,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list ENV",
 		Short: "List encrypted store secret names",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
@@ -6414,7 +6615,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	exportCmd := &cobra.Command{
 		Use:   "export ENV",
 		Short: "Export encrypted store secrets",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			secretOpts, err := secretSourceOptions(opts, args[0])
 			if err != nil {
@@ -6478,7 +6679,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	cmd.AddCommand(&cobra.Command{
 		Use:   "diff ENV",
 		Short: "Compare local secret digests with the current release",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
@@ -6526,7 +6727,7 @@ func secretsCmd(opts *options) *cobra.Command {
 	render := &cobra.Command{
 		Use:   "render ENV",
 		Short: "Render redacted remote secret env files",
-		Args:  cobra.ExactArgs(1),
+		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !renderDryRun && !opts.dryRun {
 				return fmt.Errorf("secrets render only supports --dry-run in V1")

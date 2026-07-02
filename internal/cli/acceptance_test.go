@@ -157,7 +157,7 @@ func TestAcceptanceFakeInfrastructureWorkflow(t *testing.T) {
 	}
 
 	out = runAcceptanceCommand(t, recoverCmd(&options{configPath: path}), "production")
-	assertAcceptanceOutput(t, out, "failed releases:", "rollback target "+first.ID, "suggested rollback: ship rollback production --to "+first.ID+" --allow-data-rollback")
+	assertAcceptanceOutput(t, out, "Failed releases", "rollback target: "+first.ID, "suggested rollback: ship rollback production --to "+first.ID+" --allow-data-rollback")
 
 	out = runAcceptanceCommand(t, rollbackCmd(&options{configPath: path}), "production", "--to", first.ID, "--allow-data-rollback")
 	assertAcceptanceOutput(t, out, "rollback production to release "+first.ID)
@@ -537,6 +537,13 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 		}
 	case "caddy_reload":
 		a.infra.record("agent:%s:caddy_reload", a.host.Name)
+	case "write_file", "run_oneoff_container", "ensure_network":
+		a.infra.record("agent:%s:%s", a.host.Name, method)
+	case "docker_inspect":
+		a.infra.record("agent:%s:docker_inspect", a.host.Name)
+		if result, ok := out.(*agent.DockerInspectResult); ok {
+			result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+		}
 	default:
 		a.infra.record("agent:%s:%s", a.host.Name, method)
 	}

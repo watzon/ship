@@ -20,6 +20,7 @@ import (
 	"filippo.io/age"
 	accessorypkg "github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/agent"
+	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"
@@ -37,7 +38,14 @@ type recordingBootstrapSSH struct {
 
 func (r recordingBootstrapSSH) Run(_ context.Context, command string) (string, error) {
 	*r.events = append(*r.events, "bootstrap:"+r.host.Name+":run:"+firstCommandLine(command))
-	return "ok", nil
+	switch strings.TrimSpace(command) {
+	case "uname -s":
+		return "Linux", nil
+	case "uname -m":
+		return "x86_64", nil
+	default:
+		return "ok", nil
+	}
 }
 
 func (r recordingBootstrapSSH) RunWithStdin(_ context.Context, command, stdin string) (string, error) {
@@ -55,11 +63,15 @@ func firstCommandLine(command string) string {
 func installBootstrapHooks(t *testing.T, events *[]string) {
 	t.Helper()
 	originalBinary := readCurrentShipBinary
+	originalResolve := resolveShipBinaryForHost
 	originalSSH := newBootstrapSSH
 	originalAttempts := bootstrapMaxAttempts
 	originalDelay := bootstrapRetryDelay
 	readCurrentShipBinary = func() ([]byte, error) {
 		return []byte("ship-test-binary"), nil
+	}
+	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
+		return readCurrentShipBinary()
 	}
 	newBootstrapSSH = func(host scheduler.Host, dryRun bool) bootstrapSSH {
 		return recordingBootstrapSSH{host: host, events: events}
@@ -68,6 +80,7 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 	bootstrapRetryDelay = 0
 	t.Cleanup(func() {
 		readCurrentShipBinary = originalBinary
+		resolveShipBinaryForHost = originalResolve
 		newBootstrapSSH = originalSSH
 		bootstrapMaxAttempts = originalAttempts
 		bootstrapRetryDelay = originalDelay
@@ -77,11 +90,16 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 func installShipBinaryReader(t *testing.T, content []byte) {
 	t.Helper()
 	originalBinary := readCurrentShipBinary
+	originalResolve := resolveShipBinaryForHost
 	readCurrentShipBinary = func() ([]byte, error) {
 		return append([]byte(nil), content...), nil
 	}
+	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
+		return readCurrentShipBinary()
+	}
 	t.Cleanup(func() {
 		readCurrentShipBinary = originalBinary
+		resolveShipBinaryForHost = originalResolve
 	})
 }
 
@@ -223,10 +241,11 @@ func TestHostsCmdUsesConfiguredInventoryBeforeProvisioning(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"hosts production source=config",
-		"ingress-1 pool=ingress user=root contact=ingress-1",
-		"web-1 pool=web user=root contact=web-1",
-		"worker-1 pool=worker user=root contact=worker-1",
+		"environment production",
+		"source config",
+		"ingress-1",
+		"web-1",
+		"worker-1",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("hosts output missing %q:\n%s", needle, text)
@@ -289,8 +308,8 @@ func TestVersionCmdLocal(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"ship version " + agent.AgentVersion,
-		fmt.Sprintf("protocol=%d-%d", agent.AgentMinProtocol, agent.AgentProtocol),
+		agent.AgentVersion,
+		fmt.Sprintf("%d-%d", agent.AgentMinProtocol, agent.AgentProtocol),
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("version output missing %q:\n%s", needle, text)
@@ -432,9 +451,10 @@ func TestAgentUpgradeDryRunDoesNotContactAgents(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"agent upgrade production",
-		"dry_run=true",
-		"would_install=" + config.RemoteBinaryPath,
+		"environment production",
+		"dry-run",
+		"planned",
+		config.RemoteBinaryPath,
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("upgrade dry-run output missing %q:\n%s", needle, text)
@@ -962,14 +982,19 @@ func TestPlanObservedReportsDriftAndRolloutActions(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"observed state current_release=release-current",
-		"drift web.2 host=web-2 state=wrong_release",
-		"extra host=web-1",
-		"service=worker",
-		"rollout actions",
-		"start web.1 on web-1",
-		"stop web.2 on web-2",
-		"stop worker.1 on web-1",
+		"release release-current",
+		"web.2",
+		"web-2",
+		"wrong_release",
+		"Extra containers",
+		"worker.1",
+		"Rollout actions",
+		"start",
+		"web.1",
+		"web-1",
+		"stop",
+		"web.2",
+		"worker.1",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("observed plan output missing %q:\n%s", needle, text)
@@ -3188,7 +3213,7 @@ func TestStatusReportsObservedDriftAndJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := out.String()
-	for _, needle := range []string{"web.2 desired host=web-2", "state=wrong_release", "release=release-old", "extra managed containers", "drift detected"} {
+	for _, needle := range []string{"web.2", "web-2", "wrong_release", "release-old", "Extra containers", "drift detected"} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("status output missing %q:\n%s", needle, text)
 		}
@@ -3314,10 +3339,13 @@ func TestPSListsObservedContainersTextAndJSON(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"containers production current=release-new",
-		"kind=service service=web.1 release=release-new",
-		"kind=ingress",
-		"kind=accessory accessory=postgres",
+		"production",
+		"release-new",
+		"web-1",
+		"service",
+		"web.1",
+		"ingress",
+		"postgres",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("ps output missing %q:\n%s", needle, text)
@@ -3564,7 +3592,7 @@ func TestSupportBundleCollectsRedactedIncidentSnapshot(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"support bundle production", "doctor passed=", "hosts count=2", "status desired=2 observed=2", "events count=1"} {
+	for _, needle := range []string{"environment production", "doctor", "passed=5", "hosts", "count=2", "status", "desired=2 observed=2", "events", "count=1"} {
 		if !strings.Contains(out.String(), needle) {
 			t.Fatalf("support text missing %q:\n%s", needle, out.String())
 		}
@@ -3596,7 +3624,7 @@ func TestEventsCommandJSONAndText(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "scale planned service=web web=2") {
+	if !strings.Contains(out.String(), "scale") || !strings.Contains(out.String(), "planned") || !strings.Contains(out.String(), "service=web") || !strings.Contains(out.String(), "web=2") {
 		t.Fatalf("events output = %q", out.String())
 	}
 
@@ -3667,14 +3695,16 @@ func TestReleasesCommandShowsHistoryTextAndJSON(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"releases production",
-		"- failed-release status=failed healthy=false",
+		"environment production",
+		"failed-release",
+		"failed",
 		"error=\"health failed\"",
-		"- current-release status=healthy healthy=true",
+		"current-release",
+		"healthy",
 		"[current]",
 		"config=sha256:current",
 		"image web=current-image",
-		"- old-release status=healthy healthy=true",
+		"old-release",
 		"[rollback-target]",
 	} {
 		if !strings.Contains(text, needle) {
@@ -3772,14 +3802,21 @@ func TestReleasesDiffShowsImagesConfigAndSecretChanges(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"release diff production old-release -> new-release",
-		"config changed sha256:old -> sha256:new",
-		"image added api=new-api",
-		"image changed web old-web -> new-web",
-		"image removed worker=old-worker",
-		"secret added service-web:API_TOKEN",
-		"secret changed service-web:DATABASE_URL",
-		"secret removed service-web:OLD_SECRET",
+		"environment production",
+		"old-release",
+		"new-release",
+		"config",
+		"sha256:old",
+		"sha256:new",
+		"api",
+		"new-api",
+		"web",
+		"old-web",
+		"new-web",
+		"worker",
+		"service-web:API_TOKEN",
+		"service-web:DATABASE_URL",
+		"service-web:OLD_SECRET",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("release diff output missing %q:\n%s", needle, text)
@@ -3856,11 +3893,12 @@ func TestRecoverShowsFailedReleaseAndSuggestedRollback(t *testing.T) {
 	}
 	text := out.String()
 	for _, needle := range []string{
-		"current release current-release",
+		"current-release",
 		"failed-release",
-		"rollback target old-release",
+		"rollback target: old-release",
 		"suggested rollback: ship rollback production --to old-release",
-		"deploy_rollout failed release=failed-release",
+		"deploy_rollout",
+		"failed-release",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("recover output missing %q:\n%s", needle, text)
@@ -4117,9 +4155,13 @@ func TestHealthChecksCurrentReleaseTextAndJSON(t *testing.T) {
 	text := out.String()
 	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
 	for _, needle := range []string{
-		"health production current=release-1 ok=true",
-		"host=web-2 service=web.2 container=" + wantName + " status=ok",
-		"status_code=200",
+		"environment production",
+		"release-1",
+		"web-2",
+		"web.2",
+		wantName,
+		"ok",
+		"200",
 	} {
 		if !strings.Contains(text, needle) {
 			t.Fatalf("health output missing %q:\n%s", needle, text)
@@ -4698,7 +4740,7 @@ func TestAccessoryStatusReportsPlacementAndObservedContainer(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"accessory postgres", "placement=data-a", "host=data-a", "status=Up 5 seconds"} {
+	for _, needle := range []string{"postgres", "data-a", "Up 5 seconds"} {
 		if !strings.Contains(out.String(), needle) {
 			t.Fatalf("status output missing %q:\n%s", needle, out.String())
 		}
@@ -5563,6 +5605,8 @@ services:
     ports: [3000]
     health:
       http: /up
+    secrets:
+      - DATABASE_URL
     rolling:
       health_retries: 1
       health_interval_seconds: 1
@@ -5741,6 +5785,8 @@ services:
     scale: 1
     env:
       - RACK_ENV=production
+    secrets:
+      - SHIP_TEST_DATABASE_URL
 
 secrets:
   - SHIP_TEST_DATABASE_URL
@@ -5771,6 +5817,8 @@ services:
     command: ./bin/server
     pool: web
     scale: 2
+    secrets:
+      - SHIP_TEST_DATABASE_URL
 
 secrets:
   - SHIP_TEST_DATABASE_URL
@@ -5867,7 +5915,7 @@ func accessoryExportConfigYAML() string {
 }
 
 func accessorySecretConfigYAML() string {
-	return accessoryConfigYAML() + `
+	return strings.Replace(accessoryConfigYAML(), "primary: true\n", "primary: true\n    secrets:\n      - SHIP_TEST_POSTGRES_PASSWORD\n", 1) + `
 secrets:
   - SHIP_TEST_POSTGRES_PASSWORD
 `
@@ -6275,6 +6323,9 @@ func (r recordingDeployAgent) Call(ctx context.Context, method string, params an
 		if result, ok := out.(*agent.CommandResult); ok {
 			*result = agent.CommandResult{Output: "one-off complete"}
 		}
+	case "docker_inspect":
+		*r.events = append(*r.events, fmt.Sprintf("agent:%s:docker_inspect", r.host))
+		populateRunningDockerInspect(out)
 	default:
 		*r.events = append(*r.events, fmt.Sprintf("agent:%s:%s", r.host, method))
 	}
@@ -6381,8 +6432,11 @@ func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params an
 	case "pull":
 		image := params.(map[string]string)["image"]
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:pull:%s", s.host, image))
-	case "ensure_network":
-		return nil
+	case "ensure_network", "write_file", "run_oneoff_container":
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:%s", s.host, method))
+	case "docker_inspect":
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:docker_inspect", s.host))
+		populateRunningDockerInspect(out)
 	case "run_container":
 		p := params.(agent.RunContainerParams)
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:run:%s", s.host, p.Name))
@@ -6401,6 +6455,12 @@ func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params an
 		return fmt.Errorf("%s failed", method)
 	}
 	return nil
+}
+
+func populateRunningDockerInspect(out any) {
+	if result, ok := out.(*agent.DockerInspectResult); ok {
+		result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+	}
 }
 
 type healthDeployAgent struct {
@@ -6426,6 +6486,9 @@ func (h *healthDeployAgent) Call(ctx context.Context, method string, params any,
 				DurationMS: 25,
 			}
 		}
+	case "docker_inspect":
+		*h.events = append(*h.events, fmt.Sprintf("agent:%s:docker_inspect", h.host))
+		populateRunningDockerInspect(out)
 	default:
 		*h.events = append(*h.events, fmt.Sprintf("agent:%s:%s", h.host, method))
 	}
@@ -6454,4 +6517,17 @@ func (p panicDeployDocker) ResolveDigest(context.Context, string) (string, error
 func (p panicDeployDocker) RegistryAuth(context.Context, string) (docker.RegistryAuth, bool, error) {
 	p.t.Fatal("unexpected registry auth")
 	return docker.RegistryAuth{}, false, nil
+}
+
+func TestStatusRequiresEnvironment(t *testing.T) {
+	cmd := statusCmd(&options{})
+	ui.ConfigureRoot(cmd)
+	cmd.SetArgs(nil)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "missing environment") {
+		t.Fatalf("err = %v", err)
+	}
 }
