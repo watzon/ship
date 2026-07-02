@@ -2108,6 +2108,33 @@ func TestValidateServiceIngressHealthSettings(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsIngressHealthPathWithWhitespace(t *testing.T) {
+	cfg := minimalValidConfig()
+	svc := cfg.Services["web"]
+	svc.Ingress = &Ingress{
+		Domains: []string{"example.com"},
+		Health:  IngressHealth{Path: "/up\nevil directive"},
+	}
+	cfg.Services["web"] = svc
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), `service "web" ingress.health.path cannot contain whitespace`) {
+		t.Fatalf("expected ingress health path whitespace error, got %v", err)
+	}
+}
+
+func TestValidateRejectsServiceHealthHTTPWithWhitespace(t *testing.T) {
+	cfg := minimalValidConfig()
+	svc := cfg.Services["web"]
+	svc.Health.HTTP = "/up\nevil directive"
+	cfg.Services["web"] = svc
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), `service "web" health.http cannot contain whitespace`) {
+		t.Fatalf("expected service health.http whitespace error, got %v", err)
+	}
+}
+
 func TestValidateServiceIngressRedirects(t *testing.T) {
 	cfg := &Config{
 		Project:  "x",

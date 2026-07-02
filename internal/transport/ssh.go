@@ -93,10 +93,15 @@ func (s SSH) commandContext(ctx context.Context) (context.Context, context.Cance
 }
 
 func (s SSH) args(command string) []string {
-	args := []string{
-		"-o", "BatchMode=yes",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ConnectTimeout=15",
+	var args []string
+	for _, def := range [][2]string{
+		{"BatchMode", "yes"},
+		{"StrictHostKeyChecking", "accept-new"},
+		{"ConnectTimeout", "15"},
+	} {
+		if !s.hasOption(def[0]) {
+			args = append(args, "-o", def[0]+"="+def[1])
+		}
 	}
 	if s.Port > 0 {
 		args = append(args, "-p", strconv.Itoa(s.Port))
@@ -115,6 +120,15 @@ func (s SSH) args(command string) []string {
 	}
 	args = append(args, s.Target(), command)
 	return args
+}
+
+func (s SSH) hasOption(name string) bool {
+	for key := range s.Options {
+		if strings.EqualFold(strings.TrimSpace(key), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s SSH) knownHostsFile() string {
