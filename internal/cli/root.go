@@ -45,6 +45,34 @@ type options struct {
 	dryRun              bool
 	envFiles            []string
 	secretsIdentityFile string
+	agentBinaryPath     string
+	agentReleaseDir     string
+}
+
+// addAgentBinaryOverrideFlags registers the airgap overrides on every command
+// that can place an agent binary on a host (directly or via
+// --auto-upgrade-agents).
+func addAgentBinaryOverrideFlags(cmd *cobra.Command, opts *options) {
+	cmd.Flags().StringVar(&opts.agentBinaryPath, "agent-binary", "", "prebuilt ship binary (or release .tar.gz) to install on hosts instead of cross-compiling or downloading")
+	cmd.Flags().StringVar(&opts.agentReleaseDir, "agent-release-dir", "", "local mirror of release assets (ship_*_<os>_<arch>.tar.gz + checksums.txt) for hosts without GitHub access")
+}
+
+// agentBinaryOverrides resolves the airgap overrides: explicit flags first,
+// then the environment. Both being set is rejected inside shipbinary.Resolve.
+func agentBinaryOverrides(opts *options) shipbinary.Options {
+	overrides := shipbinary.Options{BinaryPath: opts.agentBinaryPath, ReleaseDir: opts.agentReleaseDir}
+	if overrides.BinaryPath == "" {
+		overrides.BinaryPath = os.Getenv("SHIP_AGENT_BINARY")
+	}
+	if overrides.ReleaseDir == "" {
+		overrides.ReleaseDir = os.Getenv("SHIP_AGENT_RELEASE_DIR")
+	}
+	return overrides
+}
+
+func agentBinaryOverridden(opts *options) bool {
+	overrides := agentBinaryOverrides(opts)
+	return overrides.BinaryPath != "" || overrides.ReleaseDir != ""
 }
 
 var newEnvironmentProvider = providers.ForEnvironment
@@ -158,6 +186,8 @@ func Execute() error {
 	agent.GroupID = ui.GroupInfra
 	version := versionCmd(opts)
 	version.GroupID = ui.GroupInfra
+	release := releaseCmd()
+	release.GroupID = ui.GroupInfra
 	deploy := deployCmd(opts)
 	deploy.GroupID = ui.GroupDeploy
 	promote := promoteCmd(opts)
@@ -202,7 +232,7 @@ func Execute() error {
 	root.AddCommand(
 		init, doctor,
 		cfg, hosts, plan, scale,
-		provision, agent, version,
+		provision, agent, version, release,
 		deploy, promote,
 		status, ps, health, logs, execSvc, restart, inspect, support, events, releases, lock, unlock, maintenance, prune,
 		accessory,
@@ -560,7 +590,7 @@ func provisionCmd(opts *options) *cobra.Command {
 				return err
 			}
 			for _, host := range hosts {
-				shipBinary, err := resolveShipBinaryForHost(ctx, host, opts.dryRun)
+				shipBinary, err := resolveShipBinaryForHost(ctx, host, opts)
 				if err != nil {
 					recordEvent(store, state.Event{Environment: args[0], Kind: "provision", Status: "failed", Host: host.Name, Message: err.Error()})
 					return fmt.Errorf("resolve ship binary for %s: %w", host.Name, err)
@@ -576,6 +606,7 @@ func provisionCmd(opts *options) *cobra.Command {
 		},
 	}
 	apply.Flags().BoolVar(&yes, "yes", false, "confirm provisioning changes")
+	addAgentBinaryOverrideFlags(apply, opts)
 	cmd.AddCommand(apply)
 	var decommissionYes bool
 	decommission := &cobra.Command{
@@ -1066,7 +1097,7 @@ func versionCmd(opts *options) *cobra.Command {
 
 func localVersionView() versionView {
 	return versionView{
-		ShipVersion:      agent.AgentVersion,
+		ShipVersion:      agent.Version(),
 		MinAgentProtocol: agent.AgentMinProtocol,
 		MaxAgentProtocol: agent.AgentProtocol,
 	}
@@ -1281,11 +1312,11 @@ func mergeStringMap(base, override map[string]string) map[string]string {
 	return out
 }
 
-func shipBinaryForHost(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
-	if dryRun {
+func shipBinaryForHost(ctx context.Context, host scheduler.Host, opts *options) ([]byte, error) {
+	if opts.dryRun {
 		return readCurrentShipBinary()
 	}
-	ssh := newBootstrapSSH(host, dryRun)
+	ssh := newBootstrapSSH(host, opts.dryRun)
 	sysname, err := ssh.Run(ctx, "uname -s")
 	if err != nil {
 		return nil, fmt.Errorf("detect remote OS on %s: %w", host.Name, err)
@@ -1298,7 +1329,7 @@ func shipBinaryForHost(ctx context.Context, host scheduler.Host, dryRun bool) ([
 	if err != nil {
 		return nil, fmt.Errorf("unsupported remote platform on %s: %w", host.Name, err)
 	}
-	return shipbinary.Resolve(ctx, target)
+	return shipbinary.Resolve(ctx, target, agentBinaryOverrides(opts))
 }
 
 func bootstrapHost(ctx context.Context, host scheduler.Host, shipBinary []byte, dryRun bool) error {
@@ -1872,9 +1903,9 @@ func agentCmd(opts *options) *cobra.Command {
 	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "run",
-		Short: "Run the agent service loop",
+		Short: "Report agent install status (RPC is served on demand, not by a daemon)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Fprintln(cmd.OutOrStdout(), "ship agent is installed; RPC is served through `ship agent rpc`")
+			fmt.Fprintln(cmd.OutOrStdout(), "ship agent is installed; RPC is served on demand through `ship agent rpc` over SSH, so no daemon runs")
 			return nil
 		},
 	})
@@ -1927,6 +1958,7 @@ func agentCmd(opts *options) *cobra.Command {
 		},
 	}
 	upgrade.Flags().BoolVar(&upgradeJSON, "json", false, "print upgrade results as JSON")
+	addAgentBinaryOverrideFlags(upgrade, opts)
 	cmd.AddCommand(upgrade)
 	cmd.AddCommand(&cobra.Command{
 		Use:   "status ENV",
@@ -1952,6 +1984,45 @@ func agentCmd(opts *options) *cobra.Command {
 			return nil
 		},
 	})
+	return cmd
+}
+
+func releaseCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "release", Short: "Inspect Ship's own release assets"}
+	var jsonOutput bool
+	check := &cobra.Command{
+		Use:   "check VERSION",
+		Short: "Verify a Ship release published binaries for every supported platform",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			statuses, allOK, err := shipbinary.CheckRelease(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				if err := writeJSON(cmd.OutOrStdout(), statuses); err != nil {
+					return err
+				}
+			} else {
+				table := ui.NewTable(cmd.OutOrStdout())
+				table.SetHeaders("ASSET", "STATUS", "DETAIL")
+				for _, status := range statuses {
+					result := "ok"
+					if !status.OK {
+						result = "missing"
+					}
+					table.AddRow(status.Name, result, ui.Dash(status.Detail))
+				}
+				ui.RenderTable(cmd.OutOrStdout(), table)
+			}
+			if !allOK {
+				return fmt.Errorf("release v%s is missing assets; do not pin it for agent installs", strings.TrimPrefix(strings.TrimSpace(args[0]), "v"))
+			}
+			return nil
+		},
+	}
+	check.Flags().BoolVar(&jsonOutput, "json", false, "print asset statuses as JSON")
+	cmd.AddCommand(check)
 	return cmd
 }
 
@@ -1984,11 +2055,11 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 	}
 	view := agentUpgradeView{
 		Environment: envName,
-		ShipVersion: agent.AgentVersion,
+		ShipVersion: agent.Version(),
 		DryRun:      opts.dryRun,
 	}
 	for _, host := range hosts {
-		shipBinary, err := resolveShipBinaryForHost(ctx, host, opts.dryRun)
+		shipBinary, err := resolveShipBinaryForHost(ctx, host, opts)
 		if err != nil {
 			return agentUpgradeView{}, fmt.Errorf("resolve ship binary for %s: %w", host.Name, err)
 		}
@@ -2008,14 +2079,11 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 		if len(view.Hosts) == 0 {
 			recordEvent(store, state.Event{Environment: envName, Kind: "agent_upgrade", Status: "started", Message: fmt.Sprintf("hosts=%d", len(hosts))})
 		}
-		content := base64.StdEncoding.EncodeToString(shipBinary)
-		var result agent.InstallBinaryResult
-		err = newDeployAgent(host).Call(ctx, "install_binary", agent.InstallBinaryParams{
-			Path:          config.RemoteBinaryPath,
-			ContentBase64: content,
-			SHA256:        digest,
-			Mode:          0o755,
-		}, &result)
+		ssh := newBootstrapSSH(host, opts.dryRun)
+		// Restore point beside the target; best-effort since a first install
+		// has nothing to back up.
+		_, _ = ssh.Run(ctx, backupShipBinaryCommand())
+		result, err := installAgentBinary(ctx, host, ssh, shipBinary, digest)
 		if err != nil {
 			entry.Error = err.Error()
 			recordEvent(store, state.Event{Environment: envName, Kind: "agent_upgrade", Status: "failed", Host: host.Name, Message: err.Error()})
@@ -2025,6 +2093,16 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 		entry.Path = result.Path
 		entry.Installed = result.Installed
 		entry.SHA256 = result.SHA256
+		if err := verifyUpgradedAgent(ctx, host, view.ShipVersion, agentBinaryOverridden(opts)); err != nil {
+			restoreMsg := "previous binary restored from " + config.RemoteBinaryPath + ".bak"
+			if _, restoreErr := ssh.Run(ctx, restoreShipBinaryCommand()); restoreErr != nil {
+				restoreMsg = fmt.Sprintf("restore of previous binary also failed: %v", restoreErr)
+			}
+			entry.Error = fmt.Sprintf("post-upgrade check failed: %v (%s)", err, restoreMsg)
+			recordEvent(store, state.Event{Environment: envName, Kind: "agent_upgrade", Status: "failed", Host: host.Name, Message: entry.Error})
+			view.Hosts = append(view.Hosts, entry)
+			continue
+		}
 		if view.SHA256 == "" {
 			view.SHA256 = digest
 		}
@@ -2036,6 +2114,102 @@ func upgradeAgents(ctx context.Context, opts *options, envName string) (agentUpg
 		view.Hosts = append(view.Hosts, entry)
 	}
 	return view, nil
+}
+
+// installAgentBinary installs through the agent RPC, falling back to a plain
+// SSH upload when the host agent predates the install_binary method.
+func installAgentBinary(ctx context.Context, host scheduler.Host, ssh bootstrapSSH, shipBinary []byte, digest string) (agent.InstallBinaryResult, error) {
+	var result agent.InstallBinaryResult
+	err := newDeployAgent(host).Call(ctx, "install_binary", agent.InstallBinaryParams{
+		Path:          config.RemoteBinaryPath,
+		ContentBase64: base64.StdEncoding.EncodeToString(shipBinary),
+		SHA256:        digest,
+		Mode:          0o755,
+	}, &result)
+	if err == nil {
+		return result, nil
+	}
+	var remote agent.RemoteError
+	if errors.As(err, &remote) && remote.Code == agent.ErrorUnknownMethod {
+		if _, sshErr := ssh.RunWithStdin(ctx, uploadShipBinaryCommand(), string(shipBinary)); sshErr != nil {
+			return agent.InstallBinaryResult{}, fmt.Errorf("%w; SSH upload fallback also failed: %v", err, sshErr)
+		}
+		return agent.InstallBinaryResult{Path: config.RemoteBinaryPath, Installed: true, SHA256: digest}, nil
+	}
+	return agent.InstallBinaryResult{}, err
+}
+
+// verifyUpgradedAgent exercises the freshly installed binary — every RPC
+// execs it anew over SSH — so a broken upgrade is caught while the .bak
+// restore point still exists. When an explicit --agent-binary or release-dir
+// override supplied the bytes, its version may legitimately differ from this
+// CLI's, so only the does-it-answer check applies.
+func verifyUpgradedAgent(ctx context.Context, host scheduler.Host, wantVersion string, versionOverridden bool) error {
+	var status agent.Status
+	if err := newDeployAgent(host).Call(ctx, "status", map[string]any{}, &status); err != nil {
+		return fmt.Errorf("upgraded agent did not answer status: %w", err)
+	}
+	if !versionOverridden && status.AgentVersion != wantVersion {
+		return fmt.Errorf("upgraded agent reports version %s, expected %s", status.AgentVersion, wantVersion)
+	}
+	return nil
+}
+
+// preflightAgentProtocols negotiates with every host agent before a rollout
+// touches anything. Compatible agents proceed (older-but-in-window with an
+// info line); incompatible or pre-negotiation agents stop the operation with
+// the one command that fixes it, or are upgraded inline when autoUpgrade is
+// set.
+func preflightAgentProtocols(ctx context.Context, w io.Writer, opts *options, envName string, hosts []scheduler.Host, autoUpgrade bool) error {
+	var incompatible []string
+	for _, host := range hosts {
+		var result agent.NegotiateResult
+		err := newDeployAgent(host).Call(ctx, "negotiate", agent.NegotiateParams{
+			ClientVersion:      agent.Version(),
+			MinProtocolVersion: agent.AgentMinProtocol,
+			MaxProtocolVersion: agent.AgentProtocol,
+		}, &result)
+		if err != nil {
+			var remote agent.RemoteError
+			switch {
+			case errors.As(err, &remote) && remote.Code == agent.ErrorUnknownMethod:
+				incompatible = append(incompatible, host.Name+": agent predates protocol negotiation")
+			case errors.As(err, &remote) && remote.Code == agent.ErrorIncompatibleProtocol:
+				incompatible = append(incompatible, host.Name+": "+remote.Message)
+			default:
+				return fmt.Errorf("agent preflight on %s: %w", host.Name, err)
+			}
+			continue
+		}
+		if result.AgentVersion != "" && result.AgentVersion != agent.Version() {
+			fmt.Fprintf(w, "agent on %s is version %s (CLI %s); protocol %d is compatible\n", host.Name, result.AgentVersion, agent.Version(), result.ProtocolVersion)
+		}
+	}
+	if len(incompatible) == 0 {
+		return nil
+	}
+	if autoUpgrade {
+		fmt.Fprintf(w, "upgrading %d agent(s) before rollout\n", len(incompatible))
+		view, err := upgradeAgents(ctx, opts, envName)
+		if err != nil {
+			return fmt.Errorf("auto-upgrade agents: %w", err)
+		}
+		if failed := countAgentUpgradeFailures(view); failed > 0 {
+			return fmt.Errorf("auto-upgrade agents failed on %d/%d hosts", failed, len(view.Hosts))
+		}
+		return nil
+	}
+	return fmt.Errorf("incompatible agents:\n  %s\n\nFix: ship agent upgrade %s", strings.Join(incompatible, "\n  "), envName)
+}
+
+func backupShipBinaryCommand() string {
+	path := config.RemoteBinaryPath
+	return fmt.Sprintf("set -eu\nif [ -f %s ]; then cp -p %s %s.bak; fi", path, path, path)
+}
+
+func restoreShipBinaryCommand() string {
+	path := config.RemoteBinaryPath
+	return fmt.Sprintf("set -eu\ntest -f %s.bak\ncp -p %s.bak %s", path, path, path)
 }
 
 func renderAgentStatusText(w io.Writer, envName string, hosts []scheduler.Host, fetch func(scheduler.Host) (agent.Status, error)) {
@@ -2380,6 +2554,7 @@ func firstNonEmptyLine(value string) string {
 
 func deployCmd(opts *options) *cobra.Command {
 	var ignoreLock bool
+	var autoUpgradeAgents bool
 	cmd := &cobra.Command{
 		Use:   "deploy ENV",
 		Short: "Build, push, place, and roll services",
@@ -2467,6 +2642,12 @@ func deployCmd(opts *options) *cobra.Command {
 			secretFiles, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
+				return err
+			}
+			// Local validation is done; check CLI/agent compatibility before
+			// spending time on builds or touching remote state.
+			if err := preflightAgentProtocols(ctx, cmd.OutOrStdout(), opts, envName, hosts, autoUpgradeAgents); err != nil {
+				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "blocked", Release: releaseID, Message: err.Error()})
 				return err
 			}
 			deployClient := deployDockerWithLogs(newDeployDocker(), cmd.OutOrStdout())
@@ -2694,12 +2875,15 @@ func deployCmd(opts *options) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&ignoreLock, "ignore-lock", false, "deploy even when the environment has a deploy lock")
+	cmd.Flags().BoolVar(&autoUpgradeAgents, "auto-upgrade-agents", false, "upgrade incompatible host agents inline instead of stopping the deploy")
+	addAgentBinaryOverrideFlags(cmd, opts)
 	return cmd
 }
 
 func promoteCmd(opts *options) *cobra.Command {
 	var sourceReleaseID string
 	var ignoreLock bool
+	var autoUpgradeAgents bool
 	cmd := &cobra.Command{
 		Use:   "promote SOURCE_ENV TARGET_ENV",
 		Short: "Promote an existing release image set into another environment",
@@ -2797,6 +2981,12 @@ func promoteCmd(opts *options) *cobra.Command {
 			secretFiles, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote", Status: "failed", Release: releaseID, Message: err.Error()})
+				return err
+			}
+			// Local validation is done; check CLI/agent compatibility before
+			// touching remote state.
+			if err := preflightAgentProtocols(ctx, cmd.OutOrStdout(), opts, targetEnv, hosts, autoUpgradeAgents); err != nil {
+				recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote", Status: "blocked", Release: releaseID, Message: err.Error()})
 				return err
 			}
 			release := state.Release{
@@ -2901,6 +3091,8 @@ func promoteCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&sourceReleaseID, "release", "", "source release id to promote; defaults to SOURCE_ENV current release")
 	cmd.Flags().BoolVar(&ignoreLock, "ignore-lock", false, "promote even when the target environment has a deploy lock")
+	cmd.Flags().BoolVar(&autoUpgradeAgents, "auto-upgrade-agents", false, "upgrade incompatible host agents inline instead of stopping the promote")
+	addAgentBinaryOverrideFlags(cmd, opts)
 	return cmd
 }
 
@@ -7036,16 +7228,22 @@ func secretRenderScopes(cfg *config.Config, env config.Environment, envName stri
 	return scopes
 }
 
+// systemdUnit is an install marker, not a daemon: Ship's RPC is served by
+// execing `ship agent rpc` over each SSH session, so there is no long-running
+// process to supervise. `ship agent run` prints a notice and exits 0, which
+// under Type=oneshot + RemainAfterExit leaves the unit "active (exited)" —
+// a Restart=always unit here would loop forever.
 func systemdUnit() string {
 	return `[Unit]
-Description=Ship node agent
+Description=Ship node agent (RPC served on demand via SSH; no daemon)
+Documentation=https://github.com/watzon/ship
 After=docker.service
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/local/bin/ship agent run
-Restart=always
-RestartSec=5
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=` + config.RemoteBinaryPath + ` agent run
 
 [Install]
 WantedBy=multi-user.target`

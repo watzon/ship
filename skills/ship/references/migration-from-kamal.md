@@ -257,21 +257,34 @@ Confirm placement, ingress domains, image build/push plan, release commands, and
 Typical in-place cutover:
 
 1. Optional: `ship maintenance enable production --message "Deploying"`
-2. Deploy accessories first if they are new or changed:
+2. **Release host ports held by Kamal.** Ship's Caddy ingress needs 80/443
+   (TCP and UDP 443), and each translated accessory needs its published port
+   (e.g. Redis on 6379). While kamal-proxy or Kamal accessories are running,
+   `ship deploy` and `ship accessory deploy` fail with `port is already
+   allocated` — Ship names the container holding the port in the error. This
+   is the traffic-interruption moment, so do it right before deploying:
+   ```bash
+   ssh root@HOST 'docker stop kamal-proxy'
+   # for each Kamal accessory whose port a Ship accessory will reuse:
+   ssh root@HOST 'docker stop <app>-redis'   # stop, don't rm — keeps rollback cheap
+   ```
+   Stopping (not removing) preserves the containers for rollback; data
+   volumes are untouched either way. Removal happens in Phase 6.
+3. Deploy accessories first if they are new or changed:
    ```bash
    ship accessory deploy production postgres
    ```
    If reusing an existing Postgres data volume on the same host, align `volumes` paths with the existing Docker volume or host path before first deploy.
-3. `ship deploy production`
-4. Verify:
+4. `ship deploy production`
+5. Verify:
    ```bash
    ship status production
    ship health production web
    ship ps production
    ship logs production web --lines 100
    ```
-5. `ship maintenance disable production` if enabled
-6. Update DNS if ingress hosts changed
+6. `ship maintenance disable production` if enabled
+7. Update DNS if ingress hosts changed
 
 ### Phase 6 — Decommission Kamal
 
@@ -279,8 +292,8 @@ After Ship is healthy and traffic is confirmed:
 
 On each host (via SSH):
 
-- Stop Kamal proxy: `docker ps` and stop/remove kamal-proxy container
-- Stop old Kamal app containers (`<service>-<role>-<hash>` pattern)
+- Remove the stopped kamal-proxy container (stopped during Phase 5): `docker rm kamal-proxy`
+- Stop and remove old Kamal app containers (`<service>-<role>-<hash>` pattern) and the stopped Kamal accessories
 - Optionally remove `.kamal/` runtime directory
 - Remove Kamal systemd units or cron if any were added manually
 
@@ -299,6 +312,7 @@ If cutover fails:
 
 - Ship keeps the previous healthy release if deploy health fails
 - `ship rollback production` with `--allow-data-rollback` when accessories are involved
+- To hand ports back to Kamal (Phase 5 only stopped its containers): stop Ship's Caddy/accessory containers on the host, then `docker start kamal-proxy` and `docker start <app>-<accessory>`
 - Re-enable Kamal proxy/containers only if you have not removed them yet; otherwise restore from documented Kamal release tag
 
 Document the rollback decision before cutover.

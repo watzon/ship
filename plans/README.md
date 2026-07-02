@@ -23,6 +23,7 @@ into a plan.
 | 003  | Env-override merge semantics (explicit false, sibling wipes) | P1 | M | in-flight config work committed; 001 recommended | DONE |
 | 004  | Secrets scoping contract tests | P2 | S | — | DONE |
 | 005  | SSH option overrides + ingress health path validation | P2 | S | — | DONE |
+| 006  | Install/update paths: agent binary resolution, release process, docs | P0–P2 (phased) | L | — | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale)
 
@@ -38,6 +39,12 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
   (`ci.yml`, `deployment.go`, `secrets.go`) — their excerpts double as drift
   guards; executors STOP on mismatch rather than merging over WIP.
 - 004 and 005 are independent and can run in parallel with anything.
+- 006 was added 2026-07-02 (planned at `0e4a826`, after the npxray postmortem
+  and the v0.4.1 release), not part of the original improve run. It subsumes
+  vetted finding 5 below (curl + unreachable download fallback) and the
+  "cut a first release tag" direction finding's follow-through. Its phases
+  are independently shippable: A (resolver correctness) first, then B
+  (release process + agent-upgrade safety), then C (airgap).
 
 ## Vetted findings not (yet) planned
 

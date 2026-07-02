@@ -19,13 +19,18 @@ The model is Kamal-like: you define host pools, services, and accessories in YAM
 
 Requires [Go](https://go.dev/dl/) 1.26+ and Docker for deploys.
 
-Install the CLI with `go install`:
+Install the CLI with `go install`, pinned to a released version:
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@latest
+go install github.com/watzon/ship/cmd/ship@v0.4.2
 ```
 
-Pin a branch or tag with `@main` (or `@v0.1.0` once releases are tagged) instead of `@latest`.
+`@latest` works for interactive use; pin an explicit release in CI. Avoid
+`@main` when you will install agents on servers — placing the agent on a
+host with a different OS/architecture downloads that version's binaries from
+[GitHub Releases](https://github.com/watzon/ship/releases), so the version
+you run must have published assets (prebuilt binaries are also there if you
+prefer not to install Go).
 
 Working from a clone:
 

@@ -3,6 +3,8 @@
 
 Provisioning reconciles provider servers by Ship ownership metadata, writes local host facts, waits for SSH, installs Docker prerequisites, uploads the local `ship` binary, and enables the Ship agent service. It does not delete extra servers during apply; cleanup is an explicit decommission command.
 
+The `ship-agent` systemd unit is an install marker, not a daemon: agent RPC is served on demand by execing `ship agent rpc` over each SSH session, so the unit is `Type=oneshot` and shows `active (exited)`. Hosts set up before v0.5.0 have an older unit that restart-loops (`ship agent run` exits immediately by design); rerun `ship agent install ENV` to rewrite and re-enable it.
+
 ```bash
 ship provision apply production --yes
 ship --dry-run agent install production
@@ -69,7 +71,7 @@ Each release stores a hash of the resolved `ship.yml` environment config. `ship 
 
 `ship version` prints the local Ship binary version and supported agent protocol range. `ship version ENV` also asks every resolved host agent for its version, protocol, Docker readiness, state directory, and supported RPC methods; use `--json` for fleet audits and upgrade checks.
 
-`ship agent upgrade ENV` uploads a host-compatible Ship binary through the SSH-framed agent RPC, verifies the SHA-256 checksum, and records upgrade events per host. From a Ship repository checkout with Go installed, Ship can cross-compile for the remote platform. From a release install, use a version with published release assets for the remote OS/architecture, such as `ship_*_linux_amd64.tar.gz` or `ship_*_linux_arm64.tar.gz`. Use `--dry-run` to preview the target path and digest, and `--json` for upgrade reports.
+`ship agent upgrade ENV` uploads a host-compatible Ship binary through the SSH-framed agent RPC, verifies the SHA-256 checksum, and records upgrade events per host. Ship obtains the host binary by trying, in order: the local CLI binary (when its platform matches the host), a cross-compile (only when run inside the `github.com/watzon/ship` source tree with Go installed), and a download of this version's `ship_<version>_<os>_<arch>.tar.gz` from GitHub Releases — verified against the release's `checksums.txt` and checked to actually be an executable for the host platform before anything touches the server. A strategy failing never aborts the ones after it; if all fail, the error lists each attempt with its reason and ends with a single `Fix:` command to run. Because the download uses the CLI's own version, only run agent installs/upgrades from a version with published release assets — check with `ship release check vX.Y.Z` before pinning in CI. Use `--dry-run` to preview the target path and digest, and `--json` for upgrade reports.
 
 `ship health ENV [SERVICE]` runs the configured command or HTTP health checks against the current release without deploying. Use `--replica N` to check one placed service replica and `--json` for monitors or incident tooling.
 

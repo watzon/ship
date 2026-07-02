@@ -15,19 +15,56 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/watzon/ship/internal/binfmt"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/state"
 )
 
-// AgentVersion is the ship CLI and agent release version. Release builds override
-// this via -ldflags "-X github.com/watzon/ship/internal/agent.AgentVersion=...".
-var AgentVersion = "0.4.1"
+// AgentVersion is set by release builds via
+// -ldflags "-X github.com/watzon/ship/internal/agent.AgentVersion=...".
+// Every other build derives its version at runtime; see Version. Keeping the
+// source default empty means a build can never claim a release it is not:
+// a hand-bumped constant once baked "0.4.0" into the immutable v0.1.0 tag,
+// pointing its binaries at release assets that never existed.
+var AgentVersion = ""
+
+// devVersion is reported by plain `go build` checkouts, where neither a
+// release stamp nor a module version is available. Bump after each release.
+const devVersion = "0.4.3-dev"
+
+// Version reports the ship CLI/agent version: the release-stamped value when
+// present, else the true module version recorded by `go install ...@vX.Y.Z`,
+// else the development sentinel (which is never used to derive release-asset
+// URLs).
+func Version() string {
+	if v := strings.TrimSpace(AgentVersion); v != "" {
+		return v
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := strings.TrimSpace(bi.Main.Version); isReleaseTag(v) {
+			return strings.TrimPrefix(v, "v")
+		}
+	}
+	return devVersion
+}
+
+// isReleaseTag accepts exact release tags (v0.4.1) and rejects "(devel)",
+// pseudo-versions from @main installs, and anything else that has no
+// corresponding release assets.
+func isReleaseTag(v string) bool {
+	return releaseTagPattern.MatchString(v)
+}
+
+var releaseTagPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
 const (
 	AgentMinProtocol     = 1
@@ -366,7 +403,7 @@ func (s Server) Handle(ctx context.Context, req Request) Response {
 			}
 			args := append(labelArgs(p.Labels), networkArgs(p.Network, p.NetworkAliases)...)
 			args = append(args, p.Args...)
-			return empty(req.ID, ErrorDocker, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...))
+			return empty(req.ID, ErrorDocker, s.enrichPortConflict(ctx, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...)))
 		})
 	case "run_oneoff_container":
 		return s.withHostLock(req, "run_oneoff_container", func() Response {
@@ -493,7 +530,7 @@ func (s Server) negotiate(req Request) Response {
 		return failure(req.ID, ErrorIncompatibleProtocol, fmt.Errorf("agent supports protocol %d-%d, client requested %d-%d", AgentMinProtocol, AgentProtocol, minVersion, maxVersion))
 	}
 	return result(req.ID, NegotiateResult{
-		AgentVersion:     AgentVersion,
+		AgentVersion:     Version(),
 		ProtocolVersion:  selected,
 		SupportedMethods: supportedMethods(),
 	})
@@ -509,7 +546,7 @@ func (s Server) status(ctx context.Context, req Request) Response {
 		Hostname:         hostname,
 		StateDir:         s.stateDir(),
 		DockerOK:         dockerErr == nil,
-		AgentVersion:     AgentVersion,
+		AgentVersion:     Version(),
 		ProtocolVersion:  AgentProtocol,
 		SupportedMethods: supportedMethods(),
 	})
@@ -902,6 +939,39 @@ func (s Server) ensureNetwork(ctx context.Context, req Request) Response {
 	return result(req.ID, CommandResult{Output: trimOutput(out)})
 }
 
+var bindConflictPattern = regexp.MustCompile(`Bind for (?:\S*:)?(\d+) failed`)
+
+// enrichPortConflict names the container publishing a host port when docker
+// refuses to bind it. Half-migrated hosts hit this constantly — kamal-proxy
+// still holding 80/443, or a Kamal-managed accessory on its old port — and
+// the bare docker error gives no next step.
+func (s Server) enrichPortConflict(ctx context.Context, err error) error {
+	if err == nil || !strings.Contains(err.Error(), "port is already allocated") {
+		return err
+	}
+	match := bindConflictPattern.FindStringSubmatch(err.Error())
+	if match == nil {
+		return err
+	}
+	port := match[1]
+	out, psErr := s.command()(ctx, "docker", "ps", "--format", "{{.Names}}\t{{.Ports}}")
+	if psErr != nil {
+		return err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		name, ports, ok := strings.Cut(line, "\t")
+		if !ok || !publishesHostPort(ports, port) {
+			continue
+		}
+		return fmt.Errorf("%w; host port %s is published by container %q — stop it before deploying (docker stop %s); during a Kamal migration this is typically kamal-proxy or a Kamal accessory that is still running", err, port, name, name)
+	}
+	return err
+}
+
+func publishesHostPort(ports, port string) bool {
+	return strings.Contains(ports, ":"+port+"->")
+}
+
 func (s Server) installBinary(req Request) Response {
 	var p InstallBinaryParams
 	if err := decode(req.Params, &p); err != nil {
@@ -919,6 +989,21 @@ func (s Server) installBinary(req Request) Response {
 	digest := hex.EncodeToString(sum[:])
 	if p.SHA256 != "" && !strings.EqualFold(p.SHA256, digest) {
 		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("binary checksum mismatch"))
+	}
+	// The client supplies both bytes and hash, so the checksum alone proves
+	// nothing about what is being installed; refuse anything that is not an
+	// executable for this host before it can replace the agent.
+	goos, goarch, ok := binfmt.Detect(data)
+	if !ok && runtime.GOOS == "darwin" && binfmt.HasDarwinSlice(data, runtime.GOARCH) {
+		// Universal Mach-O with a slice for this host; mirrors the CLI-side
+		// verifyBinaryPlatform acceptance.
+		goos, goarch, ok = runtime.GOOS, runtime.GOARCH, true
+	}
+	if !ok {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("binary is not a recognizable executable"))
+	}
+	if goos != runtime.GOOS || goarch != runtime.GOARCH {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("binary targets %s/%s but this host is %s/%s", goos, goarch, runtime.GOOS, runtime.GOARCH))
 	}
 	mode := os.FileMode(0o755)
 	if p.Mode != 0 {

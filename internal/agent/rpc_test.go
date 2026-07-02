@@ -306,6 +306,54 @@ func TestRunOneOffContainerUsesDockerRunRemove(t *testing.T) {
 	}
 }
 
+func TestEnrichPortConflictNamesHolder(t *testing.T) {
+	server := Server{CommandRunner: func(ctx context.Context, name string, args ...string) (string, error) {
+		return "kamal-proxy\t0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/udp\nnpxray-redis\t127.0.0.1:6379->6379/tcp", nil
+	}}
+	base := errors.New(`docker run: driver failed programming external connectivity on endpoint caddy (abc): Bind for 0.0.0.0:443 failed: port is already allocated`)
+	err := server.enrichPortConflict(context.Background(), base)
+	if !errors.Is(err, base) {
+		t.Fatalf("enriched error must wrap the original, got %v", err)
+	}
+	for _, needle := range []string{`"kamal-proxy"`, "docker stop kamal-proxy", "Kamal"} {
+		if !strings.Contains(err.Error(), needle) {
+			t.Fatalf("enriched error missing %q: %v", needle, err)
+		}
+	}
+
+	redisErr := errors.New(`Bind for 127.0.0.1:6379 failed: port is already allocated`)
+	if err := server.enrichPortConflict(context.Background(), redisErr); !strings.Contains(err.Error(), `"npxray-redis"`) {
+		t.Fatalf("redis conflict not attributed: %v", err)
+	}
+
+	if got := server.enrichPortConflict(context.Background(), nil); got != nil {
+		t.Fatalf("nil error must pass through, got %v", got)
+	}
+	other := errors.New("image not found")
+	if got := server.enrichPortConflict(context.Background(), other); got != other {
+		t.Fatalf("unrelated error must pass through unchanged, got %v", got)
+	}
+
+	unmatched := errors.New(`Bind for 0.0.0.0:5432 failed: port is already allocated`)
+	if got := server.enrichPortConflict(context.Background(), unmatched); got != unmatched {
+		t.Fatalf("conflict with unknown holder must pass through unchanged, got %v", got)
+	}
+}
+
+func TestInstallBinaryRejectsNonExecutablePayload(t *testing.T) {
+	server := testServer(t)
+	resp := server.Handle(context.Background(), request(t, "install-bad", "install_binary", InstallBinaryParams{
+		Path:          filepath.Join(t.TempDir(), "ship"),
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte("not a binary")),
+	}))
+	if resp.OK || resp.ErrorCode != ErrorInvalidParams {
+		t.Fatalf("install response = %+v, want invalid_params rejection", resp)
+	}
+	if !strings.Contains(resp.Error, "not a recognizable executable") {
+		t.Fatalf("install error = %q", resp.Error)
+	}
+}
+
 func TestWriteFileInstallBinaryAndStateMigration(t *testing.T) {
 	server := testServer(t)
 	target := filepath.Join(t.TempDir(), "nested", "config.txt")
@@ -328,7 +376,17 @@ func TestWriteFileInstallBinaryAndStateMigration(t *testing.T) {
 	}
 
 	binaryPath := filepath.Join(t.TempDir(), "ship")
-	binaryContent := base64.StdEncoding.EncodeToString([]byte("binary"))
+	// install_binary refuses anything that is not an executable for this
+	// host, so use the running test binary as a valid payload.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selfBytes, err := os.ReadFile(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryContent := base64.StdEncoding.EncodeToString(selfBytes)
 	installResp := server.Handle(context.Background(), request(t, "install-1", "install_binary", InstallBinaryParams{
 		Path:          binaryPath,
 		ContentBase64: binaryContent,

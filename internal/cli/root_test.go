@@ -70,7 +70,7 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 	readCurrentShipBinary = func() ([]byte, error) {
 		return []byte("ship-test-binary"), nil
 	}
-	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
+	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, opts *options) ([]byte, error) {
 		return readCurrentShipBinary()
 	}
 	newBootstrapSSH = func(host scheduler.Host, dryRun bool) bootstrapSSH {
@@ -87,6 +87,15 @@ func installBootstrapHooks(t *testing.T, events *[]string) {
 	})
 }
 
+func installUpgradeSSHHook(t *testing.T, events *[]string) {
+	t.Helper()
+	originalSSH := newBootstrapSSH
+	newBootstrapSSH = func(host scheduler.Host, dryRun bool) bootstrapSSH {
+		return recordingBootstrapSSH{host: host, events: events}
+	}
+	t.Cleanup(func() { newBootstrapSSH = originalSSH })
+}
+
 func installShipBinaryReader(t *testing.T, content []byte) {
 	t.Helper()
 	originalBinary := readCurrentShipBinary
@@ -94,7 +103,7 @@ func installShipBinaryReader(t *testing.T, content []byte) {
 	readCurrentShipBinary = func() ([]byte, error) {
 		return append([]byte(nil), content...), nil
 	}
-	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, dryRun bool) ([]byte, error) {
+	resolveShipBinaryForHost = func(ctx context.Context, host scheduler.Host, opts *options) ([]byte, error) {
 		return readCurrentShipBinary()
 	}
 	t.Cleanup(func() {
@@ -338,7 +347,7 @@ func TestVersionCmdEnvironmentJSON(t *testing.T) {
 				Hostname:         "node-" + host.Name,
 				StateDir:         config.RemoteStateDir,
 				DockerOK:         true,
-				AgentVersion:     agent.AgentVersion,
+				AgentVersion:     agent.Version(),
 				ProtocolVersion:  agent.AgentProtocol,
 				SupportedMethods: []string{"status", "pull"},
 			}
@@ -357,14 +366,14 @@ func TestVersionCmdEnvironmentJSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &view); err != nil {
 		t.Fatalf("invalid json %q: %v", out.String(), err)
 	}
-	if view.ShipVersion != agent.AgentVersion || view.MinAgentProtocol != agent.AgentMinProtocol || view.MaxAgentProtocol != agent.AgentProtocol {
+	if view.ShipVersion != agent.Version() || view.MinAgentProtocol != agent.AgentMinProtocol || view.MaxAgentProtocol != agent.AgentProtocol {
 		t.Fatalf("local version fields = %+v", view)
 	}
 	if view.Environment != "production" || len(view.Hosts) != 1 {
 		t.Fatalf("view = %+v", view)
 	}
 	host := view.Hosts[0]
-	if host.Name != "web-1" || host.Pool != "web" || host.AgentVersion != agent.AgentVersion || host.AgentProtocol != agent.AgentProtocol || !host.DockerOK {
+	if host.Name != "web-1" || host.Pool != "web" || host.AgentVersion != agent.Version() || host.AgentProtocol != agent.AgentProtocol || !host.DockerOK {
 		t.Fatalf("host version = %+v", host)
 	}
 	if strings.Join(host.SupportedMethods, ",") != "status,pull" {
@@ -384,20 +393,31 @@ func TestAgentUpgradeUploadsCurrentBinary(t *testing.T) {
 	binary := []byte("ship-upgrade-binary")
 	installShipBinaryReader(t, binary)
 	wantSum := fmt.Sprintf("%x", sha256.Sum256(binary))
+	var sshEvents []string
+	installUpgradeSSHHook(t, &sshEvents)
 	var calls []agent.InstallBinaryParams
 	installAgentHook(t, func(host scheduler.Host) deployAgent {
 		return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
-			if method != "install_binary" {
+			switch method {
+			case "install_binary":
+				p := params.(agent.InstallBinaryParams)
+				calls = append(calls, p)
+				result, ok := out.(*agent.InstallBinaryResult)
+				if !ok {
+					return fmt.Errorf("unexpected install output %T", out)
+				}
+				*result = agent.InstallBinaryResult{Path: p.Path, Installed: true, SHA256: p.SHA256}
+				return nil
+			case "status":
+				status, ok := out.(*agent.Status)
+				if !ok {
+					return fmt.Errorf("unexpected status output %T", out)
+				}
+				*status = agent.Status{AgentVersion: agent.Version(), ProtocolVersion: agent.AgentProtocol, DockerOK: true}
+				return nil
+			default:
 				return fmt.Errorf("unexpected method %s", method)
 			}
-			p := params.(agent.InstallBinaryParams)
-			calls = append(calls, p)
-			result, ok := out.(*agent.InstallBinaryResult)
-			if !ok {
-				return fmt.Errorf("unexpected install output %T", out)
-			}
-			*result = agent.InstallBinaryResult{Path: p.Path, Installed: true, SHA256: p.SHA256}
-			return nil
 		})
 	})
 
@@ -431,6 +451,62 @@ func TestAgentUpgradeUploadsCurrentBinary(t *testing.T) {
 	}
 	if !timelineContains(timeline, "agent_upgrade", "started", "") || !timelineContains(timeline, "agent_upgrade", "succeeded", "") {
 		t.Fatalf("timeline missing agent upgrade events: %+v", timeline)
+	}
+}
+
+func TestSystemdUnitIsOneshotMarker(t *testing.T) {
+	unit := systemdUnit()
+	for _, needle := range []string{
+		"Type=oneshot",
+		"RemainAfterExit=yes",
+		config.RemoteBinaryPath + " agent run",
+	} {
+		if !strings.Contains(unit, needle) {
+			t.Fatalf("systemd unit missing %q:\n%s", needle, unit)
+		}
+	}
+	// `ship agent run` exits immediately by design; a Restart= directive
+	// would loop the unit forever.
+	if strings.Contains(unit, "Restart=") {
+		t.Fatalf("systemd unit must not restart a oneshot command:\n%s", unit)
+	}
+}
+
+func TestAgentUpgradeWithOverrideToleratesVersionSkew(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(singleHostConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installShipBinaryReader(t, []byte("older-release-binary"))
+	var sshEvents []string
+	installUpgradeSSHHook(t, &sshEvents)
+	installAgentHook(t, func(host scheduler.Host) deployAgent {
+		return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
+			switch method {
+			case "install_binary":
+				p := params.(agent.InstallBinaryParams)
+				result := out.(*agent.InstallBinaryResult)
+				*result = agent.InstallBinaryResult{Path: p.Path, Installed: true, SHA256: p.SHA256}
+				return nil
+			case "status":
+				status := out.(*agent.Status)
+				// An explicitly overridden binary may be a different release
+				// than the CLI; that must not trigger a rollback.
+				*status = agent.Status{AgentVersion: "0.0.1-not-the-cli-version", ProtocolVersion: agent.AgentProtocol, DockerOK: true}
+				return nil
+			default:
+				return fmt.Errorf("unexpected method %s", method)
+			}
+		})
+	})
+
+	var out bytes.Buffer
+	cmd := agentCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"upgrade", "production", "--agent-binary", "/mirror/ship_0.4.1_linux_amd64.tar.gz"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("override upgrade rolled back on version skew: %v", err)
 	}
 }
 
@@ -1061,6 +1137,8 @@ func TestDeployBuildsPushesResolvesBeforeAgentMutation(t *testing.T) {
 	}
 
 	want := []string{
+		"agent:web-1:negotiate",
+		"agent:web-2:negotiate",
 		"build:" + tag,
 		"push:" + tag,
 		"push:" + latestTag,
@@ -1464,7 +1542,13 @@ func TestDeployRunsFailureHookWhenLifecycleHookFails(t *testing.T) {
 	if !strings.Contains(hookRuns[len(hookRuns)-1].Context.Failure, "pre_build hook failed") {
 		t.Fatalf("failure hook context = %+v", hookRuns[len(hookRuns)-1].Context)
 	}
-	if len(events) != 4 {
+	var mutating []string
+	for _, event := range events {
+		if !strings.HasSuffix(event, ":negotiate") {
+			mutating = append(mutating, event)
+		}
+	}
+	if len(mutating) != 4 {
 		t.Fatalf("unexpected deploy events after hook failure: %#v", events)
 	}
 	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
@@ -2969,7 +3053,9 @@ func TestDeployImageFailuresStopBeforeAgentMutation(t *testing.T) {
 				t.Fatal("expected deploy failure")
 			}
 			for _, event := range events {
-				if strings.HasPrefix(event, "agent:") {
+				// The protocol preflight (negotiate) is read-only and runs
+				// before builds; only mutating agent calls matter here.
+				if strings.HasPrefix(event, "agent:") && !strings.HasSuffix(event, ":negotiate") {
 					t.Fatalf("agent mutated after %s failure: %#v", stage, events)
 				}
 			}
@@ -3163,6 +3249,7 @@ func TestDeployWritesRemoteSecretFileAndStoresOnlyDigests(t *testing.T) {
 
 	secretPath := "/var/lib/ship/secrets/production/service-web.env"
 	wantEvents := []string{
+		"agent:web-1:negotiate",
 		"resolve:" + imageRef,
 		"agent:web-1:write_release_state:abc123def456-20260630T183456.123456789Z:pending",
 		"agent:web-1:write_file:" + secretPath + ":0600",

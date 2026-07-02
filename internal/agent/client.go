@@ -40,7 +40,7 @@ func (c Client) Call(ctx context.Context, method string, params any, out any) er
 					Hostname:        c.SSH.Host,
 					StateDir:        config.RemoteStateDir,
 					DockerOK:        true,
-					AgentVersion:    AgentVersion,
+					AgentVersion:    Version(),
 					ProtocolVersion: AgentProtocol,
 				}
 			case *map[string]string:

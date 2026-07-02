@@ -16,3 +16,5 @@ require (
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
 )
+
+retract v0.4.0 // tagged without published release assets (agent installs 404); use v0.4.1 or later

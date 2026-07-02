@@ -1,8 +1,17 @@
 name: Release
 
+# Draft-then-publish: pushing a vX.Y.Z tag builds and uploads every asset to
+# a DRAFT release, verifies all assets are present, and only then publishes.
+# "Published" therefore always means "assets exist" for releases-API
+# consumers. Note the Go module proxy resolves the TAG itself, minutes before
+# assets finish uploading — the CLI's download retry/backoff covers that
+# window. Never delete a released tag (the module proxy caches it forever);
+# disavow bad releases with a go.mod retract directive instead.
 on:
-  release:
-    types: [published]
+  push:
+    # Exact vX.Y.Z only: the CLI's release-download path rejects prerelease
+    # versions, so a v0.5.0-rc1 tag would publish assets nothing can consume.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
     inputs:
       tag:
@@ -99,9 +108,13 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.tag }}"
           else
-            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${{ github.ref_name }}"
           fi
           VERSION="${VERSION#v}"
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::release tags must be exact vX.Y.Z (got 'v$VERSION'); prerelease tags have no supported asset path"
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building ship $VERSION for ${{ matrix.goos }}/${{ matrix.goarch }}"
 
@@ -114,6 +127,9 @@ jobs:
         run: |
           if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${APPLE_CERTIFICATE:-}" ] || [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::error::Apple signing secrets are PARTIALLY configured — fix or remove them. Refusing to ship a silently-unsigned macOS binary."
+            exit 1
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Apple signing secrets not configured — macOS build will be UNSIGNED."
@@ -154,7 +170,26 @@ jobs:
             -o "dist/${BINARY}" \
             ./cmd/ship
           chmod +x "dist/${BINARY}"
-          "dist/${BINARY}" version
+
+      - name: Assert stamped version matches tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PRINTED="$("dist/${BINARY}" version | head -n1 | awk '{print $2}')"
+          if [ "$PRINTED" != "$VERSION" ]; then
+            echo "::error::built binary reports version '$PRINTED', tag says '$VERSION'"
+            exit 1
+          fi
+
+      - name: Assert static binary (linux)
+        if: matrix.goos == 'linux'
+        run: |
+          # The agent must stay a static pure-Go binary (musl and glibc
+          # hosts alike); a cgo dependency would silently break Alpine.
+          if ldd "dist/${BINARY}" 2>&1 | grep -vq 'not a dynamic executable'; then
+            echo "::error::dist/${BINARY} is dynamically linked"
+            ldd "dist/${BINARY}" || true
+            exit 1
+          fi
 
       - name: Sign and notarize macOS binary
         if: matrix.sign && steps.signing.outputs.enabled == 'true'
@@ -177,23 +212,33 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           ARCHIVE="dist/${BINARY}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz"
           tar -C dist -czf "$ARCHIVE" "${BINARY}"
-          sha256sum "$ARCHIVE" | tee "dist/${BINARY}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.sha256"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ship-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            ${{ steps.package.outputs.archive }}
-            dist/*.sha256
+          path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
   publish:
     name: Publish release assets
     runs-on: ubuntu-24.04
     needs: build
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
     steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -204,25 +249,90 @@ jobs:
       - name: Create checksum manifest
         run: |
           cd dist
-          ls -1 ship_*.tar.gz > checksums.txt
-          sha256sum ship_*.tar.gz | tee -a checksums.txt
+          # sha256sum lines only — extra preamble lines break `sha256sum -c`.
+          sha256sum ship_*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Ensure draft release
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "ship ${TAG#v}" --generate-notes
+          fi
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: |
-            dist/ship_*.tar.gz
-            dist/checksums.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release upload "$TAG" dist/ship_*.tar.gz dist/checksums.txt --clobber
+
+      - name: Verify assets and publish
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          MISSING=0
+          for want in \
+            "ship_${VERSION}_linux_amd64.tar.gz" \
+            "ship_${VERSION}_linux_arm64.tar.gz" \
+            "ship_${VERSION}_darwin_amd64.tar.gz" \
+            "ship_${VERSION}_darwin_arm64.tar.gz" \
+            "checksums.txt"; do
+            if ! printf '%s\n' "$ASSETS" | grep -qx "$want"; then
+              echo "::error::release $TAG is missing asset $want"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ]
+          gh release edit "$TAG" --draft=false
 
       - name: Summary
         run: |
           {
             echo "## Release artifacts"
             echo ""
-            echo "Attached to **${{ github.event.release.tag_name || github.event.inputs.tag }}**:"
+            echo "Published **${{ steps.tag.outputs.tag }}** with:"
             echo ""
-            ls -1 dist/ship_*.tar.gz | sed 's/^/- /'
+            ls -1 dist/ship_*.tar.gz dist/checksums.txt | sed 's/^/- /'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  smoke:
+    name: Post-publish smoke test
+    runs-on: ubuntu-24.04
+    needs: publish
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: go install resolves the tag and self-reports it
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # GOPROXY=direct sidesteps proxy propagation lag right after tagging.
+          GOPROXY=direct go install "${GO_MODULE}/cmd/ship@${TAG}"
+          PRINTED="$("$(go env GOPATH)/bin/ship" version | head -n1 | awk '{print $2}')"
+          if [ "$PRINTED" != "${TAG#v}" ]; then
+            echo "::error::go install @$TAG reports version '$PRINTED'"
+            exit 1
+          fi
+
+      - name: Published assets download and verify
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${TAG#v}"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          curl -fsSL -O "${BASE}/checksums.txt"
+          curl -fsSL -O "${BASE}/ship_${VERSION}_linux_amd64.tar.gz"
+          grep "ship_${VERSION}_linux_amd64.tar.gz" checksums.txt | sha256sum -c -
+          tar -xzf "ship_${VERSION}_linux_amd64.tar.gz" ship
+          ./ship version

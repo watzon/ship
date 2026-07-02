@@ -27,16 +27,16 @@ Requires Go 1.26+ for `go install`, and Docker on the machine that runs deploys.
 
 ### Option A: `go install` (recommended for dev and CI)
 
-```bash
-go install github.com/watzon/ship/cmd/ship@latest
-```
-
-Pin a branch or tag instead of floating on `@latest`:
+Pin an asset-backed release tag (check [GitHub Releases](https://github.com/watzon/ship/releases) for the newest):
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@main
-go install github.com/watzon/ship/cmd/ship@v0.1.0
+go install github.com/watzon/ship/cmd/ship@v0.4.2
 ```
+
+`@latest` is acceptable for interactive use, but never for CI: it can jump to
+a tag whose release assets have not finished publishing. Avoid `@main` when
+you will install agents on servers — a `@main` build reports a development
+version and cannot download release binaries for remote hosts.
 
 From a Ship repo clone:
 
@@ -53,20 +53,37 @@ Ensure `$(go env GOPATH)/bin` is on your `PATH` (or set `GOBIN`).
 Download a published asset from [GitHub Releases](https://github.com/watzon/ship/releases). Archives are named `ship_<version>_<os>_<arch>.tar.gz` for `linux`/`darwin` × `amd64`/`arm64`.
 
 ```bash
-VERSION=v0.1.0                          # release tag
+VERSION=v0.4.2                          # release tag
 VER="${VERSION#v}"                      # filename uses version without v prefix
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; esac
 
-curl -fsSL -o ship.tar.gz \
+curl -fsSL -O "https://github.com/watzon/ship/releases/download/${VERSION}/checksums.txt"
+curl -fsSL -o "ship_${VER}_${OS}_${ARCH}.tar.gz" \
   "https://github.com/watzon/ship/releases/download/${VERSION}/ship_${VER}_${OS}_${ARCH}.tar.gz"
-tar -xzf ship.tar.gz ship
+grep "ship_${VER}_${OS}_${ARCH}.tar.gz" checksums.txt | grep -E '^[0-9a-f]{64} ' | sha256sum -c -
+tar -xzf "ship_${VER}_${OS}_${ARCH}.tar.gz" ship
 install -m 755 ship ~/.local/bin/ship   # or sudo install to /usr/local/bin
-rm ship ship.tar.gz
+rm ship "ship_${VER}_${OS}_${ARCH}.tar.gz" checksums.txt
 ```
 
-Use a release that publishes assets for your local OS/arch before relying on `ship agent upgrade` from a release install (Ship downloads matching release binaries for remote hosts when cross-compile is unavailable).
+(On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.)
+
+### Two rules that prevent stranded setups
+
+1. **Agent installs need either the Ship checkout or published release
+   assets.** `ship provision apply` and `ship agent upgrade` place a
+   host-platform Ship binary on each server. Ship cross-compiles it only when
+   run inside the `github.com/watzon/ship` source tree; from any other
+   directory it downloads `ship_<version>_<os>_<arch>.tar.gz` for its own
+   version from GitHub Releases and verifies it against `checksums.txt`. So
+   always install a version whose assets exist — verify with
+   `ship release check vX.Y.Z` before pinning it in CI.
+2. **When resolution fails, run the `Fix:` line.** The error lists every
+   strategy Ship attempted (local binary, cross-compile, release download)
+   with the reason each failed, and ends with a single `Fix:` command — run
+   that instead of falling back to manual binary copying.
 
 ### Verify
 
