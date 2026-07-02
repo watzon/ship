@@ -27,7 +27,7 @@ import (
 
 // AgentVersion is the ship CLI and agent release version. Release builds override
 // this via -ldflags "-X github.com/watzon/ship/internal/agent.AgentVersion=...".
-var AgentVersion = "0.4.0"
+var AgentVersion = "0.4.1"
 
 const (
 	AgentMinProtocol     = 1
