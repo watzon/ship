@@ -171,6 +171,8 @@ environments:
           domains: [staging.example.com]
 ```
 
+Environment `services` and `accessories` entries are deep-merged into the root definitions. You only need to specify the fields that differ for that environment (image, pool, ingress, env, and so on). New services or accessories can still be defined only under an environment.
+
 ## SSH / bastion
 
 ### Kamal
@@ -252,7 +254,11 @@ ship config production --json
 ship hosts production
 ship plan production
 ship secrets verify production
-ship doctor
+ship doctor staging   # limit remote checks to one environment
 ```
+
+`ship agent install` enables the systemd unit on hosts that already have `/usr/local/bin/ship`. The binary is uploaded during `ship provision apply` (or `ship agent upgrade`), and Ship cross-compiles or downloads a matching linux/amd64 (or arm64) release when your local CLI is a different OS/arch.
+
+Co-located ingress (app and Caddy on the same host, shared Docker network) uses Docker service aliases such as `web:3000` for upstreams. Dedicated ingress pools reach app hosts via contact addresses or public IPs.
 
 Fix validation errors before any `--dry-run provision apply` or `--dry-run deploy`.
