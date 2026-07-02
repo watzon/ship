@@ -14,7 +14,7 @@ func TestValidateDeployRequiresBackupCommandForRequiredBackup(t *testing.T) {
 	err := ValidateDeploy(config.Accessory{
 		Image:  "postgres:17",
 		Pool:   "data",
-		Backup: config.BackupSpec{Required: true},
+		Backup: config.BackupSpec{Required: boolPtr(true)},
 	})
 	if err == nil || !strings.Contains(err.Error(), "backup.command") {
 		t.Fatalf("expected backup command validation error, got %v", err)
@@ -25,10 +25,10 @@ func TestValidateRestoreRequiresPrimaryBackupAndRestoreCommand(t *testing.T) {
 	acc := config.Accessory{
 		Image:   "postgres:17",
 		Pool:    "data",
-		Primary: true,
+		Primary: boolPtr(true),
 		Backup: config.BackupSpec{
 			Command:  "pg_dumpall",
-			Required: true,
+			Required: boolPtr(true),
 		},
 	}
 	err := ValidateRestore(acc)
@@ -196,9 +196,9 @@ func TestNamedVolumesAndCommands(t *testing.T) {
 		Backup: config.BackupSpec{
 			Command:        "pg_dumpall",
 			RestoreCommand: `psql -f "$SHIP_BACKUP_ARTIFACT"`,
-			Required:       true,
+			Required:       boolPtr(true),
 		},
-		Primary: true,
+		Primary: boolPtr(true),
 	}
 	volumes := NamedVolumes(acc)
 	if len(volumes) != 1 || volumes[0] != "postgres-data" {
@@ -259,13 +259,17 @@ func accessoryConfig() *config.Config {
 			"postgres": {
 				Image:   "postgres:17",
 				Pool:    "data",
-				Primary: true,
+				Primary: boolPtr(true),
 				Backup: config.BackupSpec{
 					Command:        "pg_dumpall",
 					RestoreCommand: `psql -f "$SHIP_BACKUP_ARTIFACT"`,
-					Required:       true,
+					Required:       boolPtr(true),
 				},
 			},
 		},
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

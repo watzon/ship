@@ -35,10 +35,10 @@ func Plan(cfg *config.Config) []PlanAction {
 	for _, name := range names {
 		acc := cfg.Accessories[name]
 		details := fmt.Sprintf("image=%s pool=%s", acc.Image, acc.Pool)
-		if acc.Primary {
+		if acc.IsPrimary() {
 			details += " primary"
 		}
-		if acc.Backup.Required {
+		if acc.Backup.BackupRequired() {
 			details += " backup-required"
 		}
 		actions = append(actions, PlanAction{Name: name, Details: details})
@@ -71,17 +71,17 @@ func ValidateDeploy(acc config.Accessory) error {
 	if strings.TrimSpace(acc.Pool) == "" {
 		return errors.New("accessory pool is required")
 	}
-	if acc.Backup.Required && strings.TrimSpace(acc.Backup.Command) == "" {
+	if acc.Backup.BackupRequired() && strings.TrimSpace(acc.Backup.Command) == "" {
 		return errors.New("backup.required accessories require backup.command")
 	}
 	return nil
 }
 
 func ValidateRestore(acc config.Accessory) error {
-	if !acc.Primary {
+	if !acc.IsPrimary() {
 		return fmt.Errorf("restore is only supported for primary accessories")
 	}
-	if !acc.Backup.Required {
+	if !acc.Backup.BackupRequired() {
 		return fmt.Errorf("restore requires backup.required=true")
 	}
 	if strings.TrimSpace(acc.Backup.Command) == "" {

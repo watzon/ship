@@ -88,7 +88,7 @@ func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
 	for _, name := range accessoryNames {
 		acc := cfg.Accessories[name]
 		plan.Actions = append(plan.Actions, Action{Kind: "accessory", Target: name, Details: fmt.Sprintf("ensure %s on pool %s", acc.Image, acc.Pool)})
-		if acc.Backup.Required {
+		if acc.Backup.BackupRequired() {
 			plan.Actions = append(plan.Actions, Action{Kind: "backup-check", Target: name, Details: acc.Backup.Command})
 		}
 	}
