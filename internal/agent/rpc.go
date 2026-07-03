@@ -39,7 +39,7 @@ var AgentVersion = ""
 
 // devVersion is reported by plain `go build` checkouts, where neither a
 // release stamp nor a module version is available. Bump after each release.
-const devVersion = "0.4.3-dev"
+const devVersion = "0.4.5-dev"
 
 // Version reports the ship CLI/agent version: the release-stamped value when
 // present, else the true module version recorded by `go install ...@vX.Y.Z`,
