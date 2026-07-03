@@ -422,6 +422,42 @@ func TestWriteFileInstallBinaryAndStateMigration(t *testing.T) {
 	}
 }
 
+func TestReadFileReturnsContentAndExistence(t *testing.T) {
+	server := testServer(t)
+	target := filepath.Join(t.TempDir(), "ingress", "production.Caddyfile")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("example.com {\n  reverse_proxy web:3000\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := server.Handle(context.Background(), request(t, "read-1", "read_file", ReadFileParams{Path: target}))
+	if !resp.OK {
+		t.Fatalf("read response = %+v", resp)
+	}
+	var got ReadFileResult
+	decodeResult(t, resp, &got)
+	if !got.Exists || got.Content != "example.com {\n  reverse_proxy web:3000\n}\n" {
+		t.Fatalf("read result = %+v", got)
+	}
+
+	missingResp := server.Handle(context.Background(), request(t, "read-2", "read_file", ReadFileParams{Path: filepath.Join(t.TempDir(), "missing.Caddyfile")}))
+	if !missingResp.OK {
+		t.Fatalf("read missing response = %+v", missingResp)
+	}
+	var missing ReadFileResult
+	decodeResult(t, missingResp, &missing)
+	if missing.Exists || missing.Content != "" {
+		t.Fatalf("read missing result = %+v", missing)
+	}
+
+	relativeResp := server.Handle(context.Background(), request(t, "read-3", "read_file", ReadFileParams{Path: "relative/path"}))
+	if relativeResp.OK || relativeResp.ErrorCode != ErrorInvalidParams {
+		t.Fatalf("read relative path response = %+v, want invalid_params rejection", relativeResp)
+	}
+}
+
 func TestWriteRegistryAuthMergesDockerConfig(t *testing.T) {
 	server := testServer(t)
 	server.DockerConfigDir = t.TempDir()

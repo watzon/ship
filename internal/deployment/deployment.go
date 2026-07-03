@@ -294,25 +294,19 @@ func BuildActions(input PlanInput) ([]Action, error) {
 			Network:           networkName,
 			NetworkDriver:     networkDriver,
 		})
-	} else {
-		shouldClear, err := shouldClearIngress(ingressPath)
-		if err != nil {
-			return nil, fmt.Errorf("read previous ingress state: %w", err)
-		}
-		if shouldClear {
-			actions = append(actions, Action{
-				Kind:              ActionIngress,
-				IngressPath:       ingressPath,
-				IngressHosts:      clearIngressHosts(input),
-				CaddyImage:        caddyImage(input.Config),
-				CaddyName:         CaddyContainerName(input.Config.Project, input.EnvName),
-				CaddyDataVolume:   caddyDataVolume(input.Config, input.EnvName),
-				CaddyConfigVolume: caddyConfigVolume(input.Config, input.EnvName),
-				CaddyLabels:       CaddyLabels(input.Config.Project, input.EnvName),
-				Network:           networkName,
-				NetworkDriver:     networkDriver,
-			})
-		}
+	} else if hasObservedCaddyContainer(input.Config, input.EnvName, input.Observed) {
+		actions = append(actions, Action{
+			Kind:              ActionIngress,
+			IngressPath:       ingressPath,
+			IngressHosts:      clearIngressHosts(input),
+			CaddyImage:        caddyImage(input.Config),
+			CaddyName:         CaddyContainerName(input.Config.Project, input.EnvName),
+			CaddyDataVolume:   caddyDataVolume(input.Config, input.EnvName),
+			CaddyConfigVolume: caddyConfigVolume(input.Config, input.EnvName),
+			CaddyLabels:       CaddyLabels(input.Config.Project, input.EnvName),
+			Network:           networkName,
+			NetworkDriver:     networkDriver,
+		})
 	}
 	for _, old := range stopCandidates(input.Config, input.EnvName, input.Observed, desiredNames) {
 		if _, ok := preStopped[observedKey(old)]; ok {
@@ -527,16 +521,23 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 	return lastErr
 }
 
+// executeIngressAction applies the desired Caddyfile to every ingress host,
+// snapshotting each host's on-disk config immediately beforehand so a
+// mid-rollout failure can restore exactly what that host was actually
+// running. The snapshot is read live from the host, not from local .ship/
+// state: a CI runner's checkout never carries state from prior deploys, so
+// sourcing "previous" locally silently turned rollback into a no-op there.
 func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory) error {
-	previous, hadPrevious, err := readPreviousIngressConfig(action.IngressPath)
-	if err != nil {
-		return fmt.Errorf("read previous ingress state: %w", err)
+	remotePath := remoteCaddyfilePath(action.IngressPath)
+	previous := map[string]ingressSnapshot{}
+	for _, host := range action.IngressHosts {
+		previous[host.Name] = readRemoteIngressSnapshot(ctx, host, remotePath, agentFor)
 	}
 
 	var reloaded []scheduler.Host
 	for _, host := range action.IngressHosts {
 		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
-			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
+			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
 				return fmt.Errorf("reload ingress on %s: %w; additionally failed to roll back ingress: %v", host.Name, err, rollbackErr)
 			}
 			return fmt.Errorf("reload ingress on %s: %w", host.Name, err)
@@ -545,13 +546,13 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 	}
 
 	if err := os.MkdirAll(filepath.Dir(action.IngressPath), 0o755); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
 			return fmt.Errorf("prepare ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("prepare ingress state: %w", err)
 	}
 	if err := fsatomic.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, hadPrevious, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
 			return fmt.Errorf("write ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("write ingress state: %w", err)
@@ -559,23 +560,30 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 	return nil
 }
 
-func readPreviousIngressConfig(path string) (string, bool, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	return string(data), true, nil
+type ingressSnapshot struct {
+	content string
+	exists  bool
 }
 
-func shouldClearIngress(path string) (bool, error) {
-	previous, hadPrevious, err := readPreviousIngressConfig(path)
-	if err != nil {
-		return false, err
+// readRemoteIngressSnapshot is best-effort: an agent that predates the
+// read_file RPC, or any other read failure, degrades to "no known previous
+// state" rather than blocking the deploy, matching prior behavior for hosts
+// we genuinely know nothing about.
+func readRemoteIngressSnapshot(ctx context.Context, host scheduler.Host, remotePath string, agentFor AgentFactory) ingressSnapshot {
+	var result agent.ReadFileResult
+	if err := agentFor(host).Call(ctx, "read_file", agent.ReadFileParams{Path: remotePath}, &result); err != nil {
+		return ingressSnapshot{}
 	}
-	return hadPrevious && strings.TrimSpace(previous) != "", nil
+	return ingressSnapshot{content: result.Content, exists: result.Exists}
+}
+
+func hasObservedCaddyContainer(cfg *config.Config, envName string, observed []ObservedContainer) bool {
+	for _, item := range observed {
+		if isManagedCaddyContainer(cfg, envName, item.Container) {
+			return true
+		}
+	}
+	return false
 }
 
 func clearIngressHosts(input PlanInput) []scheduler.Host {
@@ -624,14 +632,15 @@ func hostsByName(byName map[string]scheduler.Host) []scheduler.Host {
 	return hosts
 }
 
-func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous string, hadPrevious bool, base Action, agentFor AgentFactory) error {
-	if !hadPrevious {
-		return nil
-	}
+func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous map[string]ingressSnapshot, base Action, agentFor AgentFactory) error {
 	var errs []string
 	for _, host := range hosts {
+		snap, ok := previous[host.Name]
+		if !ok || !snap.exists {
+			continue
+		}
 		action := base
-		action.IngressConfig = previous
+		action.IngressConfig = snap.content
 		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", host.Name, err))
 		}
@@ -1223,6 +1232,9 @@ func stopCandidates(cfg *config.Config, envName string, observed []ObservedConta
 			continue
 		}
 		if labels[docker.LabelService] == "" || labels[docker.LabelAccessory] != "" {
+			continue
+		}
+		if isManagedCaddyContainer(cfg, envName, item.Container) {
 			continue
 		}
 		if _, desired := desiredNames[item.Container.Names]; desired {

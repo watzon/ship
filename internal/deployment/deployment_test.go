@@ -568,16 +568,58 @@ func TestBuildActionsStopsZeroScaleAndRemovedServiceContainers(t *testing.T) {
 	}
 }
 
+// TestBuildActionsDoesNotStopRunningCaddyContainer guards against a deploy
+// scheduling a stop action for its own ingress container. The Caddy
+// container observed on a host is real (managed-by=ship, service=caddy) but
+// is never added to desiredNames since it isn't a scheduled application
+// service, so stopCandidates previously treated every already-running
+// deploy's Caddy container as orphaned and appended a stop action right
+// after the ingress action reloaded it — undoing the reload it had just
+// performed.
+func TestBuildActionsDoesNotStopRunningCaddyContainer(t *testing.T) {
+	cfg := testConfig()
+	env := cfg.Environments["production"]
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+		Observed: []ObservedContainer{
+			statusCaddyObserved("web-1", "Up 5 minutes"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caddyName := CaddyContainerName("demo", "production")
+	for _, action := range actions {
+		if action.Kind == ActionStop && action.ContainerName == caddyName {
+			t.Fatalf("actions stopped the running ingress container: %+v", actions)
+		}
+	}
+	var sawIngress bool
+	for _, action := range actions {
+		if action.Kind == ActionIngress {
+			sawIngress = true
+		}
+	}
+	if !sawIngress {
+		t.Fatalf("expected an ingress action to reload caddy: %+v", actions)
+	}
+}
+
+// TestBuildAndExecuteActionsClearsStaleIngressWhenCurrentConfigIsEmpty
+// deliberately runs with no local .ship/ingress state on disk, simulating a
+// CI runner's fresh checkout. The box's real state comes only through
+// Observed (a live agent-reported container), matching how Rollout is
+// actually invoked. Before the fix, the clear decision was driven by a local
+// file read that is always empty on a fresh checkout, so the stale ingress
+// was silently left running on the box.
 func TestBuildAndExecuteActionsClearsStaleIngressWhenCurrentConfigIsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	ingressPath := filepath.Join(dir, "ingress", "production.Caddyfile")
-	if err := os.MkdirAll(filepath.Dir(ingressPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	previous := "example.com {\n  reverse_proxy web-1:3000\n}\n"
-	if err := os.WriteFile(ingressPath, []byte(previous), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	cfg := testConfig()
 	web := cfg.Services["web"]
 	web.Scale = 0
@@ -590,20 +632,23 @@ func TestBuildAndExecuteActionsClearsStaleIngressWhenCurrentConfigIsEmpty(t *tes
 		EnvName:     "production",
 		ReleaseID:   "new",
 		StateDir:    dir,
-		Observed: []ObservedContainer{{
-			Host: scheduler.Host{Name: "web-1", Pool: "web", User: "root"},
-			Container: docker.ContainerSummary{
-				Names: oldName,
-				Labels: map[string]string{
-					docker.LabelManagedBy:   docker.LabelManagedByValue,
-					docker.LabelProject:     "demo",
-					docker.LabelEnvironment: "production",
-					docker.LabelService:     "web",
-					docker.LabelReplica:     "1",
-					docker.LabelRelease:     "old",
+		Observed: []ObservedContainer{
+			{
+				Host: scheduler.Host{Name: "web-1", Pool: "web", User: "root"},
+				Container: docker.ContainerSummary{
+					Names: oldName,
+					Labels: map[string]string{
+						docker.LabelManagedBy:   docker.LabelManagedByValue,
+						docker.LabelProject:     "demo",
+						docker.LabelEnvironment: "production",
+						docker.LabelService:     "web",
+						docker.LabelReplica:     "1",
+						docker.LabelRelease:     "old",
+					},
 				},
 			},
-		}},
+			statusCaddyObserved("web-1", "Up 5 minutes"),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -800,16 +845,17 @@ func TestExecuteIngressActionReloadsHostsAndWritesLocalState(t *testing.T) {
 	}
 }
 
+// TestExecuteIngressActionRollsBackReloadedHostsOnFailure runs with no local
+// .ship/ingress state on disk (a fresh CI checkout). ingress-1's "previous"
+// config is known only because the fake agent reports it back live via
+// read_file, standing in for the box's real on-disk Caddyfile. Before the
+// fix, rollback content came from a local file that a CI runner never has,
+// so a failure on ingress-2 would leave ingress-1 stuck on the half-applied
+// new config instead of being restored.
 func TestExecuteIngressActionRollsBackReloadedHostsOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	ingressPath := filepath.Join(dir, "ingress", "production.Caddyfile")
-	if err := os.MkdirAll(filepath.Dir(ingressPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	previous := "example.com {\n  reverse_proxy web-old:3000\n}\n"
-	if err := os.WriteFile(ingressPath, []byte(previous), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	action := Action{
 		Kind:          ActionIngress,
 		IngressPath:   ingressPath,
@@ -817,7 +863,7 @@ func TestExecuteIngressActionRollsBackReloadedHostsOnFailure(t *testing.T) {
 		IngressHosts:  []scheduler.Host{{Name: "ingress-1"}, {Name: "ingress-2"}},
 	}
 	agents := map[string]*ingressAgent{
-		"ingress-1": {host: "ingress-1"},
+		"ingress-1": {host: "ingress-1", remoteContent: previous, remoteExists: true},
 		"ingress-2": {host: "ingress-2", failReload: true},
 	}
 	err := ExecuteActions(context.Background(), []Action{action}, func(host scheduler.Host) Agent {
@@ -826,12 +872,11 @@ func TestExecuteIngressActionRollsBackReloadedHostsOnFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected reload failure")
 	}
-	data, readErr := os.ReadFile(ingressPath)
-	if readErr != nil {
-		t.Fatal(readErr)
+	if _, statErr := os.Stat(ingressPath); !os.IsNotExist(statErr) {
+		t.Fatalf("local caddyfile written after failure: err=%v", statErr)
 	}
-	if string(data) != previous {
-		t.Fatalf("local caddyfile changed after failure: %q", data)
+	if agents["ingress-1"].readFileCalls != 1 || agents["ingress-2"].readFileCalls != 1 {
+		t.Fatalf("expected each host's live state to be read once: ingress-1=%d ingress-2=%d", agents["ingress-1"].readFileCalls, agents["ingress-2"].readFileCalls)
 	}
 	if !reflect.DeepEqual(agents["ingress-1"].reloads, []string{action.IngressConfig, previous}) {
 		t.Fatalf("ingress-1 reloads = %#v", agents["ingress-1"].reloads)
@@ -1261,21 +1306,31 @@ func (f *fixedPortAgent) Call(ctx context.Context, method string, params any, ou
 }
 
 type ingressAgent struct {
-	host       string
-	reloads    []string
-	runs       []agent.RunContainerParams
-	validated  []bool
-	clears     []bool
-	failReload bool
-	failHealth bool
+	host          string
+	reloads       []string
+	runs          []agent.RunContainerParams
+	validated     []bool
+	clears        []bool
+	failReload    bool
+	failHealth    bool
+	remoteContent string
+	remoteExists  bool
+	readFileCalls int
 }
 
 func (f *ingressAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
+	case "read_file":
+		f.readFileCalls++
+		if result, ok := out.(*agent.ReadFileResult); ok {
+			*result = agent.ReadFileResult{Content: f.remoteContent, Exists: f.remoteExists}
+		}
 	case "write_file":
 		p := params.(agent.WriteFileParams)
 		f.reloads = append(f.reloads, p.Content)
 		f.clears = append(f.clears, strings.TrimSpace(p.Content) == "")
+		f.remoteContent = p.Content
+		f.remoteExists = true
 	case "run_oneoff_container":
 		f.validated = append(f.validated, true)
 		if f.failReload {

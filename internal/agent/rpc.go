@@ -187,6 +187,16 @@ type WriteFileResult struct {
 	Bytes int    `json:"bytes"`
 }
 
+type ReadFileParams struct {
+	Path string `json:"path"`
+}
+
+type ReadFileResult struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+	Exists  bool   `json:"exists"`
+}
+
 type WriteRegistryAuthParams struct {
 	Server string          `json:"server"`
 	Auth   json.RawMessage `json:"auth"`
@@ -458,6 +468,8 @@ func (s Server) Handle(ctx context.Context, req Request) Response {
 		return s.withHostLock(req, "write_file", func() Response {
 			return s.writeFile(req)
 		})
+	case "read_file":
+		return s.readFile(req)
 	case "write_registry_auth":
 		return s.withHostLock(req, "write_registry_auth", func() Response {
 			return s.writeRegistryAuth(req)
@@ -661,6 +673,24 @@ func (s Server) writeFile(req Request) Response {
 		return failure(req.ID, ErrorFileOperation, err)
 	}
 	return result(req.ID, WriteFileResult{Path: p.Path, Bytes: len(data)})
+}
+
+func (s Server) readFile(req Request) Response {
+	var p ReadFileParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	if strings.TrimSpace(p.Path) == "" {
+		return failure(req.ID, ErrorInvalidParams, errors.New("path is required"))
+	}
+	if !filepath.IsAbs(p.Path) {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("path %q must be absolute", p.Path))
+	}
+	data, _, exists, err := fileSnapshot(p.Path)
+	if err != nil {
+		return failure(req.ID, ErrorFileOperation, err)
+	}
+	return result(req.ID, ReadFileResult{Path: p.Path, Content: string(data), Exists: exists})
 }
 
 func (s Server) writeRegistryAuth(req Request) Response {
@@ -1200,6 +1230,7 @@ func supportedMethods() []string {
 		"negotiate",
 		"pull",
 		"prune_images",
+		"read_file",
 		"read_release_state",
 		"run_container",
 		"run_oneoff_container",
