@@ -638,6 +638,14 @@ func (s Server) runOneOffContainer(ctx context.Context, req Request) Response {
 	if err := validateNetworkAliases(p.NetworkAliases); err != nil {
 		return failure(req.ID, ErrorInvalidParams, err)
 	}
+	// Exec-form, not sh -lc: see docker.SplitCommand for why wrapping every
+	// one-off container's CMD in a login shell broke images (postgres,
+	// mysql, ...) whose entrypoint scripts branch on argv[0] and whose PATH
+	// comes from image ENV rather than /etc/profile.
+	tokens, err := docker.SplitCommand(p.Command)
+	if err != nil {
+		return failure(req.ID, ErrorInvalidParams, fmt.Errorf("command for %q: %w", p.Name, err))
+	}
 	commandCtx := ctx
 	cancel := func() {}
 	if p.TimeoutSeconds > 0 {
@@ -648,7 +656,8 @@ func (s Server) runOneOffContainer(ctx context.Context, req Request) Response {
 	args = append(args, labelArgs(p.Labels)...)
 	args = append(args, networkArgs(p.Network, p.NetworkAliases)...)
 	args = append(args, p.Args...)
-	args = append(args, p.Image, "sh", "-lc", p.Command)
+	args = append(args, p.Image)
+	args = append(args, tokens...)
 	out, err := s.command()(commandCtx, "docker", args...)
 	if err != nil {
 		return failure(req.ID, ErrorDocker, fmt.Errorf("one-off container %q failed: %w", p.Name, err))

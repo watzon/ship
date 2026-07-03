@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -31,6 +32,78 @@ func TestRunAddsShipManagedLabel(t *testing.T) {
 	joined := strings.Join(gotArgs, " ")
 	if !strings.Contains(joined, "--label managed-by=ship") {
 		t.Fatalf("docker run args missing managed label: %#v", gotArgs)
+	}
+}
+
+// TestRunPassesCommandAsExecFormArgv is the postgres accessory reproduction:
+// a multi-flag startup command must reach `docker run` as separate argv
+// tokens after the image, not wrapped in `sh -lc "<command>"`. The old
+// wrapping broke the postgres image's entrypoint contract (it only drops
+// root via gosu when argv[0] == "postgres") and reset PATH by sourcing
+// /etc/profile via the login shell, producing "postgres: not found".
+func TestRunPassesCommandAsExecFormArgv(t *testing.T) {
+	var gotArgs []string
+	client := Client{CommandRunner: func(ctx context.Context, name string, args ...string) (string, error) {
+		gotArgs = append([]string(nil), args...)
+		return "container-id\n", nil
+	}}
+	command := "postgres -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10"
+	if err := client.Run(context.Background(), "ship_accessory_postgres", "postgres:17", command); err != nil {
+		t.Fatal(err)
+	}
+	if contains(gotArgs, "sh") || contains(gotArgs, "-lc") {
+		t.Fatalf("run args wrapped command in a login shell: %#v", gotArgs)
+	}
+	tail := gotArgs[len(gotArgs)-8:]
+	want := []string{"postgres:17", "postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"}
+	if !reflect.DeepEqual(tail, want) {
+		t.Fatalf("run args tail = %#v, want %#v (full: %#v)", tail, want, gotArgs)
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSplitCommand(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		want    []string
+		wantErr bool
+	}{
+		{name: "simple flags", command: "postgres -c wal_level=logical -c max_wal_senders=10", want: []string{"postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10"}},
+		{name: "double quoted arg with space", command: `sh -c "foo && bar"`, want: []string{"sh", "-c", "foo && bar"}},
+		{name: "single quoted arg preserves literal", command: `echo 'a  b'`, want: []string{"echo", "a  b"}},
+		{name: "empty quoted arg", command: `cmd ""`, want: []string{"cmd", ""}},
+		{name: "escaped space outside quotes", command: `foo bar\ baz`, want: []string{"foo", "bar baz"}},
+		{name: "extra whitespace collapses", command: "  foo   bar  ", want: []string{"foo", "bar"}},
+		{name: "empty command", command: "", want: nil},
+		{name: "unterminated double quote", command: `foo "bar`, wantErr: true},
+		{name: "unterminated single quote", command: `foo 'bar`, wantErr: true},
+		{name: "trailing backslash", command: `foo\`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := SplitCommand(tc.command)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("SplitCommand(%q) = %#v, want error", tc.command, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SplitCommand(%q) unexpected error: %v", tc.command, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("SplitCommand(%q) = %#v, want %#v", tc.command, got, tc.want)
+			}
+		})
 	}
 }
 

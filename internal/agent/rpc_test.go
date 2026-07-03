@@ -190,6 +190,61 @@ func TestRunContainerReplacesExistingContainerWithSameImage(t *testing.T) {
 	}
 }
 
+// TestRunContainerPassesCommandExecFormNotLoginShell locks in the fix for
+// accessories like postgres crash-looping with "postgres: not found". Ship
+// used to run every container's command through `sh -lc "<command>"`, which
+// breaks any image whose entrypoint script branches on argv[0] (postgres
+// only drops root via gosu when $1 == "postgres") and resets PATH via
+// /etc/profile (dropping image-set directories like
+// /usr/lib/postgresql/17/bin). Exec-form argv preserves both.
+func TestRunContainerPassesCommandExecFormNotLoginShell(t *testing.T) {
+	var commands [][]string
+	server := Server{
+		StateDir: t.TempDir(),
+		Hostname: func() (string, error) { return "host-a", nil },
+		Docker: docker.Client{CommandRunner: func(ctx context.Context, name string, args ...string) (string, error) {
+			commands = append(commands, append([]string{name}, args...))
+			return "container-id\n", nil
+		}},
+	}
+	resp := server.Handle(context.Background(), request(t, "run-1", "run_container", RunContainerParams{
+		Name:    "ship_demo_production_accessory_postgres",
+		Image:   "postgres:17",
+		Command: "postgres -c wal_level=logical -c max_wal_senders=10",
+	}))
+	if !resp.OK {
+		t.Fatalf("response = %+v", resp)
+	}
+	var run []string
+	for _, cmd := range commands {
+		if len(cmd) > 1 && cmd[1] == "run" {
+			run = cmd
+		}
+	}
+	if run == nil {
+		t.Fatalf("no docker run command captured: %#v", commands)
+	}
+	if contains(run, "sh") || contains(run, "-lc") {
+		t.Fatalf("run args wrapped command in a login shell: %#v", run)
+	}
+	// argv[0] after the image must be "postgres" itself (not "sh") so the
+	// image's entrypoint script recognizes it and drops root correctly.
+	tail := run[len(run)-6:]
+	want := []string{"postgres:17", "postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10"}
+	if !reflect.DeepEqual(tail, want) {
+		t.Fatalf("run args tail = %#v, want %#v (full: %#v)", tail, want, run)
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPruneImagesUsesDockerUnderLock(t *testing.T) {
 	fake := &fakeDocker{}
 	server := testServer(t)
@@ -293,7 +348,7 @@ func TestRunOneOffContainerUsesDockerRunRemove(t *testing.T) {
 		"--network ship-demo-production",
 		"--network-alias release-web",
 		"--env-file /var/lib/ship/secrets/production/service-web.env",
-		"registry.local/acme/web@sha256:abc sh -lc bin/rails db:migrate",
+		"registry.local/acme/web@sha256:abc bin/rails db:migrate",
 	} {
 		if !strings.Contains(joined, needle) {
 			t.Fatalf("command %q missing %q", joined, needle)

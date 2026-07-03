@@ -221,6 +221,16 @@ accessories:
       - 127.0.0.1:15432:5432
 ```
 
+`services.<service>.command` and `accessories.<name>.command` override the image's default `CMD`. Ship splits the string into exec-form argv the way `docker compose`'s string `command:` does — no shell, so no `&&`, pipes, redirects, globs, or `$VAR` expansion — and passes it straight through as the container's command, preserving the image's `ENTRYPOINT` and `PATH`. This matters for official images like `postgres` and `mysql`, whose entrypoint scripts only drop root when they recognize the first argument (e.g. `postgres`) and whose `PATH` is set via image `ENV`:
+
+```yaml
+accessories:
+  postgres:
+    command: postgres -c wal_level=logical -c max_wal_senders=10
+```
+
+If a command genuinely needs shell features, invoke a shell explicitly: `command: sh -c "foo && bar"`.
+
 Use `services.<service>.resources` and `accessories.<name>.resources` to pass Docker CPU and memory constraints to service containers, restarts, release one-offs, and accessory containers. Supported fields are `cpus`, `memory`, `memory_reservation`, `memory_swap`, `cpu_shares`, `cpuset_cpus`, and `pids_limit`.
 
 ```yaml

@@ -459,9 +459,84 @@ func (c Client) Run(ctx context.Context, name, image, command string, args ...st
 	base = append(base, args...)
 	base = append(base, image)
 	if command != "" {
-		base = append(base, "sh", "-lc", command)
+		tokens, err := SplitCommand(command)
+		if err != nil {
+			return fmt.Errorf("command for %q: %w", name, err)
+		}
+		base = append(base, tokens...)
 	}
 	return c.run(ctx, "docker", base...)
+}
+
+// SplitCommand splits a command string into exec-form argv the way a shell
+// word-splits arguments, without shell semantics: no globbing, pipes,
+// redirects, `&&`, or variable expansion. This matches how docker-compose
+// interprets a string `command:`.
+//
+// It deliberately does not wrap the result in `sh -c`. Passing it straight
+// through as the container's CMD preserves each image's own ENTRYPOINT
+// contract and PATH: official images like postgres and mysql ship an
+// entrypoint script that branches on argv[0] (e.g. only drops root via gosu
+// when $1 == "postgres") and set PATH via ENV. Wrapping everything in
+// `sh -lc "<command>"` made argv[0] always "sh" (skipping that branch) and
+// `-l` re-sourced /etc/profile, clobbering the image's PATH — together
+// producing "postgres: not found" even though the binary was on PATH via
+// ENV. A command that genuinely needs shell features can still get them
+// explicitly: `command: sh -c "foo && bar"`.
+func SplitCommand(command string) ([]string, error) {
+	var tokens []string
+	var current strings.Builder
+	hasToken := false
+	var quote rune
+	runes := []rune(command)
+	flush := func() {
+		if hasToken {
+			tokens = append(tokens, current.String())
+			current.Reset()
+			hasToken = false
+		}
+	}
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case quote == '\'':
+			if r == '\'' {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case quote == '"':
+			switch {
+			case r == '"':
+				quote = 0
+			case r == '\\' && i+1 < len(runes) && strings.ContainsRune(`"\$`+"`", runes[i+1]):
+				i++
+				current.WriteRune(runes[i])
+			default:
+				current.WriteRune(r)
+			}
+		case r == '\'', r == '"':
+			quote = r
+			hasToken = true
+		case r == '\\':
+			if i+1 >= len(runes) {
+				return nil, errors.New("trailing backslash in command")
+			}
+			i++
+			current.WriteRune(runes[i])
+			hasToken = true
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+			hasToken = true
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated %c quote in command", quote)
+	}
+	flush()
+	return tokens, nil
 }
 
 // releaseIDBytes is the amount of randomness backing a release ID: 6 bytes
