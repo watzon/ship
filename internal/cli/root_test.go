@@ -4232,6 +4232,46 @@ func TestLogsTargetsReplicaLinesFollowAndJSON(t *testing.T) {
 	}
 }
 
+func TestLogsAcceptsShorthandAndFullContainerName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+
+	cases := []struct {
+		name    string
+		service string
+	}{
+		{"shorthand", "web.2"},
+		{"full container name", wantName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			var logCalls []agent.LogsParams
+			installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+				return &observabilityAgent{host: host.Name, events: &events, logCalls: &logCalls}
+			})
+
+			cmd := logsCmd(&options{configPath: path})
+			cmd.SetArgs([]string{"production", tc.service})
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if len(logCalls) != 1 || logCalls[0].Name != wantName {
+				t.Fatalf("log calls = %+v, want single call against %q", logCalls, wantName)
+			}
+		})
+	}
+}
+
 func TestLogsCanTargetExplicitAndFailedReleases(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -4352,6 +4392,46 @@ func TestRestartRecreatesCurrentReleaseReplicaAndRecordsEvents(t *testing.T) {
 	}
 	if !timelineContains(timeline, "restart", "started", "release-1") || !timelineContains(timeline, "restart", "succeeded", "release-1") {
 		t.Fatalf("timeline missing restart events: %+v", timeline)
+	}
+}
+
+func TestRestartAcceptsShorthandAndFullContainerName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+
+	cases := []struct {
+		name    string
+		service string
+	}{
+		{"shorthand", "web.2"},
+		{"full container name", wantName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			var runs []agent.RunContainerParams
+			installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+				return &restartDeployAgent{host: host.Name, events: &events, runs: &runs}
+			})
+
+			cmd := restartCmd(&options{configPath: path})
+			cmd.SetArgs([]string{"production", tc.service})
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if len(runs) != 1 || runs[0].Name != wantName {
+				t.Fatalf("restart runs = %+v, want single run against %q", runs, wantName)
+			}
+		})
 	}
 }
 
@@ -4549,6 +4629,45 @@ func TestHealthChecksCurrentReleaseTextAndJSON(t *testing.T) {
 	}
 }
 
+func TestHealthAcceptsShorthandAndFullContainerName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(restartConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+
+	cases := []struct {
+		name    string
+		service string
+	}{
+		{"shorthand", "web.2"},
+		{"full container name", wantName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+				return &healthDeployAgent{host: host.Name, events: &events}
+			})
+
+			cmd := healthCmd(&options{configPath: path})
+			cmd.SetArgs([]string{"production", tc.service})
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if joined := strings.Join(events, "\n"); !strings.Contains(joined, "agent:web-2:health_check:http://127.0.0.1:3000/up") {
+				t.Fatalf("health events = %#v", events)
+			}
+		})
+	}
+}
+
 func TestHealthReportsFailuresBeforeReturningError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -4689,6 +4808,71 @@ func TestExecTargetsReplicaCommandTimeoutAndJSON(t *testing.T) {
 	}
 	if view.Service != "web" || view.Replica != 2 || len(view.Entries) != 1 || view.Entries[0].Host != "web-2" || view.Entries[0].Output != "exec from web-2" {
 		t.Fatalf("exec view = %+v", view)
+	}
+}
+
+func TestExecAcceptsShorthandAndFullContainerName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	wantName := deployment.ContainerName("demo", "production", "web", 2, "release-1")
+
+	cases := []struct {
+		name    string
+		service string
+	}{
+		{"shorthand", "web.2"},
+		{"full container name", wantName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			var execCalls []agent.ExecContainerParams
+			installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+				return &observabilityAgent{host: host.Name, events: &events, execCalls: &execCalls}
+			})
+
+			cmd := execServiceCmd(&options{configPath: path})
+			cmd.SetArgs([]string{"production", tc.service, "--", "echo", "hi"})
+			if err := cmd.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			if len(execCalls) != 1 || execCalls[0].Name != wantName {
+				t.Fatalf("exec calls = %+v, want single call against %q", execCalls, wantName)
+			}
+		})
+	}
+}
+
+func TestExecRejectsConflictingReplicaFlagAndShorthand(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "release-1", Environment: "production", Images: map[string]string{"web": "image"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return &observabilityAgent{host: host.Name, events: &events}
+	})
+
+	cmd := execServiceCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production", "web.2", "--replica", "1", "--", "echo", "hi"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "conflicts with replica") {
+		t.Fatalf("expected replica conflict error, got %v", err)
 	}
 }
 
@@ -6641,6 +6825,7 @@ func installDeployHooks(t *testing.T, dockerClient deployDocker, agentFactory fu
 	originalAgent := newDeployAgent
 	originalNow := deployNow
 	originalGitRevision := deployGitRevision
+	originalReleaseID := newReleaseID
 	newDeployDocker = func() deployDocker { return dockerClient }
 	newDeployAgent = agentFactory
 	deployNow = func() time.Time {
@@ -6649,11 +6834,15 @@ func installDeployHooks(t *testing.T, dockerClient deployDocker, agentFactory fu
 	deployGitRevision = func(context.Context) (string, error) {
 		return "abc123def456", nil
 	}
+	newReleaseID = func() (string, error) {
+		return "abc123def456-20260630T183456.123456789Z", nil
+	}
 	t.Cleanup(func() {
 		newDeployDocker = originalDocker
 		newDeployAgent = originalAgent
 		deployNow = originalNow
 		deployGitRevision = originalGitRevision
+		newReleaseID = originalReleaseID
 	})
 }
 

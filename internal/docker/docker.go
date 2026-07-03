@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +18,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 )
 
 type Client struct {
@@ -94,8 +95,6 @@ type RegistryAuth struct {
 	Server string          `json:"server"`
 	Auth   json.RawMessage `json:"auth"`
 }
-
-type GitRevisionFunc func(context.Context) (string, error)
 
 func (c Client) Available(ctx context.Context) error {
 	return c.run(ctx, "docker", "version", "--format", "{{.Server.Version}}")
@@ -465,20 +464,22 @@ func (c Client) Run(ctx context.Context, name, image, command string, args ...st
 	return c.run(ctx, "docker", base...)
 }
 
-func ReleaseTag(ctx context.Context, now time.Time, gitRevision GitRevisionFunc) string {
-	stamp := now.UTC().Format("20060102T150405.000000000Z")
-	if gitRevision == nil {
-		return stamp
+// releaseIDBytes is the amount of randomness backing a release ID: 6 bytes
+// hex-encode to a 12 character id, short enough to keep container and image
+// tag names readable while leaving collisions astronomically unlikely.
+const releaseIDBytes = 6
+
+// NewReleaseID returns a short random release identifier. Release ids are a
+// global key in Ship's state store (not scoped per environment), so they
+// need to be collision-resistant on their own; git revision and creation
+// time are tracked separately on the release record instead of being baked
+// into the id.
+func NewReleaseID() (string, error) {
+	buf := make([]byte, releaseIDBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate release id: %w", err)
 	}
-	revision, err := gitRevision(ctx)
-	if err != nil {
-		return stamp
-	}
-	revision = sanitizeTagPart(revision)
-	if revision == "" {
-		return stamp
-	}
-	return revision + "-" + stamp
+	return hex.EncodeToString(buf), nil
 }
 
 func GitShortSHA(ctx context.Context) (string, error) {

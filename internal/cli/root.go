@@ -98,6 +98,7 @@ var newDeployAgent = func(host scheduler.Host) deployAgent {
 
 var deployNow = time.Now
 var deployGitRevision = docker.GitShortSHA
+var newReleaseID = docker.NewReleaseID
 var runLocalHookCommand = defaultRunLocalHookCommand
 var sendWebhookNotification = defaultSendWebhookNotification
 var readCurrentShipBinary = func() ([]byte, error) {
@@ -2674,7 +2675,11 @@ func deployCmd(opts *options) *cobra.Command {
 			}
 			recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "started"})
 			createdAt := deployNow()
-			releaseID := docker.ReleaseTag(ctx, createdAt, deployGitRevision)
+			releaseID, err := newReleaseID()
+			if err != nil {
+				return err
+			}
+			gitRevision, _ := deployGitRevision(ctx)
 			hookReleaseID = releaseID
 			hookCfg = cfg
 			hookStore = store
@@ -2710,6 +2715,7 @@ func deployCmd(opts *options) *cobra.Command {
 				Images:        images,
 				SecretDigests: secretFiles.Digests,
 				ConfigHash:    configHash(cfg),
+				GitRevision:   gitRevision,
 				CreatedAt:     createdAt,
 				Status:        state.ReleaseStatusPending,
 			}
@@ -2981,7 +2987,11 @@ func promoteCmd(opts *options) *cobra.Command {
 				return err
 			}
 			createdAt := deployNow()
-			releaseID := docker.ReleaseTag(ctx, createdAt, deployGitRevision)
+			releaseID, err := newReleaseID()
+			if err != nil {
+				return err
+			}
+			gitRevision, _ := deployGitRevision(ctx)
 			hookReleaseID = releaseID
 			fmt.Fprintf(cmd.OutOrStdout(), "promote %s release %s to %s as %s\n", sourceEnv, sourceRelease.ID, targetEnv, releaseID)
 			for _, service := range sortedMapKeys(images) {
@@ -3038,6 +3048,7 @@ func promoteCmd(opts *options) *cobra.Command {
 				Images:        images,
 				SecretDigests: secretFiles.Digests,
 				ConfigHash:    configHash(cfg),
+				GitRevision:   gitRevision,
 				CreatedAt:     createdAt,
 				Status:        state.ReleaseStatusPending,
 			}
@@ -4037,9 +4048,15 @@ func healthCmd(opts *options) *cobra.Command {
 				return err
 			}
 			if serviceName != "" {
-				if _, ok := cfg.Services[serviceName]; !ok {
-					return fmt.Errorf("unknown service %q", serviceName)
+				resolvedService, parsedReplica, err := resolveServiceReplica(cfg, envName, serviceName)
+				if err != nil {
+					return err
 				}
+				replica, err = mergeResolvedReplica(cmd, replica, parsedReplica, serviceName)
+				if err != nil {
+					return err
+				}
+				serviceName = resolvedService
 			} else if replica > 0 {
 				return fmt.Errorf("--replica requires SERVICE")
 			}
@@ -4516,14 +4533,21 @@ func logsCmd(opts *options) *cobra.Command {
 				return err
 			}
 			cfg = resolved
-			if _, ok := cfg.Services[args[1]]; !ok {
-				return fmt.Errorf("unknown service %q", args[1])
+			serviceArg := args[1]
+			resolvedService, parsedReplica, err := resolveServiceReplica(cfg, args[0], serviceArg)
+			if err != nil {
+				return err
 			}
+			args[1] = resolvedService
 			if lines <= 0 {
 				return fmt.Errorf("--lines must be greater than zero")
 			}
 			if replica < 0 {
 				return fmt.Errorf("--replica cannot be negative")
+			}
+			replica, err = mergeResolvedReplica(cmd, replica, parsedReplica, serviceArg)
+			if err != nil {
+				return err
 			}
 			if failed && strings.TrimSpace(requestedRelease) != "" {
 				return fmt.Errorf("--failed and --release are mutually exclusive")
@@ -4685,9 +4709,15 @@ func restartCmd(opts *options) *cobra.Command {
 				return err
 			}
 			if serviceName != "" {
-				if _, ok := cfg.Services[serviceName]; !ok {
-					return fmt.Errorf("unknown service %q", serviceName)
+				resolvedService, parsedReplica, err := resolveServiceReplica(cfg, envName, serviceName)
+				if err != nil {
+					return err
 				}
+				replica, err = mergeResolvedReplica(cmd, replica, parsedReplica, serviceName)
+				if err != nil {
+					return err
+				}
+				serviceName = resolvedService
 			} else if replica > 0 {
 				return fmt.Errorf("--replica requires SERVICE")
 			}
@@ -4741,6 +4771,53 @@ func restartCmd(opts *options) *cobra.Command {
 	}
 	cmd.Flags().IntVar(&replica, "replica", 0, "restart only one replica of SERVICE")
 	return cmd
+}
+
+// resolveServiceReplica accepts a user-supplied SERVICE argument in any of
+// three forms: a bare service name from ship.yml, the "service.N" shorthand
+// shown in `ship ps` output, or a full container name (also copyable from
+// `ship ps`). It returns the config service name and a replica number (0 if
+// the argument didn't specify one).
+func resolveServiceReplica(cfg *config.Config, envName, arg string) (string, int, error) {
+	arg = strings.TrimSpace(arg)
+	if _, ok := cfg.Services[arg]; ok {
+		return arg, 0, nil
+	}
+	if svc, replica, ok := splitServiceReplica(arg); ok {
+		if _, exists := cfg.Services[svc]; exists {
+			return svc, replica, nil
+		}
+	}
+	if svc, replica, ok := deployment.ParseContainerName(cfg.Project, envName, cfg.Services, arg); ok {
+		return svc, replica, nil
+	}
+	return "", 0, fmt.Errorf("unknown service %q", arg)
+}
+
+// splitServiceReplica splits the "service.N" shorthand on its last dot.
+func splitServiceReplica(arg string) (service string, replica int, ok bool) {
+	idx := strings.LastIndex(arg, ".")
+	if idx <= 0 || idx == len(arg)-1 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(arg[idx+1:])
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return arg[:idx], n, true
+}
+
+// mergeResolvedReplica reconciles a replica number parsed from the SERVICE
+// argument (e.g. "web.2") with an explicit --replica flag, erroring if the
+// two disagree instead of silently preferring one.
+func mergeResolvedReplica(cmd *cobra.Command, flagValue, parsedValue int, arg string) (int, error) {
+	if parsedValue <= 0 {
+		return flagValue, nil
+	}
+	if cmd.Flags().Changed("replica") && flagValue != parsedValue {
+		return 0, fmt.Errorf("--replica %d conflicts with replica %d in %q", flagValue, parsedValue, arg)
+	}
+	return parsedValue, nil
 }
 
 func restartTargets(cfg *config.Config, hosts []scheduler.Host, serviceName string, replica int) ([]scheduler.Placement, error) {
@@ -4894,9 +4971,6 @@ func execServiceCmd(opts *options) *cobra.Command {
 			if replica < 0 {
 				return fmt.Errorf("--replica cannot be negative")
 			}
-			if all && replica > 0 {
-				return fmt.Errorf("--all and --replica cannot be used together")
-			}
 			if timeoutSeconds < 0 {
 				return fmt.Errorf("--timeout cannot be negative")
 			}
@@ -4909,8 +4983,17 @@ func execServiceCmd(opts *options) *cobra.Command {
 				return err
 			}
 			cfg = resolved
-			if _, ok := cfg.Services[serviceName]; !ok {
-				return fmt.Errorf("unknown service %q", serviceName)
+			resolvedService, parsedReplica, err := resolveServiceReplica(cfg, envName, serviceName)
+			if err != nil {
+				return err
+			}
+			serviceName = resolvedService
+			replica, err = mergeResolvedReplica(cmd, replica, parsedReplica, args[1])
+			if err != nil {
+				return err
+			}
+			if all && replica > 0 {
+				return fmt.Errorf("--all and --replica cannot be used together")
 			}
 			stateDir, err := localStateDirForConfig(opts.configPath)
 			if err != nil {
@@ -5485,6 +5568,9 @@ func renderReleaseHistoryText(w io.Writer, view releaseHistoryView) {
 		}
 		if release.ConfigHash != "" {
 			details = append(details, "config="+release.ConfigHash)
+		}
+		if release.GitRevision != "" {
+			details = append(details, "git="+release.GitRevision)
 		}
 		for _, service := range sortedMapKeys(release.Images) {
 			details = append(details, fmt.Sprintf("image %s=%s", service, release.Images[service]))

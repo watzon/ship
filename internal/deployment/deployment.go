@@ -893,6 +893,36 @@ func ContainerName(project, envName, service string, replica int, release string
 	return strings.Join(parts, "_")
 }
 
+// ParseContainerName recovers the service name and replica number from a
+// full container name produced by ContainerName (e.g. as pasted from `ship
+// ps` output). Since project, environment, and service names may themselves
+// contain underscores, it disambiguates by checking the known service names
+// rather than blindly splitting on "_".
+func ParseContainerName(project, envName string, services map[string]config.Service, name string) (service string, replica int, ok bool) {
+	prefix := strings.Join([]string{"ship", safeNamePart(project), safeNamePart(envName), ""}, "_")
+	if !strings.HasPrefix(name, prefix) {
+		return "", 0, false
+	}
+	rest := strings.TrimPrefix(name, prefix)
+	for svc := range services {
+		svcPrefix := safeNamePart(svc) + "_"
+		after, found := strings.CutPrefix(rest, svcPrefix)
+		if !found {
+			continue
+		}
+		replicaPart := after
+		if idx := strings.Index(after, "_"); idx >= 0 {
+			replicaPart = after[:idx]
+		}
+		n, err := strconv.Atoi(replicaPart)
+		if err != nil || n <= 0 {
+			continue
+		}
+		return svc, n, true
+	}
+	return "", 0, false
+}
+
 func ContainerLabels(project, envName, service string, replica int, release string, custom ...map[string]string) map[string]string {
 	labels := mergeLabels(custom...)
 	for key, value := range map[string]string{

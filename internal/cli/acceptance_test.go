@@ -364,18 +364,22 @@ func installAcceptanceDeployHooks(t *testing.T, dockerClient deployDocker, agent
 	originalAgent := newDeployAgent
 	originalNow := deployNow
 	originalGitRevision := deployGitRevision
+	originalReleaseID := newReleaseID
 	clock := &acceptanceClock{next: time.Date(2026, 6, 30, 18, 0, 0, 0, time.UTC)}
+	releaseIDs := &acceptanceReleaseIDs{}
 	newDeployDocker = func() deployDocker { return dockerClient }
 	newDeployAgent = agentFactory
 	deployNow = clock.Now
 	deployGitRevision = func(context.Context) (string, error) {
 		return "accept123456", nil
 	}
+	newReleaseID = releaseIDs.Next
 	t.Cleanup(func() {
 		newDeployDocker = originalDocker
 		newDeployAgent = originalAgent
 		deployNow = originalNow
 		deployGitRevision = originalGitRevision
+		newReleaseID = originalReleaseID
 	})
 }
 
@@ -387,6 +391,15 @@ func (c *acceptanceClock) Now() time.Time {
 	now := c.next
 	c.next = c.next.Add(time.Second)
 	return now
+}
+
+type acceptanceReleaseIDs struct {
+	count int
+}
+
+func (r *acceptanceReleaseIDs) Next() (string, error) {
+	r.count++
+	return fmt.Sprintf("accept%06d", r.count), nil
 }
 
 type acceptanceDocker struct {

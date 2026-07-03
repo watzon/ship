@@ -26,6 +26,7 @@ type Release struct {
 	Images        map[string]string `json:"images"`
 	SecretDigests map[string]string `json:"secret_digests,omitempty"`
 	ConfigHash    string            `json:"config_hash"`
+	GitRevision   string            `json:"git_revision,omitempty"`
 	CreatedAt     time.Time         `json:"created_at"`
 	Healthy       bool              `json:"healthy"`
 	Status        string            `json:"status,omitempty"`

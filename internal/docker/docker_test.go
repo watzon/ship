@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestRunAddsShipManagedLabel(t *testing.T) {
@@ -56,25 +55,32 @@ func TestListShipContainersParsesDockerPSJSONLines(t *testing.T) {
 	}
 }
 
-func TestReleaseTagUsesGitSHAAndTimestamp(t *testing.T) {
-	now := time.Date(2026, 6, 30, 12, 34, 56, 123456789, time.FixedZone("MDT", -6*60*60))
-	got := ReleaseTag(context.Background(), now, func(context.Context) (string, error) {
-		return "abc123def456\n", nil
-	})
-	want := "abc123def456-20260630T183456.123456789Z"
-	if got != want {
-		t.Fatalf("release tag = %q, want %q", got, want)
+func TestNewReleaseIDIsShortAndURLSafe(t *testing.T) {
+	got, err := NewReleaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 12 {
+		t.Fatalf("release id length = %d, want 12: %q", len(got), got)
+	}
+	for _, r := range got {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			t.Fatalf("release id %q contains unexpected character %q", got, r)
+		}
 	}
 }
 
-func TestReleaseTagFallsBackToTimestampWhenGitUnavailable(t *testing.T) {
-	now := time.Date(2026, 6, 30, 12, 34, 56, 987654321, time.UTC)
-	got := ReleaseTag(context.Background(), now, func(context.Context) (string, error) {
-		return "", errors.New("no git")
-	})
-	want := "20260630T123456.987654321Z"
-	if got != want {
-		t.Fatalf("release tag = %q, want %q", got, want)
+func TestNewReleaseIDIsUnpredictable(t *testing.T) {
+	first, err := NewReleaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewReleaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("expected distinct release ids, got %q twice", first)
 	}
 }
 

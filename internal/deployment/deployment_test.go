@@ -1315,6 +1315,37 @@ func (f *ingressAgent) Call(ctx context.Context, method string, params any, out 
 	return nil
 }
 
+func TestParseContainerNameRoundTripsContainerName(t *testing.T) {
+	services := map[string]config.Service{"web": {}, "worker_task": {}}
+	name := ContainerName("demo", "production", "worker_task", 2, "abc123def456")
+	service, replica, ok := ParseContainerName("demo", "production", services, name)
+	if !ok {
+		t.Fatalf("expected parse to succeed for %q", name)
+	}
+	if service != "worker_task" || replica != 2 {
+		t.Fatalf("parsed service=%q replica=%d, want worker_task/2", service, replica)
+	}
+}
+
+func TestParseContainerNameRejectsWrongProjectOrEnvironment(t *testing.T) {
+	services := map[string]config.Service{"web": {}}
+	name := ContainerName("demo", "production", "web", 1, "abc123def456")
+	if _, _, ok := ParseContainerName("other", "production", services, name); ok {
+		t.Fatalf("expected parse to fail for mismatched project")
+	}
+	if _, _, ok := ParseContainerName("demo", "staging", services, name); ok {
+		t.Fatalf("expected parse to fail for mismatched environment")
+	}
+}
+
+func TestParseContainerNameRejectsUnknownService(t *testing.T) {
+	services := map[string]config.Service{"web": {}}
+	name := ContainerName("demo", "production", "worker", 1, "abc123def456")
+	if _, _, ok := ParseContainerName("demo", "production", services, name); ok {
+		t.Fatalf("expected parse to fail for service not in config")
+	}
+}
+
 func contains(values []string, needle string) bool {
 	for _, value := range values {
 		if value == needle {
