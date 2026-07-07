@@ -47,6 +47,18 @@ ship --help
 ship version
 ```
 
+## For AI agents
+
+Install the Ship skill for coding agents (Claude Code, Cursor, Codex, etc.):
+
+```bash
+npx skills add watzon/ship --skill ship
+```
+
+(Use `npx skills add watzon/ship --list` to see available skills in the repo.)
+
+The skill bundles migration guides, config references, command playbooks, and day-2 operation instructions. Use `-g` for global install or `--agent` to target specific agents.
+
 ## First deploy
 
 ```bash
