@@ -504,7 +504,7 @@ func TestAgentUpgradeWithOverrideToleratesVersionSkew(t *testing.T) {
 	var out bytes.Buffer
 	cmd := agentCmd(&options{configPath: path})
 	cmd.SetOut(&out)
-	cmd.SetArgs([]string{"upgrade", "production", "--agent-binary", "/mirror/ship_0.4.1_linux_amd64.tar.gz"})
+	cmd.SetArgs([]string{"upgrade", "production", "--agent-binary", "/mirror/ship_0.4.6_linux_amd64.tar.gz"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("override upgrade rolled back on version skew: %v", err)
 	}

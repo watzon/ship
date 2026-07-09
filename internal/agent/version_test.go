@@ -24,12 +24,12 @@ func TestVersionFallsBackToDevSentinel(t *testing.T) {
 
 func TestIsReleaseTag(t *testing.T) {
 	cases := map[string]bool{
-		"v0.4.1":                               true,
+		"v0.4.6":                               true,
 		"v12.0.3":                              true,
-		"0.4.1":                                false, // module versions carry the v prefix
+		"0.4.6":                                false, // module versions carry the v prefix
 		"(devel)":                              false,
 		"":                                     false,
-		"v0.4.2-0.20260702150405-abcdef123456": false, // pseudo-version from @main
+		"v0.4.6-0.20260702150405-abcdef123456": false, // pseudo-version from @main
 		"v0.5.0-rc.1":                          false, // no release assets published for prereleases
 	}
 	for input, want := range cases {

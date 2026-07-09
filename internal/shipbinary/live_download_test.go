@@ -16,7 +16,7 @@ func TestLiveReleaseDownload(t *testing.T) {
 	if os.Getenv("SHIP_LIVE_DOWNLOAD_TEST") != "1" {
 		t.Skip("set SHIP_LIVE_DOWNLOAD_TEST=1 to run the live release download test")
 	}
-	setAgentVersion(t, "0.4.1")
+	setAgentVersion(t, "0.4.6")
 	target := Platform{GOOS: "linux", GOARCH: "amd64"}
 
 	binary, err := downloadRelease(context.Background(), target)

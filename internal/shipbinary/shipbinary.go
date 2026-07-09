@@ -533,7 +533,7 @@ type AssetStatus struct {
 func CheckRelease(ctx context.Context, version string) ([]AssetStatus, bool, error) {
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
 	if !releaseVersion(version) {
-		return nil, false, fmt.Errorf("%q is not a release version (expected X.Y.Z, e.g. 0.4.1)", version)
+		return nil, false, fmt.Errorf("%q is not a release version (expected X.Y.Z, e.g. 0.4.6)", version)
 	}
 	names := []string{"checksums.txt"}
 	for _, platform := range SupportedPlatforms {

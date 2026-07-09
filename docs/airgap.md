@@ -12,7 +12,7 @@ rather than falling back to a network download.
 Mirror the assets once from a machine with access:
 
 ```bash
-VERSION=v0.4.2
+VERSION=v0.4.6
 mkdir -p ship-releases && cd ship-releases
 BASE="https://github.com/watzon/ship/releases/download/${VERSION}"
 curl -fsSL -O "${BASE}/checksums.txt"
@@ -38,7 +38,7 @@ When every host shares one platform, point directly at a binary or release
 tarball built for it:
 
 ```bash
-ship agent upgrade production --agent-binary /path/to/ship_0.4.2_linux_amd64.tar.gz
+ship agent upgrade production --agent-binary /path/to/ship_0.4.6_linux_amd64.tar.gz
 ```
 
 The binary's architecture is still verified against each host; a mismatch

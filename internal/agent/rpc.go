@@ -57,7 +57,7 @@ func Version() string {
 	return devVersion
 }
 
-// isReleaseTag accepts exact release tags (v0.4.1) and rejects "(devel)",
+// isReleaseTag accepts exact release tags (v0.4.6) and rejects "(devel)",
 // pseudo-versions from @main installs, and anything else that has no
 // corresponding release assets.
 func isReleaseTag(v string) bool {
