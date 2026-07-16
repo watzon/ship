@@ -22,7 +22,7 @@ Requires [Go](https://go.dev/dl/) 1.26+ and Docker for deploys.
 Install the CLI with `go install`, pinned to a released version:
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@v0.5.1
+go install github.com/watzon/ship/cmd/ship@v0.5.2
 ```
 
 `@latest` works for interactive use; pin an explicit release in CI. Avoid
