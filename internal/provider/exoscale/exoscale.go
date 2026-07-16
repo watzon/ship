@@ -157,24 +157,49 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor resolves the exoscale security groups and builds the
+// reconcile backend shared by Reconcile and CreateHost so both create instances
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	exoscale := *env.Provider.Exoscale
 	securityGroupIDs := append([]string{}, exoscale.SecurityGroups...)
 	if exoscale.SecurityGroup.ManagedValue(true) {
 		group, err := c.EnsureSecurityGroup(ctx, project, environment, exoscale)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		securityGroupIDs = append(securityGroupIDs, group.ID)
 	} else if exoscale.SecurityGroup.ID != "" {
 		securityGroupIDs = append(securityGroupIDs, exoscale.SecurityGroup.ID)
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:           c,
 		exoscale:         exoscale,
 		securityGroupIDs: securityGroupIDs,
-	})
+	}, nil
 }
+
+// CreateHost provisions a single instance using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Exoscale == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.exoscale", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client           Client

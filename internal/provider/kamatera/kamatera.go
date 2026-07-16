@@ -173,6 +173,17 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, kamatera: *env.Provider.Kamatera})
 }
 
+// CreateHost provisions a single server using the same backend Reconcile builds,
+// so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Kamatera == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.kamatera", environment)
+	}
+	return reconcileBackend{client: c, kamatera: *env.Provider.Kamatera}.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
+
 type reconcileBackend struct {
 	client   Client
 	kamatera config.KamateraConfig

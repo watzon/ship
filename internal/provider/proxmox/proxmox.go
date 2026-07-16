@@ -89,6 +89,19 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	return provider.ReconcileHosts(ctx, project, environment, plans, c)
 }
 
+// CreateHost provisions a single VM using the same client-backed backend
+// Reconcile builds, so `ship migrate` can add a replacement alongside the
+// existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Proxmox == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.proxmox", environment)
+	}
+	c.Config = *env.Provider.Proxmox
+	return c.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
+
 func (c Client) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
 	cfg := c.Config
 	if cfg.Node == "" {

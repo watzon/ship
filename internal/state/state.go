@@ -48,7 +48,10 @@ type HostFact struct {
 	PublicAddress  string            `json:"public_address,omitempty"`
 	Provider       string            `json:"provider,omitempty"`
 	ProviderID     string            `json:"provider_id,omitempty"`
-	ServerID       int64             `json:"server_id,omitempty"`
+	// ProviderName is the provider-level server name when it differs from the
+	// logical host name, such as a replacement server created by `ship migrate`.
+	ProviderName string `json:"provider_name,omitempty"`
+	ServerID     int64  `json:"server_id,omitempty"`
 }
 
 type AccessoryState struct {

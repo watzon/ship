@@ -30,6 +30,28 @@ func TestDesiredVirtualMachinesUsesPoolsAndProviderShape(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	env := testEnvironment(1)
+	plans := DesiredVirtualMachinesFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.PublicAddress != "203.0.113.20" {
+		t.Fatalf("created host = %+v", host)
+	}
+	if len(api.securityGroups) != 1 {
+		t.Fatalf("security group not ensured through the shared backend: %+v", api.securityGroups)
+	}
+	if len(api.virtualMachines) != 1 {
+		t.Fatalf("virtual machine not created through the shared backend: %+v", api.virtualMachines)
+	}
+}
+
 func TestReconcileCreatesSecurityGroupNetworkAndVirtualMachine(t *testing.T) {
 	api := newFakeAzureAPI(t, nil)
 	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))

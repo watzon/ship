@@ -162,18 +162,43 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor scopes the client, resolves the security group and builds
+// the reconcile backend shared by Reconcile and CreateHost so both create
+// servers identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	scaleway := *env.Provider.Scaleway
 	client := c.withScope(scaleway)
 	if scaleway.SecurityGroup.ManagedValue(true) {
 		sg, err := client.EnsureSecurityGroup(ctx, project, environment, scaleway)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		scaleway.SecurityGroup.ID = sg.ID
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: client, scaleway: scaleway})
+	return reconcileBackend{client: client, scaleway: scaleway}, nil
 }
+
+// CreateHost provisions a single server using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Scaleway == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.scaleway", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client   Client

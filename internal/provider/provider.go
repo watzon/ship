@@ -15,6 +15,10 @@ const (
 	LabelProject     = "project"
 	LabelEnvironment = "environment"
 	LabelPool        = "pool"
+	// LabelHost records the logical host name a server fulfills. It lets a
+	// replacement server created by `ship migrate` keep a unique provider-level
+	// name while still reconciling against its logical host.
+	LabelHost = "host"
 )
 
 type HostPlan struct {
@@ -69,6 +73,22 @@ type Provider interface {
 	CredentialChecks(lookupEnv func(string) (string, bool)) []CredentialCheck
 }
 
+// HostCreator is an optional capability for providers that can create a single
+// server outside full reconciliation. `ship migrate` uses it to provision a
+// replacement server while the server it replaces still exists.
+type HostCreator interface {
+	CreateHost(ctx context.Context, project, environment string, env config.Environment, plan HostPlan) (Host, error)
+}
+
+// LogicalName returns the logical host name a provider server fulfills: the
+// LabelHost label when present, otherwise the server name.
+func LogicalName(host Host) string {
+	if name := strings.TrimSpace(host.Labels[LabelHost]); name != "" {
+		return name
+	}
+	return host.Name
+}
+
 type HostPlanOptions struct {
 	Location string
 	Size     string
@@ -99,6 +119,7 @@ func HostPlans(project, environment string, env config.Environment, opts HostPla
 			hostOpts.UserData = pool.UserData
 		}
 		labels := HostLabels(project, environment, host.Pool, env.Hosts.Labels, pool.Labels)
+		labels[LabelHost] = host.Name
 		plans = append(plans, HostPlan{
 			Project:     project,
 			Environment: environment,
@@ -157,16 +178,26 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 	if err != nil {
 		return ReconcileResult{}, err
 	}
-	existingByName := map[string]Host{}
-	for _, host := range existing {
-		existingByName[host.Name] = host
+	existingByLogical := map[string]int{}
+	for i, host := range existing {
+		logical := LogicalName(host)
+		if j, ok := existingByLogical[logical]; ok {
+			// Two servers claim the same logical host (for example an old
+			// server plus its migrate replacement). Prefer the one whose
+			// provider name matches the logical name so reconciliation stays
+			// stable; the other is reported as extra.
+			if existing[j].Name == logical {
+				continue
+			}
+		}
+		existingByLogical[logical] = i
 	}
 
-	desiredNames := map[string]bool{}
+	matched := map[int]bool{}
 	for _, plan := range desired {
-		desiredNames[plan.Name] = true
-		if host, ok := existingByName[plan.Name]; ok {
-			result.Existing = append(result.Existing, host)
+		if i, ok := existingByLogical[plan.Name]; ok {
+			result.Existing = append(result.Existing, existing[i])
+			matched[i] = true
 			continue
 		}
 		host, err := backend.Create(ctx, plan)
@@ -176,8 +207,8 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 		result.Created = append(result.Created, host)
 	}
 
-	for _, host := range existing {
-		if !desiredNames[host.Name] {
+	for i, host := range existing {
+		if !matched[i] {
 			result.Extra = append(result.Extra, host)
 		}
 	}

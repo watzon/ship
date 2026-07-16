@@ -216,19 +216,11 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
-	latitude := *env.Provider.Latitude
-	ownershipTagIDs, err := c.EnsureTags(ctx, provider.ShipLabels(project, environment, ""))
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
 	if err != nil {
 		return provider.ReconcileResult{}, err
 	}
-	userDataID := latitude.UserDataID
-	if userDataID == "" && latitude.UserData != "" {
-		userData, err := c.EnsureUserData(ctx, project, environment, latitude.Project, latitude.UserData)
-		if err != nil {
-			return provider.ReconcileResult{}, err
-		}
-		userDataID = userData.ID
-	}
+	latitude := *env.Provider.Latitude
 	firewallID := latitude.Firewall.ID
 	if latitude.Firewall.ManagedValue(true) {
 		firewall, err := c.EnsureFirewall(ctx, project, environment, latitude)
@@ -237,12 +229,7 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		}
 		firewallID = firewall.ID
 	}
-	result, err = provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
-		client:          c,
-		latitude:        latitude,
-		userDataID:      userDataID,
-		ownershipTagIDs: ownershipTagIDs,
-	})
+	result, err = provider.ReconcileHosts(ctx, project, environment, desired, backend)
 	if err != nil {
 		return provider.ReconcileResult{}, err
 	}
@@ -254,6 +241,65 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	}
 	return result, nil
 }
+
+// reconcileBackendFor resolves the ownership tags and user-data and builds the
+// reconcile backend shared by Reconcile and CreateHost so both create servers
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
+	latitude := *env.Provider.Latitude
+	ownershipTagIDs, err := c.EnsureTags(ctx, provider.ShipLabels(project, environment, ""))
+	if err != nil {
+		return reconcileBackend{}, err
+	}
+	userDataID := latitude.UserDataID
+	if userDataID == "" && latitude.UserData != "" {
+		userData, err := c.EnsureUserData(ctx, project, environment, latitude.Project, latitude.UserData)
+		if err != nil {
+			return reconcileBackend{}, err
+		}
+		userDataID = userData.ID
+	}
+	return reconcileBackend{
+		client:          c,
+		latitude:        latitude,
+		userDataID:      userDataID,
+		ownershipTagIDs: ownershipTagIDs,
+	}, nil
+}
+
+// CreateHost provisions a single server using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+// It also applies the managed firewall assignment Reconcile would perform.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Latitude == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.latitude", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	host, err := backend.Create(ctx, plan)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	latitude := *env.Provider.Latitude
+	firewallID := latitude.Firewall.ID
+	if latitude.Firewall.ManagedValue(true) {
+		firewall, err := c.EnsureFirewall(ctx, project, environment, latitude)
+		if err != nil {
+			return provider.Host{}, err
+		}
+		firewallID = firewall.ID
+	}
+	if firewallID != "" {
+		if err := c.EnsureFirewallAssignments(ctx, firewallID, []provider.Host{host}); err != nil {
+			return provider.Host{}, err
+		}
+	}
+	return host, nil
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client          Client

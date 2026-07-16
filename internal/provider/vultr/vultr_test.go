@@ -85,6 +85,25 @@ func TestCreateInstanceUsesPoolSourceOverride(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeVultrAPI(t, nil)
+	env := testEnvironment(1)
+	plans := DesiredInstancesFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.ID == "" || host.PublicAddress == "" {
+		t.Fatalf("created instance missing facts: %+v", host)
+	}
+	if len(api.creates) != 1 {
+		t.Fatalf("creates = %d", len(api.creates))
+	}
+}
+
 func TestReconcileCreatesMissingInstances(t *testing.T) {
 	api := newFakeVultrAPI(t, nil)
 	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))

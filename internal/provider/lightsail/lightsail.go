@@ -232,6 +232,28 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	return result, nil
 }
 
+// CreateHost provisions a single instance using the same backend Reconcile
+// builds, so `ship migrate` can add a replacement alongside the existing one.
+// It also applies the managed public-port rules Reconcile would apply.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Lightsail == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.lightsail", environment)
+	}
+	lightsail := *env.Provider.Lightsail
+	host, err := reconcileBackend{client: c, lightsail: lightsail}.Create(ctx, plan)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	if lightsail.Firewall.ManagedValue(true) {
+		if err := c.PutInstancePublicPorts(ctx, host.Name, lightsail); err != nil {
+			return provider.Host{}, err
+		}
+	}
+	return host, nil
+}
+
+var _ provider.HostCreator = Client{}
+
 type reconcileBackend struct {
 	client    Client
 	lightsail config.LightsailConfig

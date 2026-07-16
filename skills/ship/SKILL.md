@@ -165,10 +165,18 @@ ship doctor [--json]
 ```bash
 ship provision apply ENV [--yes]
 ship provision decommission ENV [--yes]
+ship migrate ENV HOST [--yes] [--keep-server] [--artifact NAME=PATH]
 ship agent install ENV
 ship agent upgrade ENV [--json]
 ship version [ENV] [--json]
 ```
+
+`ship migrate` replaces the server behind one logical host: it provisions a
+replacement from current pool settings (edit pool `size`/`location` first to
+vertically scale or relocate), moves accessory data via backup/restore, restarts
+the host's replicas from the current release, updates ingress, and deletes the
+old server. Cloud-provisioned pools only; accessories on the host need
+backup/restore commands configured.
 
 ### Deploy and operate
 

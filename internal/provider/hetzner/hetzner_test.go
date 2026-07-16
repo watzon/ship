@@ -89,6 +89,34 @@ func TestReconcileCreatesMissingServers(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeHetznerAPI(t, nil)
+	plans := DesiredServersFor("demo", "production", testEnvironment(1))
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", testEnvironment(1), plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.ID == "" || host.PublicAddress == "" {
+		t.Fatalf("created host missing facts: %+v", host)
+	}
+	if len(api.creates) != 1 {
+		t.Fatalf("creates = %d", len(api.creates))
+	}
+	create := api.creates[0]
+	if len(create.Networks) != 1 || create.Networks[0] != 300 {
+		t.Fatalf("networks = %+v", create.Networks)
+	}
+	if len(create.Firewalls) != 1 || create.Firewalls[0]["firewall"] != 400 {
+		t.Fatalf("firewalls = %+v", create.Firewalls)
+	}
+	if len(create.SSHKeys) != 1 || create.SSHKeys[0] != "ship-key" {
+		t.Fatalf("ssh_keys = %+v", create.SSHKeys)
+	}
+}
+
 func TestReconcileLeavesMatchingServersUnchanged(t *testing.T) {
 	existing := []Server{{
 		ID:         10,

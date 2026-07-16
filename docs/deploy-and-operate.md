@@ -21,6 +21,23 @@ ship --dry-run provision decommission production
 ship provision decommission production --yes
 ```
 
+Migrate replaces the server behind one logical host while the host keeps its name and placement. Ship provisions a replacement from the current pool settings, bootstraps the agent, takes fresh backups of accessories placed on the host and restores them on the replacement, restarts the host's service replicas from the current release with health checks, updates ingress upstreams, then stops workloads on the old server and deletes it. Because the replacement is built from the config you have now, editing the pool's `size` (or `location`, or `image`) first and then migrating each host is how you vertically scale or relocate a pool one server at a time.
+
+```bash
+ship --dry-run migrate production web-1
+ship migrate production web-1 --yes
+ship migrate production data-1 --yes --keep-server
+ship migrate production data-1 --yes --artifact postgres=./postgres.backup
+```
+
+Replacement servers get a unique provider-level name (`web-1-m<timestamp>`) plus a `host=web-1` label, and `ship provision apply` matches servers by that label, so reconciliation stays idempotent after a migration. Notes:
+
+- Migrate needs a provider that can create servers. For inventory-backed hosts (manual, Terraform, Pulumi, Ansible, SSH config), update the inventory to swap the server, run `ship deploy` to converge placement, and use `ship accessory failover` to move accessory data.
+- Accessories placed on the host must have `backup.command` and `backup.restore_command` configured; writes that land between the backup and the cutover are not carried over, so enable `ship maintenance enable` first when that matters. `--artifact NAME=PATH` restores from a local artifact instead of taking a fresh backup.
+- Service volume data is not migrated; only accessory data moves via backup/restore.
+- Ship manages no DNS. If the host serves ingress, point DNS records at the replacement address printed at the end.
+- `--keep-server` stops workloads on the old server but leaves it in your provider account; `ship provision apply` reports it as extra until you delete it.
+
 Deploy builds or resolves service images, writes release state, ensures configured accessories are running, rolls services through the SSH-framed agent, runs health checks, and promotes only healthy releases. Accessory ensure is conservative: an already-running accessory is left in place, while a missing or stopped accessory is created before release commands and service rollout. If an accessory is created or explicitly redeployed, Ship restarts current-release service containers so database or Redis clients reconnect to the current container address.
 
 ```bash

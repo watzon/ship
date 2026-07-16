@@ -200,6 +200,17 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor resolves the OCI region, compartment and network security
+// groups and builds the reconcile backend shared by Reconcile and CreateHost so
+// both launch instances identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	ociConfig := *env.Provider.OCI
 	c.Region = firstNonEmpty(ociConfig.Region, c.Region)
 	c.CompartmentID = firstNonEmpty(ociConfig.CompartmentID, c.CompartmentID)
@@ -207,19 +218,33 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if ociConfig.NetworkSecurityGroup.ManagedValue(true) {
 		group, err := c.EnsureNetworkSecurityGroup(ctx, project, environment, ociConfig)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		networkSecurityGroupIDs = append(networkSecurityGroupIDs, group.ID)
 	} else if ociConfig.NetworkSecurityGroup.ID != "" {
 		networkSecurityGroupIDs = append(networkSecurityGroupIDs, ociConfig.NetworkSecurityGroup.ID)
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:                  c,
 		oci:                     ociConfig,
 		networkSecurityGroupIDs: networkSecurityGroupIDs,
-	})
+	}, nil
 }
+
+// CreateHost provisions a single instance using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.OCI == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.oci", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client                  Client

@@ -48,6 +48,28 @@ func TestDesiredDropletTagsRoundTripShipLabels(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeDigitalOceanAPI(t, nil)
+	env := testEnvironment(1)
+	plans := DesiredDropletsFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.ID == "" || host.PublicAddress == "" {
+		t.Fatalf("created droplet missing facts: %+v", host)
+	}
+	if len(api.creates) != 1 {
+		t.Fatalf("creates = %d", len(api.creates))
+	}
+	if len(api.firewalls) != 1 {
+		t.Fatalf("firewall not ensured through the shared backend: %d", len(api.firewalls))
+	}
+}
+
 func TestReconcileCreatesMissingDroplets(t *testing.T) {
 	api := newFakeDigitalOceanAPI(t, nil)
 	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))

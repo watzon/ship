@@ -52,6 +52,24 @@ func TestTagsForPlanIncludeShipLabelsAndName(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeEC2API(t, nil)
+	env := testEnvironment(1)
+	plans := DesiredInstancesFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	if _, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0]); err != nil {
+		t.Fatal(err)
+	}
+	if api.firstAction("CreateSecurityGroup").Get("GroupName") != "ship-demo-production-sg" {
+		t.Fatalf("security group was not ensured through the shared backend")
+	}
+	if api.firstAction("RunInstances").Get("KeyName") != "ship-key" {
+		t.Fatalf("instance was not launched through the shared backend")
+	}
+}
+
 func TestReconcileCreatesMissingInstances(t *testing.T) {
 	api := newFakeEC2API(t, nil)
 	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))

@@ -162,11 +162,29 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	result, err = provider.ReconcileHosts(ctx, project, environment, desired, backend)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	if err := c.EnsureHostAttachments(ctx, result.Existing, backend.networkID, backend.firewallID); err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return result, nil
+}
+
+// reconcileBackendFor resolves the per-environment network and firewall and
+// builds the reconcile backend. Reconcile and CreateHost share it so the two
+// construct servers identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	var networkID int64
 	if env.Provider.Hetzner.Network.EnabledValue(true) {
 		network, err := c.EnsureNetwork(ctx, project, environment, *env.Provider.Hetzner)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		networkID = network.ID
 	}
@@ -174,26 +192,32 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if env.Provider.Hetzner.Firewall.EnabledValue(true) {
 		firewall, err := c.EnsureFirewall(ctx, project, environment, *env.Provider.Hetzner)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		firewallID = firewall.ID
 	}
-
-	var err error
-	result, err = provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:     c,
 		sshKeys:    env.Provider.Hetzner.SSHKeys,
 		networkID:  networkID,
 		firewallID: firewallID,
-	})
-	if err != nil {
-		return provider.ReconcileResult{}, err
-	}
-	if err := c.EnsureHostAttachments(ctx, result.Existing, networkID, firewallID); err != nil {
-		return provider.ReconcileResult{}, err
-	}
-	return result, nil
+	}, nil
 }
+
+// CreateHost provisions a single server using the same backend Reconcile would
+// build, letting `ship migrate` add a replacement while the old server remains.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Hetzner == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.hetzner", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client     Client

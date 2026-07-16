@@ -464,6 +464,15 @@ func (f *acceptanceFakeInfra) record(format string, args ...any) {
 	*f.events = append(*f.events, fmt.Sprintf(format, args...))
 }
 
+// containerKey identifies the physical server so a migrated logical host does
+// not share container state with the server it replaced.
+func containerKey(host scheduler.Host) string {
+	if host.Contact != "" {
+		return host.Contact
+	}
+	return host.Name
+}
+
 func (f *acceptanceFakeInfra) containersFor(host string) []docker.ContainerSummary {
 	containers := f.containers[host]
 	out := make([]docker.ContainerSummary, 0, len(containers))
@@ -513,7 +522,7 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 	case "list_ship_containers":
 		a.infra.record("agent:%s:list_ship_containers", a.host.Name)
 		if containers, ok := out.(*[]docker.ContainerSummary); ok {
-			*containers = a.infra.containersFor(a.host.Name)
+			*containers = a.infra.containersFor(containerKey(a.host))
 		}
 	case "pull":
 		image := params.(map[string]string)["image"]
@@ -525,7 +534,7 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 		for key, value := range p.Labels {
 			labels[key] = value
 		}
-		a.infra.upsertContainer(a.host.Name, docker.ContainerSummary{
+		a.infra.upsertContainer(containerKey(a.host), docker.ContainerSummary{
 			ID:     a.host.Name + "-" + p.Name,
 			Image:  p.Image,
 			Names:  p.Name,
@@ -541,7 +550,7 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 	case "stop_container":
 		name := params.(map[string]string)["name"]
 		a.infra.record("agent:%s:stop:%s", a.host.Name, name)
-		a.infra.removeContainer(a.host.Name, name)
+		a.infra.removeContainer(containerKey(a.host), name)
 	case "logs":
 		p := params.(agent.LogsParams)
 		a.infra.record("agent:%s:logs:%s:%d", a.host.Name, p.Name, p.Lines)
@@ -568,6 +577,7 @@ type acceptanceHetznerAPI struct {
 	server     *httptest.Server
 	servers    map[string]hetzner.Server
 	created    []string
+	deleted    []string
 	nextID     int64
 	nextAction int64
 }
@@ -658,6 +668,23 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"action": map[string]any{"id": api.nextAction, "status": "success"},
 		})
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/servers/"):
+		id, err := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/servers/"), 10, 64)
+		if err != nil {
+			api.t.Fatalf("delete server id: %v", err)
+		}
+		for name, server := range api.servers {
+			if server.ID == id {
+				delete(api.servers, name)
+				api.deleted = append(api.deleted, name)
+				api.nextAction++
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"action": map[string]any{"id": api.nextAction, "status": "success"},
+				})
+				return
+			}
+		}
+		api.t.Fatalf("delete unknown server id %d", id)
 	default:
 		api.t.Fatalf("%s %s", r.Method, r.URL.Path)
 	}

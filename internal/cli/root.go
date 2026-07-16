@@ -183,6 +183,8 @@ func Execute() error {
 	scale.GroupID = ui.GroupPlan
 	provision := provisionCmd(opts)
 	provision.GroupID = ui.GroupInfra
+	migrate := migrateCmd(opts)
+	migrate.GroupID = ui.GroupInfra
 	agent := agentCmd(opts)
 	agent.GroupID = ui.GroupInfra
 	version := versionCmd(opts)
@@ -233,7 +235,7 @@ func Execute() error {
 	root.AddCommand(
 		init, doctor,
 		cfg, hosts, plan, scale,
-		provision, agent, version, release,
+		provision, migrate, agent, version, release,
 		deploy, promote,
 		status, ps, health, logs, execSvc, restart, inspect, support, events, releases, lock, unlock, maintenance, prune,
 		accessory,
@@ -726,12 +728,12 @@ func printProviderID(w io.Writer, id string) {
 }
 
 func hostFactsFromReconcile(providerName string, result provider.ReconcileResult) []state.HostFact {
-	hostsByName := map[string]provider.Host{}
+	hostsByLogical := map[string]provider.Host{}
 	for _, host := range result.Existing {
-		hostsByName[host.Name] = host
+		hostsByLogical[provider.LogicalName(host)] = host
 	}
 	for _, host := range result.Created {
-		hostsByName[host.Name] = host
+		hostsByLogical[provider.LogicalName(host)] = host
 	}
 
 	facts := make([]state.HostFact, 0, len(result.Desired))
@@ -742,24 +744,34 @@ func hostFactsFromReconcile(providerName string, result provider.ReconcileResult
 			User:     plan.User,
 			Provider: providerName,
 		}
-		if host, ok := hostsByName[plan.Name]; ok {
-			fact.ProviderID = host.ID
-			if id, err := strconv.ParseInt(host.ID, 10, 64); err == nil {
-				fact.ServerID = id
-			}
-			fact.SSHPort = host.SSHPort
-			fact.IdentityFile = host.IdentityFile
-			fact.KnownHostsFile = host.KnownHostsFile
-			fact.JumpHost = host.JumpHost
-			fact.SSHOptions = copyStringMap(host.SSHOptions)
-			fact.PublicAddress = host.PublicAddress
-			if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
-				fact.IPv4 = host.PublicAddress
-			}
+		if host, ok := hostsByLogical[plan.Name]; ok {
+			applyProviderHostToFact(&fact, host)
 		}
 		facts = append(facts, fact)
 	}
 	return facts
+}
+
+func applyProviderHostToFact(fact *state.HostFact, host provider.Host) {
+	fact.ProviderID = host.ID
+	if id, err := strconv.ParseInt(host.ID, 10, 64); err == nil {
+		fact.ServerID = id
+	}
+	if host.Name != fact.Name {
+		fact.ProviderName = host.Name
+	} else {
+		fact.ProviderName = ""
+	}
+	fact.SSHPort = host.SSHPort
+	fact.IdentityFile = host.IdentityFile
+	fact.KnownHostsFile = host.KnownHostsFile
+	fact.JumpHost = host.JumpHost
+	fact.SSHOptions = copyStringMap(host.SSHOptions)
+	fact.PublicAddress = host.PublicAddress
+	fact.IPv4 = ""
+	if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
+		fact.IPv4 = host.PublicAddress
+	}
 }
 
 type statusView struct {
@@ -6923,14 +6935,6 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 		return nil
 	}
 
-	secretOpts, err := secretSourceOptions(opts, envName)
-	if err != nil {
-		return fail(err)
-	}
-	secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
-	if err != nil {
-		return fail(err)
-	}
 	observed, err := collectAccessoryObservations(ctx, cfg, hosts, envName, []string{name})
 	if err != nil {
 		return fail(err)
@@ -6945,61 +6949,9 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 		}
 	}
 
-	targetClient := newDeployAgent(target)
-	secretEnvFile, secretContent := accessorySecretEnvFile(envName, name, secretFile)
-	if err := writeRemoteSecretFile(ctx, target, secretEnvFile, secretContent); err != nil {
-		return fail(err)
-	}
-	if err := syncRemoteRegistryAuth(ctx, newDeployDocker(), []scheduler.Host{target}, []string{acc.Image}); err != nil {
-		return fail(fmt.Errorf("write registry auth for accessory %s on %s: %w", name, target.Name, err))
-	}
-	if err := targetClient.Call(ctx, "pull", map[string]string{"image": acc.Image}, nil); err != nil {
-		return fail(fmt.Errorf("pull accessory %s on %s: %w", name, target.Name, err))
-	}
-	networkName := deployment.DockerNetworkName(cfg, envName)
-	if err := ensureManagedDockerNetwork(ctx, targetClient, cfg, envName); err != nil {
-		return fail(fmt.Errorf("ensure network %s for accessory %s on %s: %w", networkName, name, target.Name, err))
-	}
-	for _, volume := range accessory.NamedVolumes(acc) {
-		params := agent.EnsureVolumeParams{Name: volume, Owner: acc.VolumeOwner}
-		if err := targetClient.Call(ctx, "ensure_volume", params, nil); err != nil {
-			return fail(fmt.Errorf("ensure volume %s for accessory %s on %s: %w", volume, name, target.Name, err))
-		}
-	}
-	params := agent.RunContainerParams{
-		Name:           containerName,
-		Image:          acc.Image,
-		Command:        acc.Command,
-		Args:           accessory.DockerArgs(acc, secretEnvFile),
-		Labels:         accessory.ContainerLabels(cfg.Project, envName, name, acc.Labels),
-		Network:        networkName,
-		NetworkAliases: accessory.NetworkAliases(name, acc),
-	}
-	if err := targetClient.Call(ctx, "run_container", params, nil); err != nil {
-		return fail(fmt.Errorf("start failover accessory %s on %s: %w", name, target.Name, err))
-	}
-	checkCommand, err := accessory.RestoreCheckCommand(acc, envName, name, artifact)
+	result, err := startAccessoryWithRestore(ctx, opts, cfg, envName, name, target, artifact)
 	if err != nil {
 		return fail(err)
-	}
-	var check agent.HealthCheckResult
-	if err := targetClient.Call(ctx, "health_check", agent.HealthCheckParams{Command: checkCommand, TimeoutSeconds: 30}, &check); err != nil {
-		return fail(fmt.Errorf("verify backup artifact for accessory %s on %s: %w", name, target.Name, err))
-	}
-	if !check.OK {
-		return fail(fmt.Errorf("verify backup artifact for accessory %s on %s failed", name, target.Name))
-	}
-	restoreCommand, err := accessory.RestoreCommand(acc, artifact)
-	if err != nil {
-		return fail(err)
-	}
-	var result agent.CommandResult
-	if err := targetClient.Call(ctx, "accessory_restore", agent.AccessoryCommandParams{
-		Name:           name,
-		Command:        restoreCommand,
-		TimeoutSeconds: accessory.BackupTimeoutSeconds(acc),
-	}, &result); err != nil {
-		return fail(fmt.Errorf("restore accessory %s on %s: %w", name, target.Name, err))
 	}
 	if err := newDeployAgent(current.Host).Call(ctx, "stop_container", map[string]string{"name": containerName}, nil); err != nil {
 		return fail(fmt.Errorf("stop old accessory %s on %s: %w", name, current.Host.Name, err))
@@ -7018,6 +6970,79 @@ func runAccessoryFailover(ctx context.Context, w io.Writer, opts *options, cfg *
 	recordEvent(store, state.Event{Environment: envName, Kind: "accessory_failover", Status: "succeeded", Accessory: name, Host: target.Name, Message: artifact})
 	fmt.Fprintf(w, "failed over accessory %s from %s to %s artifact=%s\n", name, current.Host.Name, target.Name, artifact)
 	return nil
+}
+
+// startAccessoryWithRestore starts an accessory container on the target host
+// and restores it from the given backup artifact, which must already exist on
+// the target. Shared by accessory failover and host migration.
+func startAccessoryWithRestore(ctx context.Context, opts *options, cfg *config.Config, envName, name string, target scheduler.Host, artifact string) (agent.CommandResult, error) {
+	acc := cfg.Accessories[name]
+	containerName := accessory.ContainerName(cfg.Project, envName, name)
+	secretOpts, err := secretSourceOptions(opts, envName)
+	if err != nil {
+		return agent.CommandResult{}, err
+	}
+	secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
+	if err != nil {
+		return agent.CommandResult{}, err
+	}
+	targetClient := newDeployAgent(target)
+	secretEnvFile, secretContent := accessorySecretEnvFile(envName, name, secretFile)
+	if err := writeRemoteSecretFile(ctx, target, secretEnvFile, secretContent); err != nil {
+		return agent.CommandResult{}, err
+	}
+	if err := syncRemoteRegistryAuth(ctx, newDeployDocker(), []scheduler.Host{target}, []string{acc.Image}); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("write registry auth for accessory %s on %s: %w", name, target.Name, err)
+	}
+	if err := targetClient.Call(ctx, "pull", map[string]string{"image": acc.Image}, nil); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("pull accessory %s on %s: %w", name, target.Name, err)
+	}
+	networkName := deployment.DockerNetworkName(cfg, envName)
+	if err := ensureManagedDockerNetwork(ctx, targetClient, cfg, envName); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("ensure network %s for accessory %s on %s: %w", networkName, name, target.Name, err)
+	}
+	for _, volume := range accessory.NamedVolumes(acc) {
+		params := agent.EnsureVolumeParams{Name: volume, Owner: acc.VolumeOwner}
+		if err := targetClient.Call(ctx, "ensure_volume", params, nil); err != nil {
+			return agent.CommandResult{}, fmt.Errorf("ensure volume %s for accessory %s on %s: %w", volume, name, target.Name, err)
+		}
+	}
+	params := agent.RunContainerParams{
+		Name:           containerName,
+		Image:          acc.Image,
+		Command:        acc.Command,
+		Args:           accessory.DockerArgs(acc, secretEnvFile),
+		Labels:         accessory.ContainerLabels(cfg.Project, envName, name, acc.Labels),
+		Network:        networkName,
+		NetworkAliases: accessory.NetworkAliases(name, acc),
+	}
+	if err := targetClient.Call(ctx, "run_container", params, nil); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("start accessory %s on %s: %w", name, target.Name, err)
+	}
+	checkCommand, err := accessory.RestoreCheckCommand(acc, envName, name, artifact)
+	if err != nil {
+		return agent.CommandResult{}, err
+	}
+	var check agent.HealthCheckResult
+	if err := targetClient.Call(ctx, "health_check", agent.HealthCheckParams{Command: checkCommand, TimeoutSeconds: 30}, &check); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("verify backup artifact for accessory %s on %s: %w", name, target.Name, err)
+	}
+	if !check.OK {
+		return agent.CommandResult{}, fmt.Errorf("verify backup artifact for accessory %s on %s failed", name, target.Name)
+	}
+	restoreCommand, err := accessory.RestoreCommand(acc, artifact)
+	if err != nil {
+		return agent.CommandResult{}, err
+	}
+	var result agent.CommandResult
+	if err := targetClient.Call(ctx, "accessory_restore", agent.AccessoryCommandParams{
+		Name:           name,
+		Command:        restoreCommand,
+		TimeoutSeconds: accessory.BackupTimeoutSeconds(acc),
+	}, &result); err != nil {
+		return agent.CommandResult{}, fmt.Errorf("restore accessory %s on %s: %w", name, target.Name, err)
+	}
+	return result, nil
 }
 
 func accessoryTargetHost(hosts []scheduler.Host, pool, targetName string) (scheduler.Host, error) {

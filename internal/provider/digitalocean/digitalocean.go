@@ -126,21 +126,46 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor ensures the environment tags and firewall and builds the
+// reconcile backend shared by Reconcile and CreateHost so both create droplets
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	digitalocean := *env.Provider.DigitalOcean
 	environmentTags := tagsFromLabels(provider.ShipLabels(project, environment, ""))
 	for _, tag := range environmentTags {
 		if err := c.EnsureTag(ctx, tag); err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 	}
 	if digitalocean.Firewall.EnabledValue(true) {
 		if _, err := c.EnsureFirewall(ctx, project, environment, digitalocean); err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, digitalocean: digitalocean})
+	return reconcileBackend{client: c, digitalocean: digitalocean}, nil
 }
+
+// CreateHost provisions a single droplet using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.DigitalOcean == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.digitalocean", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client       Client

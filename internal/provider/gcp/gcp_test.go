@@ -36,6 +36,28 @@ func TestDesiredInstancesUsesPoolsAndProviderShape(t *testing.T) {
 	}
 }
 
+func TestCreateHostProvisionsReplacement(t *testing.T) {
+	api := newFakeGCPAPI(t, nil)
+	env := testEnvironment(1)
+	plans := DesiredInstancesFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.PublicAddress != "203.0.113.10" {
+		t.Fatalf("created host = %+v", host)
+	}
+	if len(api.firewalls) != 2 {
+		t.Fatalf("firewalls not ensured through the shared backend: %+v", api.firewalls)
+	}
+	if len(api.creates) != 1 {
+		t.Fatalf("creates = %+v", api.creates)
+	}
+}
+
 func TestReconcileCreatesFirewallRulesAndInstance(t *testing.T) {
 	api := newFakeGCPAPI(t, nil)
 	result, err := api.client().Reconcile(context.Background(), "demo", "production", testEnvironment(1))

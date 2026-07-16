@@ -6,7 +6,7 @@ The model is Kamal-like: you define host pools, services, and accessories in YAM
 
 ## What you get
 
-- A single `ship` binary for provision, deploy, scale, logs, and recovery
+- A single `ship` binary for provision, deploy, scale, migrate, logs, and recovery
 - YAML config with per-environment overrides
 - Cloud provisioning for Hetzner, Vultr, DigitalOcean, Linode, AWS, GCP, Azure, and [others](docs/configuration/providers/README.md)
 - Inventory-backed targets through Terraform, Pulumi, Ansible, OpenSSH config, or manual host lists

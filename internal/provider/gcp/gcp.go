@@ -146,15 +146,39 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor ensures the GCP firewall and builds the reconcile backend
+// shared by Reconcile and CreateHost so both create instances identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	gcp := *env.Provider.GCP
 	if gcp.Firewall.ManagedValue(true) {
 		if _, err := c.EnsureFirewall(ctx, project, environment, gcp); err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, gcp: gcp})
+	return reconcileBackend{client: c, gcp: gcp}, nil
 }
+
+// CreateHost provisions a single instance using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.GCP == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.gcp", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client Client

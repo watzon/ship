@@ -136,6 +136,17 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: c, ovh: ovh})
 }
 
+// CreateHost provisions a single instance using the same backend Reconcile
+// builds, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.OVHCloud == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.ovhcloud", environment)
+	}
+	return reconcileBackend{client: c, ovh: *env.Provider.OVHCloud}.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
+
 type reconcileBackend struct {
 	client Client
 	ovh    config.OVHCloudConfig

@@ -36,6 +36,7 @@ func TestHostPlansUsesEnvironmentPools(t *testing.T) {
 		LabelProject:     "demo",
 		LabelEnvironment: "production",
 		LabelPool:        "web",
+		LabelHost:        "web-1",
 	}
 	if !reflect.DeepEqual(plans[0].Labels, wantLabels) {
 		t.Fatalf("labels = %+v, want %+v", plans[0].Labels, wantLabels)
@@ -116,6 +117,68 @@ func TestReconcileHostsCreatesMissingAndReportsExtra(t *testing.T) {
 	}
 	if got := backend.created; !reflect.DeepEqual(got, []string{"web-2"}) {
 		t.Fatalf("created requests = %+v", got)
+	}
+}
+
+func TestReconcileHostsMatchesReplacementByHostLabel(t *testing.T) {
+	backend := &fakeBackend{
+		existing: []Host{
+			{ID: "1", Name: "web-1", Pool: "web"},
+			{ID: "2", Name: "web-2-m20260715", Pool: "web", Labels: map[string]string{LabelHost: "web-2"}},
+		},
+	}
+	desired := []HostPlan{
+		{Name: "web-1", Pool: "web"},
+		{Name: "web-2", Pool: "web"},
+	}
+
+	result, err := ReconcileHosts(context.Background(), "demo", "production", desired, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Existing) != 2 {
+		t.Fatalf("existing = %+v", result.Existing)
+	}
+	if result.Existing[1].Name != "web-2-m20260715" {
+		t.Fatalf("replacement not matched by label: %+v", result.Existing)
+	}
+	if len(result.Created) != 0 || len(result.Extra) != 0 {
+		t.Fatalf("created = %+v extra = %+v", result.Created, result.Extra)
+	}
+}
+
+func TestReconcileHostsPrefersNameMatchOverLabelDuplicate(t *testing.T) {
+	backend := &fakeBackend{
+		existing: []Host{
+			{ID: "2", Name: "web-2-m20260715", Pool: "web", Labels: map[string]string{LabelHost: "web-2"}},
+			{ID: "1", Name: "web-2", Pool: "web", Labels: map[string]string{LabelHost: "web-2"}},
+		},
+	}
+	desired := []HostPlan{{Name: "web-2", Pool: "web"}}
+
+	result, err := ReconcileHosts(context.Background(), "demo", "production", desired, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(result.Existing) != 1 || result.Existing[0].Name != "web-2" {
+		t.Fatalf("existing = %+v", result.Existing)
+	}
+	if len(result.Created) != 0 {
+		t.Fatalf("created = %+v", result.Created)
+	}
+	if len(result.Extra) != 1 || result.Extra[0].Name != "web-2-m20260715" {
+		t.Fatalf("extra = %+v", result.Extra)
+	}
+}
+
+func TestLogicalName(t *testing.T) {
+	if got := LogicalName(Host{Name: "web-1"}); got != "web-1" {
+		t.Fatalf("LogicalName = %q", got)
+	}
+	if got := LogicalName(Host{Name: "web-2-m1", Labels: map[string]string{LabelHost: "web-2"}}); got != "web-2" {
+		t.Fatalf("LogicalName = %q", got)
 	}
 }
 

@@ -119,22 +119,47 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor resolves the Linode firewall and builds the reconcile
+// backend shared by Reconcile and CreateHost so both create instances
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	linode := *env.Provider.Linode
 	var firewallID int64
 	if linode.Firewall.EnabledValue(true) {
 		firewall, err := c.EnsureFirewall(ctx, project, environment, linode)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		firewallID = firewall.ID
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:     c,
 		linode:     linode,
 		firewallID: firewallID,
-	})
+	}, nil
 }
+
+// CreateHost provisions a single instance using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Linode == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.linode", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client     Client

@@ -148,6 +148,17 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if c.DryRun {
 		return result, nil
 	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor resolves the Azure subscription, resource group and
+// security group and builds the reconcile backend shared by Reconcile and
+// CreateHost so both create virtual machines identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	azure := *env.Provider.Azure
 	c.SubscriptionID = azure.SubscriptionID
 	c.ResourceGroup = azure.ResourceGroup
@@ -155,16 +166,32 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if azure.SecurityGroup.ManagedValue(true) {
 		securityGroup, err := c.EnsureSecurityGroup(ctx, project, environment, azure)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		securityGroupID = securityGroup.ID
 	}
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:          c,
 		azure:           azure,
 		securityGroupID: securityGroupID,
-	})
+	}, nil
 }
+
+// CreateHost provisions a single virtual machine using the backend Reconcile
+// would build, so `ship migrate` can add a replacement alongside the existing
+// one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Azure == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.azure", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client          Client

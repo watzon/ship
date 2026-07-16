@@ -209,20 +209,46 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if c.DryRun {
 		return result, nil
 	}
-	client, err := c.authenticated(ctx)
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
 	if err != nil {
 		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor authenticates, resolves the security group and builds the
+// reconcile backend shared by Reconcile and CreateHost so both create servers
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
+	client, err := c.authenticated(ctx)
+	if err != nil {
+		return reconcileBackend{}, err
 	}
 	openstack := *env.Provider.OpenStack
 	if openstack.SecurityGroup.ManagedValue(true) {
 		sg, err := client.EnsureSecurityGroup(ctx, project, environment, openstack)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		openstack.SecurityGroups = appendSecurityGroup(openstack.SecurityGroups, sg.Name)
 	}
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{client: client, openstack: openstack})
+	return reconcileBackend{client: client, openstack: openstack}, nil
 }
+
+// CreateHost provisions a single server using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.OpenStack == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.openstack", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client    Client

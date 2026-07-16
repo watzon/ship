@@ -155,24 +155,49 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.ReconcileResult{}, err
+	}
+	return provider.ReconcileHosts(ctx, project, environment, desired, backend)
+}
+
+// reconcileBackendFor resolves the cloudscale server groups and builds the
+// reconcile backend shared by Reconcile and CreateHost so both create servers
+// identically.
+func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
 	cloudscale := *env.Provider.Cloudscale
 	serverGroups := append([]string{}, cloudscale.ServerGroups...)
 	if cloudscale.ServerGroup.ManagedValue(false) {
 		group, err := c.EnsureServerGroup(ctx, project, environment, cloudscale)
 		if err != nil {
-			return provider.ReconcileResult{}, err
+			return reconcileBackend{}, err
 		}
 		serverGroups = append(serverGroups, group.UUID)
 	} else if cloudscale.ServerGroup.UUID != "" {
 		serverGroups = append(serverGroups, cloudscale.ServerGroup.UUID)
 	}
-
-	return provider.ReconcileHosts(ctx, project, environment, desired, reconcileBackend{
+	return reconcileBackend{
 		client:       c,
 		cloudscale:   cloudscale,
 		serverGroups: serverGroups,
-	})
+	}, nil
 }
+
+// CreateHost provisions a single server using the backend Reconcile would
+// build, so `ship migrate` can add a replacement alongside the existing one.
+func (c Client) CreateHost(ctx context.Context, project, environment string, env config.Environment, plan provider.HostPlan) (provider.Host, error) {
+	if env.Provider.Cloudscale == nil {
+		return provider.Host{}, fmt.Errorf("environment %q must define provider.cloudscale", environment)
+	}
+	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
+	if err != nil {
+		return provider.Host{}, err
+	}
+	return backend.Create(ctx, plan)
+}
+
+var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
 	client       Client
