@@ -13,7 +13,7 @@ import (
 
 var stableVersionRE = regexp.MustCompile(`\bv?([0-9]+)\.([0-9]+)\.([0-9]+)\b`)
 
-func TestPinnedReleaseDocsMatchLatestStableTag(t *testing.T) {
+func TestPinnedReleaseDocsUseCurrentOrNextReleaseTag(t *testing.T) {
 	tag := docsReleaseTag(t)
 	wantVersion := strings.TrimPrefix(tag, "v")
 	files := []string{
@@ -76,7 +76,28 @@ func docsReleaseTag(t *testing.T) string {
 	if latest == "" {
 		t.Skip("no local stable Git tags and SHIP_DOCS_VERSION_TAG is unset")
 	}
-	return latest
+
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := stableVersionRE.FindSubmatch(readme)
+	if len(match) == 0 {
+		t.Fatal("README.md has no pinned stable release version")
+	}
+	pinned := "v" + strings.TrimPrefix(string(match[0]), "v")
+	if pinned != latest && !isImmediateReleaseSuccessor(latest, pinned) {
+		t.Fatalf("README.md pins %s; expected current release %s or its next patch, minor, or major version", pinned, latest)
+	}
+	return pinned
+}
+
+func isImmediateReleaseSuccessor(current, candidate string) bool {
+	currentParts := stableTagParts(current)
+	candidateParts := stableTagParts(candidate)
+	return candidateParts == [3]int{currentParts[0], currentParts[1], currentParts[2] + 1} ||
+		candidateParts == [3]int{currentParts[0], currentParts[1] + 1, 0} ||
+		candidateParts == [3]int{currentParts[0] + 1, 0, 0}
 }
 
 func isStableTag(tag string) bool {
