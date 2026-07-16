@@ -14,9 +14,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/provider"
+)
+
+// Vultr assigns an instance's public address asynchronously after create;
+// vars so tests can shorten the polling schedule.
+var (
+	instanceAddressTimeout      = 5 * time.Minute
+	instanceAddressPollInterval = 5 * time.Second
 )
 
 const (
@@ -179,7 +187,58 @@ func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (p
 	if err != nil {
 		return provider.Host{}, err
 	}
+	instance, err = b.client.waitForInstanceAddress(ctx, instance)
+	if err != nil {
+		return provider.Host{}, err
+	}
 	return hostFromInstance(instance), nil
+}
+
+// waitForInstanceAddress polls until Vultr assigns the instance's public
+// address. The create response reports main_ip as "0.0.0.0" while the
+// instance is still provisioning, so consumers that SSH to the returned
+// address (migrate, provision bootstrap) must not see it.
+func (c Client) waitForInstanceAddress(ctx context.Context, instance Instance) (Instance, error) {
+	if c.DryRun || instanceAddressReady(instance) {
+		return instance, nil
+	}
+	deadline := time.Now().Add(instanceAddressTimeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return instance, fmt.Errorf("wait for address on instance %s: %w", instance.Label, ctx.Err())
+		case <-time.After(instanceAddressPollInterval):
+		}
+		refreshed, err := c.GetInstance(ctx, instance.ID)
+		if err != nil {
+			return instance, fmt.Errorf("wait for address on instance %s: %w", instance.Label, err)
+		}
+		if instanceAddressReady(refreshed) {
+			return refreshed, nil
+		}
+		if time.Now().After(deadline) {
+			return refreshed, fmt.Errorf("instance %s (%s) has no public address after %s; delete it in Vultr before retrying", instance.Label, instance.ID, instanceAddressTimeout)
+		}
+	}
+}
+
+func instanceAddressReady(instance Instance) bool {
+	ip := strings.TrimSpace(instance.MainIP)
+	return ip != "" && ip != "0.0.0.0"
+}
+
+func (c Client) GetInstance(ctx context.Context, id string) (Instance, error) {
+	if !c.TokenPresent() {
+		return Instance{}, fmt.Errorf("VULTR_API_KEY is required")
+	}
+	if strings.TrimSpace(id) == "" {
+		return Instance{}, fmt.Errorf("instance id is required")
+	}
+	var out createInstanceResponse
+	if err := c.request(ctx, http.MethodGet, "/instances/"+url.PathEscape(id), nil, &out); err != nil {
+		return Instance{}, err
+	}
+	return out.Instance, nil
 }
 
 func (c Client) List(ctx context.Context, project, environment string) ([]provider.Host, error) {

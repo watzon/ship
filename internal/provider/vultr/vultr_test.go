@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/provider"
@@ -101,6 +102,33 @@ func TestCreateHostProvisionsReplacement(t *testing.T) {
 	}
 	if len(api.creates) != 1 {
 		t.Fatalf("creates = %d", len(api.creates))
+	}
+}
+
+func TestCreateHostWaitsForPublicAddress(t *testing.T) {
+	restoreTimeout, restoreInterval := instanceAddressTimeout, instanceAddressPollInterval
+	instanceAddressTimeout = time.Second
+	instanceAddressPollInterval = time.Millisecond
+	t.Cleanup(func() {
+		instanceAddressTimeout, instanceAddressPollInterval = restoreTimeout, restoreInterval
+	})
+
+	api := newFakeVultrAPI(t, nil)
+	api.pendingAddressCreates = 1
+	env := testEnvironment(1)
+	plans := DesiredInstancesFor("demo", "production", env)
+	if len(plans) == 0 {
+		t.Fatal("no desired plans")
+	}
+	host, err := api.client().CreateHost(context.Background(), "demo", "production", env, plans[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.PublicAddress == "" || host.PublicAddress == "0.0.0.0" {
+		t.Fatalf("public address not resolved: %+v", host)
+	}
+	if len(api.gets) == 0 {
+		t.Fatal("expected instance polling after pending-address create")
 	}
 }
 
@@ -359,7 +387,14 @@ type fakeVultrAPI struct {
 	firewallRules         map[string][]createFirewallRuleRequest
 	deletes               []string
 	cursors               []string
+	gets                  []string
 	nextID                int
+	// pendingAddressCreates makes that many create responses report
+	// main_ip 0.0.0.0, matching Vultr's behavior while an instance is
+	// still provisioning; the real address is served by single-instance GET.
+	pendingAddressCreates int
+	instanceIPs           map[string]string
+	instanceLabels        map[string]string
 }
 
 type listPage struct {
@@ -414,6 +449,8 @@ func newFakeVultrAPI(t *testing.T, existing []Instance) *fakeVultrAPI {
 		existingFirewallRules: map[string][]FirewallRule{},
 		firewallRules:         map[string][]createFirewallRuleRequest{},
 		nextID:                100,
+		instanceIPs:           map[string]string{},
+		instanceLabels:        map[string]string{},
 	}
 	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
@@ -469,14 +506,32 @@ func newFakeVultrAPI(t *testing.T, existing []Instance) *fakeVultrAPI {
 			}
 			api.creates = append(api.creates, req)
 			api.nextID++
+			id := fmt.Sprintf("instance-%d", api.nextID)
+			ip := fmt.Sprintf("192.0.2.%d", api.nextID-99)
+			api.instanceIPs[id] = ip
+			api.instanceLabels[id] = req.Label
+			if api.pendingAddressCreates > 0 {
+				api.pendingAddressCreates--
+				ip = "0.0.0.0"
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"instance": Instance{
-					ID:     fmt.Sprintf("instance-%d", api.nextID),
+					ID:     id,
 					Label:  req.Label,
-					MainIP: fmt.Sprintf("192.0.2.%d", api.nextID-99),
+					MainIP: ip,
 					Tags:   req.Tags,
 				},
 				"job_ids": []string{"job-1"},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/instances/"):
+			id := strings.TrimPrefix(r.URL.Path, "/instances/")
+			api.gets = append(api.gets, id)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"instance": Instance{
+					ID:     id,
+					Label:  api.instanceLabels[id],
+					MainIP: api.instanceIPs[id],
+				},
 			})
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/instances/"):
 			api.deletes = append(api.deletes, strings.TrimPrefix(r.URL.Path, "/instances/"))
