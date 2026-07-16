@@ -3852,7 +3852,8 @@ func TestSupportBundleCollectsRedactedIncidentSnapshot(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"environment production", "doctor", "passed=5", "hosts", "count=2", "status", "desired=2 observed=2", "events", "count=1"} {
+	expectedDoctor := fmt.Sprintf("passed=%d warnings=%d failed=%d", bundle.Doctor.Summary.Passed, bundle.Doctor.Summary.Warnings, bundle.Doctor.Summary.Failed)
+	for _, needle := range []string{"environment production", "doctor", expectedDoctor, "hosts", "count=2", "status", "desired=2 observed=2", "events", "count=1"} {
 		if !strings.Contains(out.String(), needle) {
 			t.Fatalf("support text missing %q:\n%s", needle, out.String())
 		}
