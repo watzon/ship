@@ -183,6 +183,23 @@ func TestRepointHostFactUpdatesEveryPoolFact(t *testing.T) {
 	}
 }
 
+func TestRepointHostFactCreatesFactWhenNoneExist(t *testing.T) {
+	dir := t.TempDir()
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	source := scheduler.Host{Name: "butterbase-staging", Pool: "web", User: "root"}
+	created := providerpkg.Host{ID: "7", Name: "butterbase-staging-m20260716", PublicAddress: "192.0.2.7"}
+	if _, err := repointHostFact(store, "staging", source, "vultr", created); err != nil {
+		t.Fatal(err)
+	}
+	facts, err := store.ReadHostFacts("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 1 || facts[0].Name != "butterbase-staging" || facts[0].PublicAddress != "192.0.2.7" {
+		t.Fatalf("facts = %+v", facts)
+	}
+}
+
 func installMigrateCopyHooks(t *testing.T, events *[]string) {
 	t.Helper()
 	originalCopy := copyRemoteArtifact

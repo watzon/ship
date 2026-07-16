@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -428,7 +430,10 @@ func migrateAccessory(ctx context.Context, w io.Writer, opts *options, cfg *conf
 
 func repointHostFact(store state.Store, envName string, source scheduler.Host, providerName string, created provider.Host) (state.HostFact, error) {
 	facts, err := store.ReadHostFacts(envName)
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Inventory-provider environments that were never provisioned have no
+		// hosts.json yet — treat that as an empty fact list and create the
+		// replacement's fact below.
 		return state.HostFact{}, fmt.Errorf("read host facts for %s: %w", envName, err)
 	}
 	var oldFact state.HostFact
