@@ -433,12 +433,16 @@ func repointHostFact(store state.Store, envName string, source scheduler.Host, p
 	}
 	var oldFact state.HostFact
 	updated := false
+	// A logical host can appear in several pools (say app and ingress) as
+	// separate facts for the same machine — repoint every one of them, or the
+	// unmatched pools keep resolving to the replaced server.
 	for i := range facts {
 		if facts[i].Name == source.Name {
-			oldFact = facts[i]
+			if !updated {
+				oldFact = facts[i]
+			}
 			applyProviderHostToFact(&facts[i], created)
 			updated = true
-			break
 		}
 	}
 	if !updated {

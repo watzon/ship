@@ -151,6 +151,38 @@ func TestHostFactsFromReconcileMatchesReplacementByLabel(t *testing.T) {
 	}
 }
 
+func TestRepointHostFactUpdatesEveryPoolFact(t *testing.T) {
+	dir := t.TempDir()
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveHostFacts("production", []state.HostFact{
+		{Name: "npxray-production", Pool: "app", User: "root", PublicAddress: "203.0.113.10", Provider: "manual"},
+		{Name: "npxray-production", Pool: "ingress", User: "root", PublicAddress: "203.0.113.10", Provider: "manual"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := scheduler.Host{Name: "npxray-production", Pool: "app", User: "root"}
+	created := providerpkg.Host{ID: "42", Name: "npxray-production-m20260716", PublicAddress: "192.0.2.9"}
+	oldFact, err := repointHostFact(store, "production", source, "vultr", created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldFact.PublicAddress != "203.0.113.10" {
+		t.Fatalf("old fact = %+v", oldFact)
+	}
+	facts, err := store.ReadHostFacts("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 2 {
+		t.Fatalf("facts = %+v", facts)
+	}
+	for _, fact := range facts {
+		if fact.PublicAddress != "192.0.2.9" {
+			t.Fatalf("pool %s fact still points at %s", fact.Pool, fact.PublicAddress)
+		}
+	}
+}
+
 func installMigrateCopyHooks(t *testing.T, events *[]string) {
 	t.Helper()
 	originalCopy := copyRemoteArtifact
