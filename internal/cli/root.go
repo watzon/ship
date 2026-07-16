@@ -1330,6 +1330,11 @@ func shipBinaryForHost(ctx context.Context, host scheduler.Host, opts *options) 
 		return readCurrentShipBinary()
 	}
 	ssh := newBootstrapSSH(host, opts.dryRun)
+	// OS detection is the first SSH contact with a freshly provisioned server,
+	// which may still be booting — wait for readiness like bootstrapHost does.
+	if err := waitForSSH(ctx, host, ssh); err != nil {
+		return nil, err
+	}
 	sysname, err := ssh.Run(ctx, "uname -s")
 	if err != nil {
 		return nil, fmt.Errorf("detect remote OS on %s: %w", host.Name, err)
