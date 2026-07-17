@@ -371,150 +371,151 @@ func NewServer() Server {
 	}
 }
 
+type rpcHandler func(Server, context.Context, Request) Response
+
+func lockedRPCHandler(operation string, handler rpcHandler) rpcHandler {
+	return func(s Server, ctx context.Context, req Request) Response {
+		return s.withHostLock(req, operation, func() Response {
+			return handler(s, ctx, req)
+		})
+	}
+}
+
+func rpcHandlerWithoutContext(handler func(Server, Request) Response) rpcHandler {
+	return func(s Server, _ context.Context, req Request) Response {
+		return handler(s, req)
+	}
+}
+
+var rpcHandlers map[string]rpcHandler
+
+func init() {
+	rpcHandlers = map[string]rpcHandler{
+		"accessory_backup":     lockedRPCHandler("accessory_backup", Server.accessoryCommand),
+		"accessory_restore":    lockedRPCHandler("accessory_restore", Server.accessoryCommand),
+		"caddy_reload":         lockedRPCHandler("caddy_reload", Server.caddyReload),
+		"docker_inspect":       Server.handleDockerInspect,
+		"ensure_network":       lockedRPCHandler("ensure_network", Server.ensureNetwork),
+		"ensure_volume":        lockedRPCHandler("ensure_volume", Server.ensureVolume),
+		"exec_container":       lockedRPCHandler("exec_container", Server.execContainer),
+		"health_check":         Server.healthCheck,
+		"install_binary":       lockedRPCHandler("install_binary", rpcHandlerWithoutContext(Server.installBinary)),
+		"list_ship_containers": Server.handleListShipContainers,
+		"logs":                 Server.handleLogs,
+		"migrate_state_dir":    lockedRPCHandler("migrate_state_dir", rpcHandlerWithoutContext(Server.migrateStateDir)),
+		"negotiate":            rpcHandlerWithoutContext(Server.negotiate),
+		"prune_images":         Server.handlePruneImages,
+		"pull":                 Server.handlePull,
+		"read_file":            rpcHandlerWithoutContext(Server.readFile),
+		"read_release_state":   rpcHandlerWithoutContext(Server.readReleaseState),
+		"run_container":        Server.handleRunContainer,
+		"run_oneoff_container": lockedRPCHandler("run_oneoff_container", Server.runOneOffContainer),
+		"status":               Server.status,
+		"stop_container":       Server.handleStopContainer,
+		"sync_cron_files":      lockedRPCHandler("sync_cron_files", rpcHandlerWithoutContext(Server.syncCronFiles)),
+		"write_file":           lockedRPCHandler("write_file", rpcHandlerWithoutContext(Server.writeFile)),
+		"write_registry_auth":  lockedRPCHandler("write_registry_auth", rpcHandlerWithoutContext(Server.writeRegistryAuth)),
+		"write_release_state":  lockedRPCHandler("write_release_state", rpcHandlerWithoutContext(Server.writeReleaseState)),
+	}
+}
+
 func (s Server) Handle(ctx context.Context, req Request) Response {
-	switch req.Method {
-	case "negotiate":
-		return s.negotiate(req)
-	case "status":
-		return s.status(ctx, req)
-	case "pull":
-		return s.withHostLock(req, "pull", func() Response {
-			var p struct {
-				Image string `json:"image"`
-			}
-			if err := decode(req.Params, &p); err != nil {
-				return failure(req.ID, ErrorInvalidParams, err)
-			}
-			if strings.TrimSpace(p.Image) == "" {
-				return failure(req.ID, ErrorInvalidParams, errors.New("image is required"))
-			}
-			return empty(req.ID, ErrorDocker, s.docker().Pull(ctx, p.Image))
-		})
-	case "prune_images":
-		return s.withHostLock(req, "prune_images", func() Response {
-			return empty(req.ID, ErrorDocker, s.docker().PruneShipImages(ctx))
-		})
-	case "run_container":
-		return s.withHostLock(req, "run_container", func() Response {
-			var p RunContainerParams
-			if err := decode(req.Params, &p); err != nil {
-				return failure(req.ID, ErrorInvalidParams, err)
-			}
-			if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Image) == "" {
-				return failure(req.ID, ErrorInvalidParams, errors.New("name and image are required"))
-			}
-			if err := validateNetworkAliases(p.NetworkAliases); err != nil {
-				return failure(req.ID, ErrorInvalidParams, err)
-			}
-			if _, err := s.docker().Inspect(ctx, p.Name); err == nil {
-				if err := s.docker().StopRemove(ctx, p.Name); err != nil {
-					return failure(req.ID, ErrorDocker, fmt.Errorf("replace container %q: %w", p.Name, err))
-				}
-			}
-			args := append(labelArgs(p.Labels), networkArgs(p.Network, p.NetworkAliases)...)
-			args = append(args, p.Args...)
-			return empty(req.ID, ErrorDocker, s.enrichPortConflict(ctx, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...)))
-		})
-	case "run_oneoff_container":
-		return s.withHostLock(req, "run_oneoff_container", func() Response {
-			return s.runOneOffContainer(ctx, req)
-		})
-	case "stop_container":
-		return s.withHostLock(req, "stop_container", func() Response {
-			var p struct {
-				Name string `json:"name"`
-			}
-			if err := decode(req.Params, &p); err != nil {
-				return failure(req.ID, ErrorInvalidParams, err)
-			}
-			if strings.TrimSpace(p.Name) == "" {
-				return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
-			}
-			return empty(req.ID, ErrorDocker, s.docker().StopRemove(ctx, p.Name))
-		})
-	case "logs":
-		var p LogsParams
-		if err := decode(req.Params, &p); err != nil {
-			return failure(req.ID, ErrorInvalidParams, err)
-		}
-		logs, err := s.docker().Logs(ctx, p.Name, p.Lines)
-		if err != nil {
-			return failure(req.ID, ErrorDocker, err)
-		}
-		return result(req.ID, map[string]string{"logs": logs})
-	case "docker_inspect":
-		var p DockerInspectParams
-		if err := decode(req.Params, &p); err != nil {
-			return failure(req.ID, ErrorInvalidParams, err)
-		}
-		inspect, err := s.docker().Inspect(ctx, p.Name)
-		if err != nil {
-			return failure(req.ID, ErrorDocker, err)
-		}
-		return result(req.ID, DockerInspectResult{Inspect: inspect})
-	case "list_ship_containers":
-		containers, err := s.docker().ListShipContainers(ctx)
-		if err != nil {
-			return failure(req.ID, ErrorDocker, err)
-		}
-		return result(req.ID, containers)
-	case "health_check":
-		return s.healthCheck(ctx, req)
-	case "exec_container":
-		return s.withHostLock(req, "exec_container", func() Response {
-			return s.execContainer(ctx, req)
-		})
-	case "write_file":
-		return s.withHostLock(req, "write_file", func() Response {
-			return s.writeFile(req)
-		})
-	case "read_file":
-		return s.readFile(req)
-	case "write_registry_auth":
-		return s.withHostLock(req, "write_registry_auth", func() Response {
-			return s.writeRegistryAuth(req)
-		})
-	case "sync_cron_files":
-		return s.withHostLock(req, "sync_cron_files", func() Response {
-			return s.syncCronFiles(req)
-		})
-	case "read_release_state":
-		return s.readReleaseState(req)
-	case "write_release_state":
-		return s.withHostLock(req, "write_release_state", func() Response {
-			return s.writeReleaseState(req)
-		})
-	case "caddy_reload":
-		return s.withHostLock(req, "caddy_reload", func() Response {
-			return s.caddyReload(ctx, req)
-		})
-	case "accessory_backup":
-		return s.withHostLock(req, "accessory_backup", func() Response {
-			return s.accessoryCommand(ctx, req)
-		})
-	case "accessory_restore":
-		return s.withHostLock(req, "accessory_restore", func() Response {
-			return s.accessoryCommand(ctx, req)
-		})
-	case "ensure_volume":
-		return s.withHostLock(req, "ensure_volume", func() Response {
-			return s.ensureVolume(ctx, req)
-		})
-	case "ensure_network":
-		return s.withHostLock(req, "ensure_network", func() Response {
-			return s.ensureNetwork(ctx, req)
-		})
-	case "install_binary":
-		return s.withHostLock(req, "install_binary", func() Response {
-			return s.installBinary(req)
-		})
-	case "migrate_state_dir":
-		return s.withHostLock(req, "migrate_state_dir", func() Response {
-			return s.migrateStateDir(req)
-		})
-	default:
+	handler, ok := rpcHandlers[req.Method]
+	if !ok {
 		return failure(req.ID, ErrorUnknownMethod, fmt.Errorf("unknown method %q", req.Method))
 	}
+	return handler(s, ctx, req)
+}
+
+func (s Server) handlePull(ctx context.Context, req Request) Response {
+	return s.withHostLock(req, "pull", func() Response {
+		var p struct {
+			Image string `json:"image"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		if strings.TrimSpace(p.Image) == "" {
+			return failure(req.ID, ErrorInvalidParams, errors.New("image is required"))
+		}
+		return empty(req.ID, ErrorDocker, s.docker().Pull(ctx, p.Image))
+	})
+}
+
+func (s Server) handlePruneImages(ctx context.Context, req Request) Response {
+	return s.withHostLock(req, "prune_images", func() Response {
+		return empty(req.ID, ErrorDocker, s.docker().PruneShipImages(ctx))
+	})
+}
+
+func (s Server) handleRunContainer(ctx context.Context, req Request) Response {
+	return s.withHostLock(req, "run_container", func() Response {
+		var p RunContainerParams
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		if strings.TrimSpace(p.Name) == "" || strings.TrimSpace(p.Image) == "" {
+			return failure(req.ID, ErrorInvalidParams, errors.New("name and image are required"))
+		}
+		if err := validateNetworkAliases(p.NetworkAliases); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		if _, err := s.docker().Inspect(ctx, p.Name); err == nil {
+			if err := s.docker().StopRemove(ctx, p.Name); err != nil {
+				return failure(req.ID, ErrorDocker, fmt.Errorf("replace container %q: %w", p.Name, err))
+			}
+		}
+		args := append(labelArgs(p.Labels), networkArgs(p.Network, p.NetworkAliases)...)
+		args = append(args, p.Args...)
+		return empty(req.ID, ErrorDocker, s.enrichPortConflict(ctx, s.docker().Run(ctx, p.Name, p.Image, p.Command, args...)))
+	})
+}
+
+func (s Server) handleStopContainer(ctx context.Context, req Request) Response {
+	return s.withHostLock(req, "stop_container", func() Response {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		if strings.TrimSpace(p.Name) == "" {
+			return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
+		}
+		return empty(req.ID, ErrorDocker, s.docker().StopRemove(ctx, p.Name))
+	})
+}
+
+func (s Server) handleLogs(ctx context.Context, req Request) Response {
+	var p LogsParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	logs, err := s.docker().Logs(ctx, p.Name, p.Lines)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, err)
+	}
+	return result(req.ID, map[string]string{"logs": logs})
+}
+
+func (s Server) handleDockerInspect(ctx context.Context, req Request) Response {
+	var p DockerInspectParams
+	if err := decode(req.Params, &p); err != nil {
+		return failure(req.ID, ErrorInvalidParams, err)
+	}
+	inspect, err := s.docker().Inspect(ctx, p.Name)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, err)
+	}
+	return result(req.ID, DockerInspectResult{Inspect: inspect})
+}
+
+func (s Server) handleListShipContainers(ctx context.Context, req Request) Response {
+	containers, err := s.docker().ListShipContainers(ctx)
+	if err != nil {
+		return failure(req.ID, ErrorDocker, err)
+	}
+	return result(req.ID, containers)
 }
 
 func ServeStdio(ctx context.Context) error {
@@ -1223,32 +1224,9 @@ func failure(id string, code string, err error) Response {
 }
 
 func supportedMethods() []string {
-	methods := []string{
-		"accessory_backup",
-		"accessory_restore",
-		"caddy_reload",
-		"docker_inspect",
-		"exec_container",
-		"health_check",
-		"ensure_network",
-		"ensure_volume",
-		"install_binary",
-		"list_ship_containers",
-		"logs",
-		"migrate_state_dir",
-		"negotiate",
-		"pull",
-		"prune_images",
-		"read_file",
-		"read_release_state",
-		"run_container",
-		"run_oneoff_container",
-		"status",
-		"stop_container",
-		"sync_cron_files",
-		"write_file",
-		"write_registry_auth",
-		"write_release_state",
+	methods := make([]string, 0, len(rpcHandlers))
+	for method := range rpcHandlers {
+		methods = append(methods, method)
 	}
 	sort.Strings(methods)
 	return methods
