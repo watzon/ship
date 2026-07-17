@@ -206,6 +206,27 @@ func TestNegotiateRejectsIncompatibleProtocol(t *testing.T) {
 	}
 }
 
+func TestNegotiateCurrentProtocolAdvertisesRolloutLifecycle(t *testing.T) {
+	server := testServer(t)
+	resp := server.Handle(context.Background(), request(t, "req-current", "negotiate", NegotiateParams{
+		MinProtocolVersion: AgentProtocol,
+		MaxProtocolVersion: AgentProtocol,
+	}))
+	if !resp.OK {
+		t.Fatalf("response = %+v", resp)
+	}
+	var result NegotiateResult
+	decodeResult(t, resp, &result)
+	if result.ProtocolVersion != AgentProtocol {
+		t.Fatalf("protocol = %d, want %d", result.ProtocolVersion, AgentProtocol)
+	}
+	for _, method := range []string{"remove_container", "start_container", "stop_container_keep"} {
+		if !contains(result.SupportedMethods, method) {
+			t.Fatalf("supported methods missing %q: %#v", method, result.SupportedMethods)
+		}
+	}
+}
+
 func TestDockerMethodsUseInjectedDocker(t *testing.T) {
 	server := testServer(t)
 
@@ -227,6 +248,38 @@ func TestDockerMethodsUseInjectedDocker(t *testing.T) {
 	decodeResult(t, listResp, &containers)
 	if len(containers) != 1 || containers[0].Labels[docker.LabelManagedBy] != docker.LabelManagedByValue {
 		t.Fatalf("containers = %+v", containers)
+	}
+}
+
+func TestContainerLifecycleMethodsValidateAndDispatchUnderLock(t *testing.T) {
+	tests := []struct {
+		method string
+		call   string
+	}{
+		{method: "stop_container_keep", call: "stop:ship_web_1"},
+		{method: "start_container", call: "start:ship_web_1"},
+		{method: "remove_container", call: "remove:ship_web_1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			fake := &fakeDocker{}
+			server := testServer(t)
+			server.Docker = fake
+			invalid := server.Handle(context.Background(), request(t, "invalid", tc.method, map[string]string{"name": "  "}))
+			if invalid.OK || invalid.ErrorCode != ErrorInvalidParams {
+				t.Fatalf("invalid response = %+v", invalid)
+			}
+			resp := server.Handle(context.Background(), request(t, "valid", tc.method, map[string]string{"name": "ship_web_1"}))
+			if !resp.OK {
+				t.Fatalf("response = %+v", resp)
+			}
+			if !reflect.DeepEqual(fake.calls, []string{tc.call}) {
+				t.Fatalf("calls = %#v, want %#v", fake.calls, []string{tc.call})
+			}
+			if _, err := os.Stat(filepath.Join(server.StateDir, "locks", "host.lock")); err != nil {
+				t.Fatalf("host lock was not created: %v", err)
+			}
+		})
 	}
 }
 
@@ -1044,6 +1097,21 @@ func (f *fakeDocker) PruneShipImages(ctx context.Context) error {
 func (f *fakeDocker) Run(ctx context.Context, name, image, command string, args ...string) error {
 	f.calls = append(f.calls, "run:"+name+":"+image)
 	f.runArgs = append([]string(nil), args...)
+	return nil
+}
+
+func (f *fakeDocker) Stop(ctx context.Context, name string) error {
+	f.calls = append(f.calls, "stop:"+name)
+	return nil
+}
+
+func (f *fakeDocker) Start(ctx context.Context, name string) error {
+	f.calls = append(f.calls, "start:"+name)
+	return nil
+}
+
+func (f *fakeDocker) Remove(ctx context.Context, name string) error {
+	f.calls = append(f.calls, "remove:"+name)
 	return nil
 }
 

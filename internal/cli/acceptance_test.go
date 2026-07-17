@@ -509,6 +509,19 @@ func (f *acceptanceFakeInfra) removeContainer(host, name string) {
 	f.containers[host] = filtered
 }
 
+func (f *acceptanceFakeInfra) setContainerStatus(host, name, status string) error {
+	containers := f.containers[host]
+	for i := range containers {
+		if containers[i].Names != name {
+			continue
+		}
+		containers[i].Status = status
+		f.containers[host] = containers
+		return nil
+	}
+	return fmt.Errorf("container %s does not exist", name)
+}
+
 type acceptanceFakeAgent struct {
 	infra *acceptanceFakeInfra
 	host  scheduler.Host
@@ -516,6 +529,15 @@ type acceptanceFakeAgent struct {
 
 func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
+	case "negotiate":
+		a.infra.record("agent:%s:negotiate", a.host.Name)
+		if result, ok := out.(*agent.NegotiateResult); ok {
+			*result = agent.NegotiateResult{
+				AgentVersion:     agent.Version(),
+				ProtocolVersion:  agent.AgentProtocol,
+				SupportedMethods: []string{"remove_container", "start_container", "stop_container_keep"},
+			}
+		}
 	case "write_release_state":
 		p := params.(agent.WriteReleaseStateParams)
 		a.infra.record("agent:%s:write_release_state:%s:%s", a.host.Name, p.Release.ID, p.Release.Status)
@@ -548,6 +570,22 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 			*result = agent.HealthCheckResult{OK: !a.infra.failHealth}
 		}
 	case "stop_container":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:stop:%s", a.host.Name, name)
+		a.infra.removeContainer(containerKey(a.host), name)
+	case "stop_container_keep":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:stop_keep:%s", a.host.Name, name)
+		if err := a.infra.setContainerStatus(containerKey(a.host), name, "Exited (0)"); err != nil {
+			return err
+		}
+	case "start_container":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:start_existing:%s", a.host.Name, name)
+		if err := a.infra.setContainerStatus(containerKey(a.host), name, "Up 1 second"); err != nil {
+			return err
+		}
+	case "remove_container":
 		name := params.(map[string]string)["name"]
 		a.infra.record("agent:%s:stop:%s", a.host.Name, name)
 		a.infra.removeContainer(containerKey(a.host), name)

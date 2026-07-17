@@ -61,6 +61,56 @@ func TestRunPassesCommandAsExecFormArgv(t *testing.T) {
 	}
 }
 
+func TestContainerLifecycleMethodsUseExactDockerArguments(t *testing.T) {
+	var commands [][]string
+	client := Client{CommandRunner: func(ctx context.Context, name string, args ...string) (string, error) {
+		commands = append(commands, append([]string{name}, args...))
+		return "", nil
+	}}
+	ctx := context.Background()
+	if err := client.Stop(ctx, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(ctx, "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Remove(ctx, "old"); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{
+		{"docker", "stop", "old"},
+		{"docker", "start", "old"},
+		{"docker", "rm", "old"},
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+}
+
+func TestContainerLifecycleIdempotency(t *testing.T) {
+	noSuch := errors.New("Error response from daemon: No such container: missing")
+	tests := []struct {
+		name    string
+		invoke  func(Client) error
+		wantErr bool
+	}{
+		{name: "stop ignores missing", invoke: func(c Client) error { return c.Stop(context.Background(), "missing") }},
+		{name: "remove ignores missing", invoke: func(c Client) error { return c.Remove(context.Background(), "missing") }},
+		{name: "start reports missing", invoke: func(c Client) error { return c.Start(context.Background(), "missing") }, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client := Client{CommandRunner: func(ctx context.Context, name string, args ...string) (string, error) {
+				return "", noSuch
+			}}
+			err := tc.invoke(client)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func contains(values []string, target string) bool {
 	for _, v := range values {
 		if v == target {

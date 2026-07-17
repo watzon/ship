@@ -16,6 +16,7 @@ import (
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
+	"github.com/watzon/ship/internal/docker"
 	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/provider/hetzner"
 	"github.com/watzon/ship/internal/scheduler"
@@ -1118,7 +1119,16 @@ func TestAcceptanceMigrateHostWorkflow(t *testing.T) {
 	var events []string
 	fakeDocker := &acceptanceDocker{events: &events}
 	fakeInfra := newAcceptanceFakeInfra(t, &events)
-	installAcceptanceDeployHooks(t, fakeDocker, fakeInfra.agent)
+	cleanupFailureName := ""
+	installAcceptanceDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
+		client := fakeInfra.agent(host)
+		return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
+			if method == "remove_container" && params.(map[string]string)["name"] == cleanupFailureName {
+				return errors.New("remove preserved failed")
+			}
+			return client.Call(ctx, method, params, out)
+		})
+	})
 	installBootstrapHooks(t, &events)
 	installMigrateCopyHooks(t, &events)
 
@@ -1142,17 +1152,45 @@ func TestAcceptanceMigrateHostWorkflow(t *testing.T) {
 	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
 	release := currentAcceptanceRelease(t, store)
 	serversAfterDeploy := len(fakeHetzner.createdNames())
+	factsBeforeMigrate, err := store.ReadHostFacts("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	web2Contact := ""
+	for _, fact := range factsBeforeMigrate {
+		if fact.Name == "web-2" && fact.Pool == "web" {
+			web2Contact = hostFactContact(fact)
+		}
+	}
+	if web2Contact == "" {
+		t.Fatalf("web-2 contact missing from facts: %+v", factsBeforeMigrate)
+	}
+	cleanupFailureName = deployment.ContainerName("sample", "production", "web", 2, "stale-release")
+	cleanupLabels := deployment.ContainerLabels("sample", "production", "web", 2, "stale-release")
+	cleanupLabels[docker.LabelManagedBy] = docker.LabelManagedByValue
+	fakeInfra.upsertContainer(web2Contact, docker.ContainerSummary{
+		ID:     "web-2-stale-release",
+		Image:  release.Images["web"],
+		Names:  cleanupFailureName,
+		Status: "Up 1 hour",
+		Labels: cleanupLabels,
+	})
 
 	// Migrate a service host: replacement provisioned, replicas restarted on
 	// it from the current release, old server deleted.
 	out := runAcceptanceCommand(t, migrateCmd(&options{configPath: path}), "production", "web-1", "--yes")
+	cleanupWarning := "remove preserved container " + cleanupFailureName + " on web-2: remove preserved failed"
 	assertAcceptanceOutput(t, out,
 		"provisioned replacement server web-1-m",
 		"bootstrapped web-1-m",
+		cleanupWarning,
 		"started release "+release.ID+" replicas on web-1",
 		"deleted old server web-1",
 		"migrated host web-1: 192.0.2.2 ->",
 	)
+	if got := strings.Count(out, cleanupWarning); got != 1 {
+		t.Fatalf("cleanup warning count = %d, want 1 in output:\n%s", got, out)
+	}
 	facts, err := store.ReadHostFacts("production")
 	if err != nil {
 		t.Fatal(err)
@@ -1175,6 +1213,23 @@ func TestAcceptanceMigrateHostWorkflow(t *testing.T) {
 	if !slices.Contains(fakeHetzner.deleted, "web-1") {
 		t.Fatalf("old web-1 server not deleted: %v", fakeHetzner.deleted)
 	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupWarningCount := 0
+	for _, event := range timeline {
+		if event.Kind == "migrate_cleanup" && event.Status == "warning" && event.Release == release.ID && event.Host == "web-2" && strings.Contains(event.Message, cleanupFailureName) {
+			cleanupWarningCount++
+		}
+	}
+	if cleanupWarningCount != 1 {
+		t.Fatalf("migration cleanup warning event count = %d, want 1 in timeline: %+v", cleanupWarningCount, timeline)
+	}
+	if current := currentAcceptanceRelease(t, store); current.ID != release.ID {
+		t.Fatalf("migration changed current release: got %s want %s", current.ID, release.ID)
+	}
+	cleanupFailureName = ""
 
 	// Migrate the accessory host: fresh backup on the old server, artifact
 	// transferred, restore on the replacement, old accessory stopped.
