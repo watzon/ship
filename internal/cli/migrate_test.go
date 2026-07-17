@@ -431,6 +431,36 @@ func TestMigrateAccessoryFailureAfterStateSaveReportsResidualState(t *testing.T)
 	}
 }
 
+func TestMigrateAccessoryResidualHint(t *testing.T) {
+	created := providerpkg.Host{Name: "data-1-m20260717010101", PublicAddress: "192.0.2.5"}
+	source := scheduler.Host{Contact: "192.0.2.1"}
+
+	tests := []struct {
+		name        string
+		accessories []string
+		want        string
+	}{
+		{
+			name:        "one accessory",
+			accessories: []string{"postgres"},
+			want:        "note: replacement server data-1-m20260717010101 (192.0.2.5) is running migrated accessory postgres; its old container on 192.0.2.1 is stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server",
+		},
+		{
+			name:        "multiple accessories are sorted",
+			accessories: []string{"redis", "postgres"},
+			want:        "note: replacement server data-1-m20260717010101 (192.0.2.5) is running migrated accessories postgres, redis; their old containers on 192.0.2.1 are stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := migrateAccessoryResidualHint(created, source, tt.accessories); got != tt.want {
+				t.Fatalf("migrateAccessoryResidualHint() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAcceptanceMigrateHostWorkflow(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
