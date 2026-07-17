@@ -1,7 +1,13 @@
 # Development
 
 
-Default CI-safe coverage:
+Run the full local verification used by CI before opening a pull request:
+
+```bash
+./scripts/ci-local.sh
+```
+
+For a faster inner loop while editing, run:
 
 ```bash
 go test ./...
