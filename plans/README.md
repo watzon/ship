@@ -24,7 +24,7 @@ Allowed values: `TODO`, `IN PROGRESS`, `BLOCKED`, `DONE`, `STALE`. `DONE` means 
 
 | Plan | Priority | Category | Effort | Risk | Status | Depends on |
 |---|---:|---|---:|---:|---|---|
-| [001 — Agent RPC registry](001-agent-rpc-registry.md) | P1 | Architecture / correctness prevention | S | LOW | TODO | — |
+| [001 — Agent RPC registry](001-agent-rpc-registry.md) | P1 | Architecture / correctness prevention | S | LOW | DONE | — |
 | [002 — Rollout compensation](002-compensate-failed-rollouts.md) | P1 | Correctness | L | HIGH | TODO | 001 |
 | [003 — Azure lifecycle operations](003-azure-lifecycle-operations.md) | P1 | Correctness | M | MED | TODO | — |
 | [004 — Deduplicate rollout host work](004-deduplicate-rollout-host-work.md) | P1 | Performance | S | LOW | TODO | 002 |
