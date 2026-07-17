@@ -414,6 +414,94 @@ func actionKinds(actions []Action) []ActionKind {
 	return kinds
 }
 
+func TestBuildActionsPullsEachHostImageOnce(t *testing.T) {
+	tests := []struct {
+		name       string
+		configure  func(*config.Config)
+		images     map[string]string
+		wantEvents []string
+	}{
+		{
+			name: "same host with repeated and distinct images",
+			configure: func(cfg *config.Config) {
+				web := cfg.Services["web"]
+				web.Scale = 2
+				web.Ports = nil
+				web.Health = config.HealthCheck{}
+				web.Ingress = nil
+				cfg.Services["web"] = web
+				cfg.Services["worker"] = config.Service{
+					Image:   config.ImageSpec{Ref: "example/worker:latest"},
+					Command: "./bin/worker",
+					Pool:    "web",
+					Scale:   1,
+				}
+			},
+			images: map[string]string{
+				"web":    "example/web@sha256:111",
+				"worker": "example/worker@sha256:222",
+			},
+			wantEvents: []string{
+				"pull:web-1:example/web@sha256:111",
+				"start:web-1:example/web@sha256:111",
+				"start:web-1:example/web@sha256:111",
+				"pull:web-1:example/worker@sha256:222",
+				"start:web-1:example/worker@sha256:222",
+			},
+		},
+		{
+			name: "different hosts with the same image",
+			configure: func(cfg *config.Config) {
+				env := cfg.Environments["production"]
+				env.Hosts.Pools["web"] = config.Pool{Count: 2}
+				cfg.Environments["production"] = env
+				web := cfg.Services["web"]
+				web.Scale = 2
+				web.Ports = nil
+				web.Health = config.HealthCheck{}
+				web.Ingress = nil
+				cfg.Services["web"] = web
+			},
+			images: map[string]string{"web": "example/web@sha256:111"},
+			wantEvents: []string{
+				"pull:web-1:example/web@sha256:111",
+				"start:web-1:example/web@sha256:111",
+				"pull:web-2:example/web@sha256:111",
+				"start:web-2:example/web@sha256:111",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			tt.configure(cfg)
+			actions, err := BuildActions(PlanInput{
+				Config:      cfg,
+				Environment: cfg.Environments["production"],
+				EnvName:     "production",
+				ReleaseID:   "new",
+				Images:      tt.images,
+				StateDir:    t.TempDir(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var events []string
+			for _, action := range actions {
+				if action.Kind != ActionPull && action.Kind != ActionStart {
+					continue
+				}
+				events = append(events, fmt.Sprintf("%s:%s:%s", action.Kind, action.Host.Name, action.Image))
+			}
+			if !reflect.DeepEqual(events, tt.wantEvents) {
+				t.Fatalf("pull and start events = %#v, want %#v", events, tt.wantEvents)
+			}
+		})
+	}
+}
+
 func rollingStrategyConfig(maxUnavailable, maxSurge int) *config.Config {
 	cfg := testConfig()
 	env := cfg.Environments["production"]
@@ -718,6 +806,152 @@ func TestExecuteActionsUsesAgentMethodsInOrder(t *testing.T) {
 	}
 	if slept != 2*time.Second {
 		t.Fatalf("slept = %v", slept)
+	}
+}
+
+func TestExecuteActionsEnsuresEachHostNetworkOnce(t *testing.T) {
+	tests := []struct {
+		name        string
+		actions     []Action
+		wantEnsures []string
+	}{
+		{
+			name: "same host and network",
+			actions: []Action{
+				startAction("web-1", "one", "shared"),
+				startAction("web-1", "two", "shared"),
+				startAction("web-1", "three", "shared"),
+			},
+			wantEnsures: []string{"web-1\x00shared"},
+		},
+		{
+			name: "different hosts with the same network",
+			actions: []Action{
+				startAction("web-1", "one", "shared"),
+				startAction("web-2", "two", "shared"),
+			},
+			wantEnsures: []string{"web-1\x00shared", "web-2\x00shared"},
+		},
+		{
+			name: "same host with different networks",
+			actions: []Action{
+				startAction("web-1", "one", "frontend"),
+				startAction("web-1", "two", "backend"),
+				startAction("web-1", "three", "frontend"),
+			},
+			wantEnsures: []string{"web-1\x00frontend", "web-1\x00backend"},
+		},
+		{
+			name: "empty network",
+			actions: []Action{
+				startAction("web-1", "one", ""),
+				startAction("web-1", "two", ""),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := &networkRecorder{}
+			err := ExecuteActions(context.Background(), tt.actions, recorder.agentFor, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(recorder.ensures, tt.wantEnsures) {
+				t.Fatalf("network ensures = %#v, want %#v", recorder.ensures, tt.wantEnsures)
+			}
+			if recorder.runs != len(tt.actions) {
+				t.Fatalf("container runs = %d, want %d", recorder.runs, len(tt.actions))
+			}
+		})
+	}
+}
+
+func TestExecuteActionsEnsuresAppAndIngressNetworkOnce(t *testing.T) {
+	recorder := &networkRecorder{}
+	host := scheduler.Host{Name: "web-1"}
+	actions := []Action{
+		startAction(host.Name, "web", "shared"),
+		{
+			Kind:          ActionIngress,
+			IngressPath:   filepath.Join(t.TempDir(), "production.Caddyfile"),
+			IngressConfig: "example.com {\n  reverse_proxy web-1:3000\n}\n",
+			IngressHosts:  []scheduler.Host{host},
+			Network:       "shared",
+			NetworkDriver: "bridge",
+		},
+	}
+	if err := ExecuteActions(context.Background(), actions, recorder.agentFor, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"web-1\x00shared"}
+	if !reflect.DeepEqual(recorder.ensures, want) {
+		t.Fatalf("network ensures = %#v, want %#v", recorder.ensures, want)
+	}
+}
+
+func TestExecuteActionsDoesNotCacheFailedNetworkEnsure(t *testing.T) {
+	key := "web-1\x00shared"
+	recorder := &networkRecorder{ensureFailures: map[string]int{key: 1}}
+	actions := []Action{startAction("web-1", "web", "shared")}
+
+	err := ExecuteActions(context.Background(), actions, recorder.agentFor, nil)
+	if err == nil || !strings.Contains(err.Error(), "ensure network shared on web-1") {
+		t.Fatalf("first execution error = %v", err)
+	}
+	if err := ExecuteActions(context.Background(), actions, recorder.agentFor, nil); err != nil {
+		t.Fatalf("second execution: %v", err)
+	}
+	want := []string{key, key}
+	if !reflect.DeepEqual(recorder.ensures, want) {
+		t.Fatalf("network ensures = %#v, want %#v", recorder.ensures, want)
+	}
+}
+
+func TestEnsureNetworkOnceDoesNotCacheFailure(t *testing.T) {
+	host := scheduler.Host{Name: "web-1"}
+	key := host.Name + "\x00shared"
+	recorder := &networkRecorder{ensureFailures: map[string]int{key: 1}}
+	action := startAction(host.Name, "web", "shared")
+	ensuredNetworks := map[string]struct{}{}
+
+	if err := ensureNetworkOnce(context.Background(), recorder.agentFor(host), host, action, ensuredNetworks); err == nil {
+		t.Fatal("expected first ensure to fail")
+	}
+	if len(ensuredNetworks) != 0 {
+		t.Fatalf("networks cached after failure = %#v", ensuredNetworks)
+	}
+	if err := ensureNetworkOnce(context.Background(), recorder.agentFor(host), host, action, ensuredNetworks); err != nil {
+		t.Fatalf("retry ensure: %v", err)
+	}
+	wantEnsures := []string{key, key}
+	if !reflect.DeepEqual(recorder.ensures, wantEnsures) {
+		t.Fatalf("network ensures = %#v, want %#v", recorder.ensures, wantEnsures)
+	}
+	if _, ok := ensuredNetworks[key]; !ok || len(ensuredNetworks) != 1 {
+		t.Fatalf("networks cached after success = %#v", ensuredNetworks)
+	}
+}
+
+func TestExecuteActionsDeduplicatesNetworkWithoutChangingCompensation(t *testing.T) {
+	recorder := &networkRecorder{healthFailure: true}
+	actions := []Action{
+		{Kind: ActionPreserveStop, Host: scheduler.Host{Name: "web-1"}, ContainerName: "old"},
+		startAction("web-1", "one", "shared"),
+		startAction("web-1", "two", "shared"),
+		{Kind: ActionHealth, Host: scheduler.Host{Name: "web-1"}, ContainerName: "two"},
+	}
+	err := ExecuteActions(context.Background(), actions, recorder.agentFor, nil)
+	if err == nil || !strings.Contains(err.Error(), "health two on web-1 failed") {
+		t.Fatalf("execution error = %v", err)
+	}
+	wantEnsures := []string{"web-1\x00shared"}
+	if !reflect.DeepEqual(recorder.ensures, wantEnsures) {
+		t.Fatalf("network ensures = %#v, want %#v", recorder.ensures, wantEnsures)
+	}
+	wantCompensation := []string{"remove_container:two", "remove_container:one", "start_container:old"}
+	if !reflect.DeepEqual(recorder.compensation, wantCompensation) {
+		t.Fatalf("compensation = %#v, want %#v", recorder.compensation, wantCompensation)
 	}
 }
 
@@ -1384,6 +1618,65 @@ func statusCaddyObserved(host, status string) ObservedContainer {
 
 type fakeAgent struct {
 	methods []string
+}
+
+func startAction(host, name, network string) Action {
+	return Action{
+		Kind:          ActionStart,
+		Host:          scheduler.Host{Name: host},
+		ContainerName: name,
+		Image:         "example/app@sha256:111",
+		Network:       network,
+		NetworkDriver: "bridge",
+	}
+}
+
+type networkRecorder struct {
+	ensures        []string
+	runs           int
+	ensureFailures map[string]int
+	healthFailure  bool
+	compensation   []string
+}
+
+func (r *networkRecorder) agentFor(host scheduler.Host) Agent {
+	return &networkRecordingAgent{host: host.Name, recorder: r}
+}
+
+type networkRecordingAgent struct {
+	host     string
+	recorder *networkRecorder
+}
+
+func (a *networkRecordingAgent) Call(ctx context.Context, method string, params any, out any) error {
+	switch method {
+	case "ensure_network":
+		network := params.(agent.EnsureNetworkParams).Name
+		key := a.host + "\x00" + network
+		a.recorder.ensures = append(a.recorder.ensures, key)
+		if a.recorder.ensureFailures[key] > 0 {
+			a.recorder.ensureFailures[key]--
+			return errors.New("ensure failed")
+		}
+	case "run_container":
+		a.recorder.runs++
+	case "health_check":
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: !a.recorder.healthFailure}
+		}
+	case "remove_container", "start_container":
+		name := params.(map[string]string)["name"]
+		a.recorder.compensation = append(a.recorder.compensation, method+":"+name)
+	case "read_file", "write_file", "run_oneoff_container", "stop_container_keep":
+		return nil
+	case "docker_inspect":
+		if result, ok := out.(*agent.DockerInspectResult); ok {
+			result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+		}
+	default:
+		return fmt.Errorf("unexpected method %s", method)
+	}
+	return nil
 }
 
 type inventoryAgent struct {
