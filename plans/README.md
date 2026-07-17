@@ -35,7 +35,7 @@ Allowed values: `TODO`, `IN PROGRESS`, `BLOCKED`, `DONE`, `STALE`. `DONE` means 
 | [009 — Split CLI command domains](009-split-cli-command-domains.md) | P2 | Architecture | L | MED | DONE | 005, 006, 007 |
 | [010 — Bounded host fan-out](010-bounded-host-fanout.md) | P3 | Performance | L | MED | TODO | 002, 004, 005, 009 |
 | [011 — Applied scaling design spike](011-applied-scaling-design-spike.md) | Direction | Product design | M | MED | TODO | 009 |
-| [012 — Stale accessory recovery design](012-stale-accessory-recovery-design.md) | Direction | Recovery design | M | HIGH | TODO | 006, 007, 009 |
+| [012 — Stale accessory recovery design](012-stale-accessory-recovery-design.md) | Direction | Recovery design | M | HIGH | DONE | 006, 007, 009 |
 | [013 — Service volume migration design](013-service-volume-migration-design.md) | Direction | Data-mobility design | L | HIGH | TODO | 001, 007, 009 |
 
 ## Recommended execution order
