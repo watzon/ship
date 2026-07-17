@@ -28,7 +28,7 @@ Allowed values: `TODO`, `IN PROGRESS`, `BLOCKED`, `DONE`, `STALE`. `DONE` means 
 | [002 — Rollout compensation](002-compensate-failed-rollouts.md) | P1 | Correctness | L | HIGH | TODO | 001 |
 | [003 — Azure lifecycle operations](003-azure-lifecycle-operations.md) | P1 | Correctness | M | MED | TODO | — |
 | [004 — Deduplicate rollout host work](004-deduplicate-rollout-host-work.md) | P1 | Performance | S | LOW | TODO | 002 |
-| [005 — Local CI parity](005-local-ci-parity.md) | P1 | DX / tooling | S | LOW | TODO | — |
+| [005 — Local CI parity](005-local-ci-parity.md) | P1 | DX / tooling | S | LOW | DONE | — |
 | [006 — Visible, race-safe events](006-visible-race-safe-events.md) | P2 | Correctness / observability | S | LOW | TODO | — |
 | [007 — Migrate failure contracts](007-migrate-failure-contracts.md) | P1 | Test coverage | M | MED | TODO | 006 |
 | [008 — Archive stale V1 roadmap](008-archive-stale-v1-roadmap.md) | P2 | Documentation | S | LOW | TODO | — |
