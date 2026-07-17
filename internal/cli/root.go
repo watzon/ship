@@ -2225,13 +2225,15 @@ func verifyUpgradedAgent(ctx context.Context, host scheduler.Host, wantVersion s
 // info line); incompatible or pre-negotiation agents stop the operation with
 // the one command that fixes it, or are upgraded inline when autoUpgrade is
 // set.
+var requiredRolloutAgentMethods = []string{"remove_container", "start_container", "stop_container_keep"}
+
 func preflightAgentProtocols(ctx context.Context, w io.Writer, opts *options, envName string, hosts []scheduler.Host, autoUpgrade bool) error {
 	var incompatible []string
 	for _, host := range hosts {
 		var result agent.NegotiateResult
 		err := newDeployAgent(host).Call(ctx, "negotiate", agent.NegotiateParams{
 			ClientVersion:      agent.Version(),
-			MinProtocolVersion: agent.AgentMinProtocol,
+			MinProtocolVersion: agent.AgentProtocol,
 			MaxProtocolVersion: agent.AgentProtocol,
 		}, &result)
 		if err != nil {
@@ -2245,6 +2247,13 @@ func preflightAgentProtocols(ctx context.Context, w io.Writer, opts *options, en
 				return fmt.Errorf("agent preflight on %s: %w", host.Name, err)
 			}
 			continue
+		}
+		if result.SupportedMethods != nil {
+			missing := missingAgentMethods(result.SupportedMethods, requiredRolloutAgentMethods)
+			if len(missing) > 0 {
+				incompatible = append(incompatible, host.Name+": missing required rollout methods: "+strings.Join(missing, ", "))
+				continue
+			}
 		}
 		if result.AgentVersion != "" && result.AgentVersion != agent.Version() {
 			fmt.Fprintf(w, "agent on %s is version %s (CLI %s); protocol %d is compatible\n", host.Name, result.AgentVersion, agent.Version(), result.ProtocolVersion)
@@ -2262,9 +2271,23 @@ func preflightAgentProtocols(ctx context.Context, w io.Writer, opts *options, en
 		if failed := countAgentUpgradeFailures(view); failed > 0 {
 			return fmt.Errorf("auto-upgrade agents failed on %d/%d hosts", failed, len(view.Hosts))
 		}
-		return nil
+		return preflightAgentProtocols(ctx, w, opts, envName, hosts, false)
 	}
 	return fmt.Errorf("incompatible agents:\n  %s\n\nFix: ship agent upgrade %s", strings.Join(incompatible, "\n  "), envName)
+}
+
+func missingAgentMethods(supported, required []string) []string {
+	available := make(map[string]struct{}, len(supported))
+	for _, method := range supported {
+		available[method] = struct{}{}
+	}
+	var missing []string
+	for _, method := range required {
+		if _, ok := available[method]; !ok {
+			missing = append(missing, method)
+		}
+	}
+	return missing
 }
 
 func backupShipBinaryCommand() string {
@@ -2853,7 +2876,7 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "succeeded", Release: releaseID})
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_rollout", Status: "started", Release: releaseID})
-			actions, err := deployment.Rollout(ctx, deployment.RolloutOptions{
+			rollout, err := deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
 				Config:         cfg,
 				Environment:    env,
 				Hosts:          hosts,
@@ -2879,7 +2902,9 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
+			actions := rollout.Actions
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_rollout", Status: "succeeded", Release: releaseID})
+			recordRolloutCleanupWarnings(cmd.OutOrStdout(), store, args[0], "deploy_cleanup", releaseID, rollout.CleanupWarnings)
 			recordIngressEvents(store, args[0], releaseID, actions)
 			if err := preserveMaintenanceIngress(ctx, cfg, args[0], stateDir, hosts, store); err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "maintenance", Status: "failed", Release: releaseID, Message: err.Error()})
@@ -3113,7 +3138,7 @@ func promoteCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote_release_command", Status: "succeeded", Release: releaseID})
 			}
 			recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote_rollout", Status: "started", Release: releaseID})
-			actions, err := deployment.Rollout(ctx, deployment.RolloutOptions{
+			rollout, err := deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
 				Config:         cfg,
 				Environment:    env,
 				Hosts:          hosts,
@@ -3129,7 +3154,9 @@ func promoteCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote", Status: "failed", Release: releaseID, Message: err.Error()})
 				return failPromotedRelease(ctx, store, targetEnv, releaseID, hosts, err)
 			}
+			actions := rollout.Actions
 			recordEvent(store, state.Event{Environment: targetEnv, Kind: "promote_rollout", Status: "succeeded", Release: releaseID})
+			recordRolloutCleanupWarnings(cmd.OutOrStdout(), store, targetEnv, "promote_cleanup", releaseID, rollout.CleanupWarnings)
 			recordIngressEvents(store, targetEnv, releaseID, actions)
 			if err := preserveMaintenanceIngress(ctx, cfg, targetEnv, stateDir, hosts, store); err != nil {
 				recordEvent(store, state.Event{Environment: targetEnv, Kind: "maintenance", Status: "failed", Release: releaseID, Message: err.Error()})
@@ -3685,6 +3712,21 @@ func recordIngressEvents(store state.Store, envName, releaseID string, actions [
 		for _, host := range action.IngressHosts {
 			recordEvent(store, state.Event{Environment: envName, Kind: "ingress_reload", Status: "succeeded", Release: releaseID, Host: host.Name})
 		}
+	}
+}
+
+func recordRolloutCleanupWarnings(w io.Writer, store state.Store, envName, kind, releaseID string, warnings []deployment.CleanupWarning) {
+	for _, warning := range warnings {
+		message := warning.Error()
+		recordEvent(store, state.Event{
+			Environment: envName,
+			Kind:        kind,
+			Status:      "warning",
+			Release:     releaseID,
+			Host:        warning.Host.Name,
+			Message:     message,
+		})
+		ui.PrintWarn(w, message)
 	}
 }
 
@@ -5769,6 +5811,7 @@ func rollbackCmd(opts *options) *cobra.Command {
 			recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_rollout", Status: "started", Release: release.ID})
 			agentFor := deploymentAgentFactory()
 			var actions []deployment.Action
+			var cleanupWarnings []deployment.CleanupWarning
 			if useObservedRollout {
 				actions, err = deployment.BuildActions(deployment.PlanInput{
 					Config:         cfg,
@@ -5782,10 +5825,13 @@ func rollbackCmd(opts *options) *cobra.Command {
 					SecretEnvFiles: secretEnvFiles,
 				})
 				if err == nil {
-					err = deployment.ExecuteActions(ctx, actions, agentFor, nil)
+					var execution deployment.ExecutionResult
+					execution, err = deployment.ExecuteActionsWithResult(ctx, actions, agentFor, nil)
+					cleanupWarnings = execution.CleanupWarnings
 				}
 			} else {
-				actions, err = deployment.Rollout(ctx, deployment.RolloutOptions{
+				var rollout deployment.RolloutResult
+				rollout, err = deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
 					Config:         cfg,
 					Environment:    env,
 					Hosts:          hosts,
@@ -5796,6 +5842,8 @@ func rollbackCmd(opts *options) *cobra.Command {
 					SecretEnvFiles: secretEnvFiles,
 					AgentFor:       agentFor,
 				})
+				actions = rollout.Actions
+				cleanupWarnings = rollout.CleanupWarnings
 			}
 			if err != nil {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_rollout", Status: "failed", Release: release.ID, Message: err.Error()})
@@ -5804,6 +5852,7 @@ func rollbackCmd(opts *options) *cobra.Command {
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "rollback_rollout", Status: "succeeded", Release: release.ID})
+			recordRolloutCleanupWarnings(cmd.OutOrStdout(), store, args[0], "rollback_cleanup", release.ID, cleanupWarnings)
 			recordIngressEvents(store, args[0], release.ID, actions)
 			completedAt := deployNow()
 			healthyRelease := releaseAsHealthy(release, completedAt)

@@ -647,9 +647,27 @@ func sanitizeTagPart(value string) string {
 }
 
 func (c Client) StopRemove(ctx context.Context, name string) error {
+	if err := c.Stop(ctx, name); err != nil {
+		return err
+	}
+	return c.Remove(ctx, name)
+}
+
+// Stop stops a container while preserving it for a later restart.
+func (c Client) Stop(ctx context.Context, name string) error {
 	if err := c.run(ctx, "docker", "stop", name); err != nil && !isNoSuchContainer(err) {
 		return err
 	}
+	return nil
+}
+
+// Start starts an existing stopped container with its original configuration.
+func (c Client) Start(ctx context.Context, name string) error {
+	return c.run(ctx, "docker", "start", name)
+}
+
+// Remove removes a stopped container.
+func (c Client) Remove(ctx context.Context, name string) error {
 	if err := c.run(ctx, "docker", "rm", name); err != nil && !isNoSuchContainer(err) {
 		return err
 	}

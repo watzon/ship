@@ -68,7 +68,7 @@ var releaseTagPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
 const (
 	AgentMinProtocol     = 1
-	AgentProtocol        = 2
+	AgentProtocol        = 3
 	defaultCaddyfilePath = "/etc/caddy/Caddyfile"
 )
 
@@ -288,6 +288,9 @@ type DockerOps interface {
 	Pull(ctx context.Context, image string) error
 	PruneShipImages(ctx context.Context) error
 	Run(ctx context.Context, name, image, command string, args ...string) error
+	Stop(ctx context.Context, name string) error
+	Start(ctx context.Context, name string) error
+	Remove(ctx context.Context, name string) error
 	StopRemove(ctx context.Context, name string) error
 	Logs(ctx context.Context, name string, lines int) (string, error)
 	Inspect(ctx context.Context, name string) (json.RawMessage, error)
@@ -410,8 +413,11 @@ func init() {
 		"read_release_state":   rpcHandlerWithoutContext(Server.readReleaseState),
 		"run_container":        Server.handleRunContainer,
 		"run_oneoff_container": lockedRPCHandler("run_oneoff_container", Server.runOneOffContainer),
+		"remove_container":     Server.handleRemoveContainer,
+		"start_container":      Server.handleStartContainer,
 		"status":               Server.status,
 		"stop_container":       Server.handleStopContainer,
+		"stop_container_keep":  Server.handleStopContainerKeep,
 		"sync_cron_files":      lockedRPCHandler("sync_cron_files", rpcHandlerWithoutContext(Server.syncCronFiles)),
 		"write_file":           lockedRPCHandler("write_file", rpcHandlerWithoutContext(Server.writeFile)),
 		"write_registry_auth":  lockedRPCHandler("write_registry_auth", rpcHandlerWithoutContext(Server.writeRegistryAuth)),
@@ -483,6 +489,33 @@ func (s Server) handleStopContainer(ctx context.Context, req Request) Response {
 			return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
 		}
 		return empty(req.ID, ErrorDocker, s.docker().StopRemove(ctx, p.Name))
+	})
+}
+
+func (s Server) handleStopContainerKeep(ctx context.Context, req Request) Response {
+	return s.handleContainerLifecycle(ctx, req, "stop_container_keep", s.docker().Stop)
+}
+
+func (s Server) handleStartContainer(ctx context.Context, req Request) Response {
+	return s.handleContainerLifecycle(ctx, req, "start_container", s.docker().Start)
+}
+
+func (s Server) handleRemoveContainer(ctx context.Context, req Request) Response {
+	return s.handleContainerLifecycle(ctx, req, "remove_container", s.docker().Remove)
+}
+
+func (s Server) handleContainerLifecycle(ctx context.Context, req Request, operation string, execute func(context.Context, string) error) Response {
+	return s.withHostLock(req, operation, func() Response {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := decode(req.Params, &p); err != nil {
+			return failure(req.ID, ErrorInvalidParams, err)
+		}
+		if strings.TrimSpace(p.Name) == "" {
+			return failure(req.ID, ErrorInvalidParams, errors.New("name is required"))
+		}
+		return empty(req.ID, ErrorDocker, execute(ctx, p.Name))
 	})
 }
 

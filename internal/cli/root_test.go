@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1091,14 +1092,14 @@ func TestPlanObservedReportsDriftAndRolloutActions(t *testing.T) {
 	if view.Observed.CurrentRelease != "release-current" || !view.Observed.Summary.Drift || len(view.RolloutActions) == 0 {
 		t.Fatalf("observed plan view = %+v", view)
 	}
-	var sawStop bool
+	var sawPreserveStop bool
 	for _, action := range view.RolloutActions {
-		if action.Kind == "stop" && action.Container == deployment.ContainerName("demo", "production", "web", 2, "release-old") {
-			sawStop = true
+		if action.Kind == "preserve_stop" && action.Container == deployment.ContainerName("demo", "production", "web", 2, "release-old") {
+			sawPreserveStop = true
 		}
 	}
-	if !sawStop {
-		t.Fatalf("rollout actions missing stop for old web replica: %+v", view.RolloutActions)
+	if !sawPreserveStop {
+		t.Fatalf("rollout actions missing preserve-stop for old web replica: %+v", view.RolloutActions)
 	}
 }
 
@@ -2124,6 +2125,40 @@ func TestDeployRefusesConcurrentOperationBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestDeployRejectsAgentMissingRolloutLifecycleMethodsBeforeMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	var events []string
+	var negotiateParams agent.NegotiateParams
+	fakeAgent := &methodNegotiationAgent{host: "web-1", events: &events, supported: []string{"pull"}, negotiateParams: &negotiateParams}
+	installDeployHooks(t, panicDeployDocker{t: t}, func(host scheduler.Host) deployAgent {
+		return fakeAgent
+	})
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected preflight failure")
+	}
+	for _, method := range requiredRolloutAgentMethods {
+		if !strings.Contains(err.Error(), method) {
+			t.Fatalf("error %q missing method %q", err, method)
+		}
+	}
+	want := []string{"agent:web-1:negotiate"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %#v, want read-only preflight %#v", events, want)
+	}
+	if negotiateParams.MinProtocolVersion != agent.AgentProtocol || negotiateParams.MaxProtocolVersion != agent.AgentProtocol {
+		t.Fatalf("negotiate params = %+v, want current protocol %d", negotiateParams, agent.AgentProtocol)
+	}
+}
+
 func TestDeployStopsFixedPortOldBeforeStartAndPromotesHealthyRelease(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
@@ -2183,9 +2218,10 @@ func TestDeployStopsFixedPortOldBeforeStartAndPromotesHealthyRelease(t *testing.
 	wantOrder := []string{
 		"agent:web-1:list_ship_containers",
 		"agent:web-1:pull:" + digestRef,
-		"agent:web-1:stop:ship_demo_production_web_1_old-release",
+		"agent:web-1:stop_keep:ship_demo_production_web_1_old-release",
 		"agent:web-1:run:ship_demo_production_web_1_" + releaseID,
 		"agent:web-1:health",
+		"agent:web-1:remove:ship_demo_production_web_1_old-release",
 	}
 	joined := strings.Join(events, "\n")
 	for _, want := range wantOrder {
@@ -2194,10 +2230,11 @@ func TestDeployStopsFixedPortOldBeforeStartAndPromotesHealthyRelease(t *testing.
 		}
 	}
 	pullAt := strings.Index(joined, "agent:web-1:pull:"+digestRef)
-	stopAt := strings.Index(joined, "agent:web-1:stop:ship_demo_production_web_1_old-release")
+	stopAt := strings.Index(joined, "agent:web-1:stop_keep:ship_demo_production_web_1_old-release")
 	runAt := strings.Index(joined, "agent:web-1:run:ship_demo_production_web_1_"+releaseID)
 	healthAt := strings.Index(joined, "agent:web-1:health")
-	if !(pullAt < stopAt && stopAt < runAt && runAt < healthAt) {
+	removeAt := strings.Index(joined, "agent:web-1:remove:ship_demo_production_web_1_old-release")
+	if !(pullAt < stopAt && stopAt < runAt && runAt < healthAt && healthAt < removeAt) {
 		t.Fatalf("fixed-port deploy order is wrong:\n%s", joined)
 	}
 	current, err := store.CurrentRelease("production")
@@ -2355,17 +2392,17 @@ func TestDeployFailedHealthDoesNotShiftTrafficOrCurrent(t *testing.T) {
 		t.Fatalf("health failure wrote ingress: %v", err)
 	}
 	joined := strings.Join(events, "\n")
-	stopAt := strings.Index(joined, "agent:web-1:stop:ship_demo_production_web_1_old-release")
+	stopAt := strings.Index(joined, "agent:web-1:stop_keep:ship_demo_production_web_1_old-release")
 	runAt := strings.Index(joined, "agent:web-1:run:ship_demo_production_web_1_"+releaseID)
 	if stopAt < 0 || runAt < 0 || stopAt > runAt {
 		t.Fatalf("fixed-port health failure did not stop old before start:\n%s", joined)
 	}
 }
 
-func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
+func TestDeployFailedHealthRestoresFixedPortContainerInventory(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
-	if err := os.WriteFile(path, []byte(deployBuildConfig()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)
@@ -2375,6 +2412,66 @@ func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
 	}
 
 	var events []string
+	var releaseWrites []releaseStateWrite
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	oldName := "ship_demo_production_web_1_old-release"
+	newName := "ship_demo_production_web_1_" + releaseID
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fakeDocker := &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}
+	fake := &inventoryDeployAgent{
+		host:          "web-1",
+		events:        &events,
+		releaseWrites: &releaseWrites,
+		containers: map[string]bool{
+			oldName: true,
+		},
+		summaries: map[string]docker.ContainerSummary{
+			oldName: serviceContainer("web-1", "web", 1, "old-release", "Up 1 minute"),
+		},
+		failHealth: true,
+	}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent { return fake })
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected deploy failure")
+	}
+	if running, ok := fake.containers[oldName]; !ok || !running {
+		t.Fatalf("old container was not restored: %#v", fake.containers)
+	}
+	if _, ok := fake.containers[newName]; ok {
+		t.Fatalf("failed candidate was not removed: %#v", fake.containers)
+	}
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != "old-release" {
+		t.Fatalf("current = %+v", current)
+	}
+	if len(releaseWrites) == 0 || releaseWrites[len(releaseWrites)-1].Release.Status != state.ReleaseStatusFailed {
+		t.Fatalf("remote release writes = %+v", releaseWrites)
+	}
+}
+
+func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	configYAML := strings.Replace(deployBuildConfig(), "    ports: [3000]\n", "    ports: [3000]\n    health:\n      command: ./bin/health\n", 1)
+	if err := os.WriteFile(path, []byte(configYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "old-release", Environment: "production", Images: map[string]string{"web": "old"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var releaseWrites []releaseStateWrite
 	releaseID := "abc123def456-20260630T183456.123456789Z"
 	tag := "registry.local/acme/demo:web-" + releaseID
 	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
@@ -2386,13 +2483,22 @@ func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
 			"registry.local/acme/worker:stable": workerDigestRef,
 		},
 	}
-	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent {
-		failMethod := ""
-		if host.Name == "web-2" {
-			failMethod = "run_container"
+	agents := map[string]*inventoryDeployAgent{}
+	for i, host := range []string{"web-1", "web-2"} {
+		replica := i + 1
+		oldName := deployment.ContainerName("demo", "production", "web", replica, "old-release")
+		agents[host] = &inventoryDeployAgent{
+			host:          host,
+			events:        &events,
+			releaseWrites: &releaseWrites,
+			containers:    map[string]bool{oldName: true},
+			summaries: map[string]docker.ContainerSummary{
+				oldName: serviceContainer(host, "web", replica, "old-release", "Up 1 minute"),
+			},
+			failHealth: host == "web-2",
 		}
-		return &scriptedDeployAgent{host: host.Name, events: &events, failMethod: failMethod}
-	})
+	}
+	installDeployHooks(t, fakeDocker, func(host scheduler.Host) deployAgent { return agents[host.Name] })
 
 	cmd := deployCmd(&options{configPath: path})
 	cmd.SetArgs([]string{"production"})
@@ -2401,8 +2507,31 @@ func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
 		t.Fatal("expected deploy failure")
 	}
 	joined := strings.Join(events, "\n")
-	if !strings.Contains(joined, "agent:web-1:run:ship_demo_production_web_1_"+releaseID) || !strings.Contains(joined, "agent:web-2:run:ship_demo_production_web_2_"+releaseID) {
+	if !strings.Contains(joined, "agent:web-1:run_container:ship_demo_production_web_1_"+releaseID) || !strings.Contains(joined, "agent:web-2:run_container:ship_demo_production_web_2_"+releaseID) {
 		t.Fatalf("partial host events = %#v", events)
+	}
+	for i, host := range []string{"web-1", "web-2"} {
+		replica := i + 1
+		oldName := deployment.ContainerName("demo", "production", "web", replica, "old-release")
+		newName := deployment.ContainerName("demo", "production", "web", replica, releaseID)
+		if running, ok := agents[host].containers[oldName]; !ok || !running {
+			t.Fatalf("%s old container was not restored: %#v", host, agents[host].containers)
+		}
+		if _, ok := agents[host].containers[newName]; ok {
+			t.Fatalf("%s candidate was not removed: %#v", host, agents[host].containers)
+		}
+	}
+	if strings.Contains(joined, ":write_file") {
+		t.Fatalf("partial failure shifted ingress: %#v", events)
+	}
+	lastRemoteStatus := map[string]string{}
+	for _, write := range releaseWrites {
+		lastRemoteStatus[write.Host] = write.Release.Status
+	}
+	for _, host := range []string{"web-1", "web-2"} {
+		if lastRemoteStatus[host] != state.ReleaseStatusFailed {
+			t.Fatalf("remote release status on %s = %q, writes = %+v", host, lastRemoteStatus[host], releaseWrites)
+		}
 	}
 	current, err := store.CurrentRelease("production")
 	if err != nil {
@@ -2417,6 +2546,135 @@ func TestDeployPartialHostFailureLeavesPreviousCurrent(t *testing.T) {
 	}
 	if failed.Status != state.ReleaseStatusFailed {
 		t.Fatalf("failed release = %+v", failed)
+	}
+}
+
+func TestDeployFailedHealthRecordsCompensationFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "old-release", Environment: "production", Images: map[string]string{"web": "old"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	oldName := deployment.ContainerName("demo", "production", "web", 1, "old-release")
+	newName := deployment.ContainerName("demo", "production", "web", 1, releaseID)
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fake := &inventoryDeployAgent{
+		host:       "web-1",
+		events:     &events,
+		containers: map[string]bool{oldName: true},
+		summaries: map[string]docker.ContainerSummary{
+			oldName: serviceContainer("web-1", "web", 1, "old-release", "Up 1 minute"),
+		},
+		failHealth: true,
+		failures: map[string]error{
+			"remove_container:" + newName: errors.New("remove candidate failed"),
+		},
+	}
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}, func(host scheduler.Host) deployAgent { return fake })
+
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetArgs([]string{"production"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected deploy failure")
+	}
+	for _, want := range []string{"health " + newName + " on web-1 failed", "remove " + newName + " on web-1: remove candidate failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q missing %q", err, want)
+		}
+	}
+	if running, ok := fake.containers[oldName]; !ok || !running {
+		t.Fatalf("old container was not restored after cleanup failure: %#v", fake.containers)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range timeline {
+		if event.Kind == "deploy_rollout" && event.Status == "failed" && strings.Contains(event.Message, "remove candidate failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("timeline did not record compensation failure: %+v", timeline)
+	}
+}
+
+func TestDeployCleanupWarningKeepsReleaseHealthyAndCurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(rollingDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{ID: "old-release", Environment: "production", Images: map[string]string{"web": "old"}, CreatedAt: time.Unix(10, 0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []string
+	var releaseWrites []releaseStateWrite
+	releaseID := "abc123def456-20260630T183456.123456789Z"
+	oldName := deployment.ContainerName("demo", "production", "web", 1, "old-release")
+	newName := deployment.ContainerName("demo", "production", "web", 1, releaseID)
+	tag := "registry.local/acme/demo:web-" + releaseID
+	digestRef := "registry.local/acme/demo@sha256:" + strings.Repeat("1", 64)
+	fake := &inventoryDeployAgent{
+		host:          "web-1",
+		events:        &events,
+		releaseWrites: &releaseWrites,
+		containers:    map[string]bool{oldName: true},
+		summaries: map[string]docker.ContainerSummary{
+			oldName: serviceContainer("web-1", "web", 1, "old-release", "Up 1 minute"),
+		},
+		failures: map[string]error{
+			"remove_container:" + oldName: errors.New("remove preserved failed"),
+		},
+	}
+	installDeployHooks(t, &recordingDeployDocker{events: &events, resolved: map[string]string{tag: digestRef}}, func(host scheduler.Host) deployAgent { return fake })
+
+	var output bytes.Buffer
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetOut(&output)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "remove preserved container "+oldName+" on web-1: remove preserved failed") {
+		t.Fatalf("output = %q", output.String())
+	}
+	current, err := store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID != releaseID || !current.Healthy || current.Status != state.ReleaseStatusHealthy {
+		t.Fatalf("current release = %+v", current)
+	}
+	if running, ok := fake.containers[newName]; !ok || !running {
+		t.Fatalf("candidate is not running: %#v", fake.containers)
+	}
+	if running, ok := fake.containers[oldName]; !ok || running {
+		t.Fatalf("leaked preserved container should remain stopped: %#v", fake.containers)
+	}
+	if len(releaseWrites) == 0 || releaseWrites[len(releaseWrites)-1].Release.Status != state.ReleaseStatusHealthy {
+		t.Fatalf("remote release writes = %+v", releaseWrites)
+	}
+	timeline, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !timelineContains(timeline, "deploy_cleanup", "warning", releaseID) || !timelineContains(timeline, "deploy", "succeeded", releaseID) {
+		t.Fatalf("timeline = %+v", timeline)
 	}
 }
 
@@ -6865,7 +7123,9 @@ func installDeployHooks(t *testing.T, dockerClient deployDocker, agentFactory fu
 	originalGitRevision := deployGitRevision
 	originalReleaseID := newReleaseID
 	newDeployDocker = func() deployDocker { return dockerClient }
-	newDeployAgent = agentFactory
+	newDeployAgent = func(host scheduler.Host) deployAgent {
+		return defaultNegotiationAgent{delegate: agentFactory(host)}
+	}
 	deployNow = func() time.Time {
 		return time.Date(2026, 6, 30, 12, 34, 56, 123456789, time.FixedZone("MDT", -6*60*60))
 	}
@@ -6882,6 +7142,50 @@ func installDeployHooks(t *testing.T, dockerClient deployDocker, agentFactory fu
 		deployGitRevision = originalGitRevision
 		newReleaseID = originalReleaseID
 	})
+}
+
+type defaultNegotiationAgent struct {
+	delegate deployAgent
+}
+
+type methodNegotiationAgent struct {
+	host            string
+	events          *[]string
+	supported       []string
+	negotiateParams *agent.NegotiateParams
+}
+
+func (a *methodNegotiationAgent) Call(ctx context.Context, method string, params any, out any) error {
+	*a.events = append(*a.events, fmt.Sprintf("agent:%s:%s", a.host, method))
+	if method != "negotiate" {
+		return fmt.Errorf("unexpected mutation %s", method)
+	}
+	if a.negotiateParams != nil {
+		*a.negotiateParams = params.(agent.NegotiateParams)
+	}
+	if result, ok := out.(*agent.NegotiateResult); ok {
+		*result = agent.NegotiateResult{
+			AgentVersion:     agent.Version(),
+			ProtocolVersion:  agent.AgentProtocol,
+			SupportedMethods: append([]string(nil), a.supported...),
+		}
+	}
+	return nil
+}
+
+func (a defaultNegotiationAgent) Call(ctx context.Context, method string, params any, out any) error {
+	if err := a.delegate.Call(ctx, method, params, out); err != nil {
+		return err
+	}
+	if method != "negotiate" {
+		return nil
+	}
+	if result, ok := out.(*agent.NegotiateResult); ok && result.SupportedMethods == nil {
+		result.AgentVersion = agent.Version()
+		result.ProtocolVersion = agent.AgentProtocol
+		result.SupportedMethods = append([]string(nil), requiredRolloutAgentMethods...)
+	}
+	return nil
 }
 
 type hookRun struct {
@@ -7164,6 +7468,102 @@ type scriptedDeployAgent struct {
 	releaseWrites *[]releaseStateWrite
 }
 
+type inventoryDeployAgent struct {
+	host          string
+	events        *[]string
+	containers    map[string]bool
+	summaries     map[string]docker.ContainerSummary
+	failHealth    bool
+	failures      map[string]error
+	releaseWrites *[]releaseStateWrite
+}
+
+func (a *inventoryDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
+	name := ""
+	switch method {
+	case "run_container":
+		name = params.(agent.RunContainerParams).Name
+	case "stop_container", "stop_container_keep", "start_container", "remove_container":
+		name = params.(map[string]string)["name"]
+	}
+	event := fmt.Sprintf("agent:%s:%s", a.host, method)
+	if name != "" {
+		event += ":" + name
+	}
+	*a.events = append(*a.events, event)
+	if err := a.failures[method+":"+name]; err != nil {
+		return err
+	}
+	switch method {
+	case "negotiate":
+		if result, ok := out.(*agent.NegotiateResult); ok {
+			*result = agent.NegotiateResult{
+				AgentVersion:    agent.Version(),
+				ProtocolVersion: agent.AgentProtocol,
+				SupportedMethods: []string{
+					"remove_container", "start_container", "stop_container_keep",
+				},
+			}
+		}
+	case "write_release_state":
+		if a.releaseWrites != nil {
+			p := params.(agent.WriteReleaseStateParams)
+			*a.releaseWrites = append(*a.releaseWrites, releaseStateWrite{Host: a.host, Release: p.Release})
+		}
+	case "list_ship_containers":
+		if containers, ok := out.(*[]docker.ContainerSummary); ok {
+			for containerName, summary := range a.summaries {
+				if running, exists := a.containers[containerName]; exists {
+					if running {
+						summary.Status = "Up 1 minute"
+					} else {
+						summary.Status = "Exited"
+					}
+					*containers = append(*containers, summary)
+				}
+			}
+		}
+	case "pull", "ensure_network", "write_file", "run_oneoff_container":
+		return nil
+	case "read_file":
+		if result, ok := out.(*agent.ReadFileResult); ok {
+			*result = agent.ReadFileResult{Exists: false}
+		}
+	case "docker_inspect":
+		populateRunningDockerInspect(out)
+	case "logs":
+		if result, ok := out.(*map[string]string); ok {
+			*result = map[string]string{"logs": ""}
+		}
+	case "run_container":
+		p := params.(agent.RunContainerParams)
+		a.containers[p.Name] = true
+		a.summaries[p.Name] = docker.ContainerSummary{Names: p.Name, Image: p.Image, Status: "Up", Labels: p.Labels}
+	case "health_check":
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: !a.failHealth}
+		}
+	case "stop_container":
+		delete(a.containers, name)
+		delete(a.summaries, name)
+	case "stop_container_keep":
+		if _, ok := a.containers[name]; ok {
+			a.containers[name] = false
+		}
+	case "start_container":
+		if _, ok := a.containers[name]; !ok {
+			return fmt.Errorf("container %s does not exist", name)
+		}
+		a.containers[name] = true
+	case "remove_container":
+		delete(a.containers, name)
+		delete(a.summaries, name)
+	default:
+		return fmt.Errorf("unexpected method %s", method)
+	}
+	return nil
+}
+
 func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
 	case "write_release_state":
@@ -7196,6 +7596,15 @@ func (s *scriptedDeployAgent) Call(ctx context.Context, method string, params an
 	case "stop_container":
 		name := params.(map[string]string)["name"]
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:stop:%s", s.host, name))
+	case "stop_container_keep":
+		name := params.(map[string]string)["name"]
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:stop_keep:%s", s.host, name))
+	case "start_container":
+		name := params.(map[string]string)["name"]
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:start_existing:%s", s.host, name))
+	case "remove_container":
+		name := params.(map[string]string)["name"]
+		*s.events = append(*s.events, fmt.Sprintf("agent:%s:remove:%s", s.host, name))
 	default:
 		*s.events = append(*s.events, fmt.Sprintf("agent:%s:%s", s.host, method))
 	}

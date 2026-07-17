@@ -3,6 +3,7 @@ package deployment
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,7 +51,7 @@ func TestBuildActionsStopsFixedPortReplicaBeforeStart(t *testing.T) {
 	for _, action := range actions {
 		kinds = append(kinds, action.Kind)
 	}
-	wantKinds := []ActionKind{ActionPull, ActionStop, ActionStart, ActionHealth, ActionIngress}
+	wantKinds := []ActionKind{ActionPull, ActionPreserveStop, ActionStart, ActionHealth, ActionIngress, ActionRemovePreserved}
 	if !reflect.DeepEqual(kinds, wantKinds) {
 		t.Fatalf("kinds = %#v, want %#v", kinds, wantKinds)
 	}
@@ -167,8 +168,9 @@ func TestBuildActionsHonorsMaxSurgeOneForRollingReplacement(t *testing.T) {
 	}
 	got := actionKinds(actions)
 	want := []ActionKind{
-		ActionPull, ActionStart, ActionHealth, ActionStop,
-		ActionPull, ActionStart, ActionHealth, ActionStop,
+		ActionPull, ActionStart, ActionHealth, ActionPreserveStop,
+		ActionPull, ActionStart, ActionHealth, ActionPreserveStop,
+		ActionRemovePreserved, ActionRemovePreserved,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("kinds = %#v, want %#v", got, want)
@@ -208,9 +210,10 @@ func TestBuildActionsInsertsCanaryPauseAfterFirstHealthyReplica(t *testing.T) {
 	}
 	got := actionKinds(actions)
 	want := []ActionKind{
-		ActionPull, ActionStart, ActionHealth, ActionCanary, ActionStop,
-		ActionPull, ActionStart, ActionHealth, ActionStop,
-		ActionPull, ActionStart, ActionHealth, ActionStop,
+		ActionPull, ActionStart, ActionHealth, ActionCanary, ActionPreserveStop,
+		ActionPull, ActionStart, ActionHealth, ActionPreserveStop,
+		ActionPull, ActionStart, ActionHealth, ActionPreserveStop,
+		ActionRemovePreserved, ActionRemovePreserved, ActionRemovePreserved,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("kinds = %#v, want %#v", got, want)
@@ -314,8 +317,9 @@ func TestBuildActionsHonorsMaxUnavailableWhenSurgeDisabled(t *testing.T) {
 	}
 	got := actionKinds(actions)
 	want := []ActionKind{
-		ActionPull, ActionStop, ActionStart, ActionHealth,
-		ActionPull, ActionStop, ActionStart, ActionHealth,
+		ActionPull, ActionPreserveStop, ActionStart, ActionHealth,
+		ActionPull, ActionPreserveStop, ActionStart, ActionHealth,
+		ActionRemovePreserved, ActionRemovePreserved,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("kinds = %#v, want %#v", got, want)
@@ -784,13 +788,169 @@ func TestExecuteFixedPortActionsAvoidsPortCollision(t *testing.T) {
 	}
 	want := []string{
 		"pull",
-		"stop_container:" + oldName,
+		"stop_container_keep:" + oldName,
 		"run_container:" + ContainerName("demo", "production", "web", 1, "new"),
 		"health_check",
 	}
 	for _, event := range want {
 		if !contains(fake.events, event) {
 			t.Fatalf("events missing %q: %#v", event, fake.events)
+		}
+	}
+}
+
+func TestExecuteFixedPortHealthFailureRestoresPreviousContainer(t *testing.T) {
+	cfg := testConfig()
+	env := cfg.Environments["production"]
+	oldName := ContainerName("demo", "production", "web", 1, "old")
+	newName := ContainerName("demo", "production", "web", 1, "new")
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+		Observed:    []ObservedContainer{statusObserved("web-1", "web", 1, "old", "Up 1 minute")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &inventoryAgent{
+		containers: map[string]bool{oldName: true},
+		failHealth: true,
+	}
+	err = ExecuteActions(context.Background(), actions, func(host scheduler.Host) Agent { return fake }, nil)
+	if err == nil || !strings.Contains(err.Error(), "health "+newName+" on web-1 failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if running, ok := fake.containers[oldName]; !ok || !running {
+		t.Fatalf("old container was not restored: %#v", fake.containers)
+	}
+	if _, ok := fake.containers[newName]; ok {
+		t.Fatalf("failed candidate was not removed: %#v", fake.containers)
+	}
+}
+
+func TestExecuteActionsReportsAllCompensationFailures(t *testing.T) {
+	oldOne := "old-one"
+	oldTwo := "old-two"
+	newOne := "new-one"
+	newTwo := "new-two"
+	fake := &inventoryAgent{
+		containers: map[string]bool{oldOne: true, oldTwo: true},
+		failHealth: true,
+		failures: map[string]error{
+			"remove_container:" + newTwo: errors.New("remove new two failed"),
+			"remove_container:" + newOne: errors.New("remove new one failed"),
+			"start_container:" + oldTwo:  errors.New("start old two failed"),
+			"start_container:" + oldOne:  errors.New("start old one failed"),
+		},
+	}
+	actions := []Action{
+		{Kind: ActionPreserveStop, Host: scheduler.Host{Name: "web-1"}, ContainerName: oldOne},
+		{Kind: ActionStart, Host: scheduler.Host{Name: "web-1"}, ContainerName: newOne, Image: "example/web:1"},
+		{Kind: ActionPreserveStop, Host: scheduler.Host{Name: "web-2"}, ContainerName: oldTwo},
+		{Kind: ActionStart, Host: scheduler.Host{Name: "web-2"}, ContainerName: newTwo, Image: "example/web:1"},
+		{Kind: ActionHealth, Host: scheduler.Host{Name: "web-2"}, ContainerName: newTwo},
+	}
+	err := ExecuteActions(context.Background(), actions, func(host scheduler.Host) Agent { return fake }, nil)
+	if err == nil {
+		t.Fatal("expected rollout failure")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		"health new-two on web-2 failed",
+		"remove new-two on web-2: remove new two failed",
+		"remove new-one on web-1: remove new one failed",
+		"restart old-two on web-2: start old two failed",
+		"restart old-one on web-1: start old one failed",
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("error %q missing %q", message, want)
+		}
+	}
+	wantCalls := []string{
+		"remove_container:" + newTwo,
+		"remove_container:" + newOne,
+		"start_container:" + oldTwo,
+		"start_container:" + oldOne,
+	}
+	var compensationCalls []string
+	for _, call := range fake.calls {
+		if strings.HasPrefix(call, "remove_container:") || strings.HasPrefix(call, "start_container:") {
+			compensationCalls = append(compensationCalls, call)
+		}
+	}
+	if !reflect.DeepEqual(compensationCalls, wantCalls) {
+		t.Fatalf("compensation calls = %#v, want %#v", compensationCalls, wantCalls)
+	}
+}
+
+func TestExecuteSuccessfulFixedPortRolloutRemovesPreviousContainerAfterIngress(t *testing.T) {
+	cfg := testConfig()
+	env := cfg.Environments["production"]
+	oldName := ContainerName("demo", "production", "web", 1, "old")
+	newName := ContainerName("demo", "production", "web", 1, "new")
+	actions, err := BuildActions(PlanInput{
+		Config:      cfg,
+		Environment: env,
+		EnvName:     "production",
+		ReleaseID:   "new",
+		Images:      map[string]string{"web": "example/web@sha256:111"},
+		StateDir:    t.TempDir(),
+		Observed:    []ObservedContainer{statusObserved("web-1", "web", 1, "old", "Up 1 minute")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &inventoryAgent{containers: map[string]bool{oldName: true}}
+	if err := ExecuteActions(context.Background(), actions, func(host scheduler.Host) Agent { return fake }, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fake.containers[oldName]; ok {
+		t.Fatalf("preserved old container was not removed: %#v", fake.containers)
+	}
+	if running, ok := fake.containers[newName]; !ok || !running {
+		t.Fatalf("candidate is not running: %#v", fake.containers)
+	}
+	keepAt := indexOf(fake.calls, "stop_container_keep:"+oldName)
+	ingressAt := indexOf(fake.calls, "write_file")
+	removeAt := indexOf(fake.calls, "remove_container:"+oldName)
+	if keepAt < 0 || ingressAt < 0 || removeAt < 0 || !(keepAt < ingressAt && ingressAt < removeAt) {
+		t.Fatalf("cleanup was not deferred until after ingress: %#v", fake.calls)
+	}
+}
+
+func TestExecuteActionsReturnsPostCommitCleanupWarnings(t *testing.T) {
+	oldOne := "old-one"
+	oldTwo := "old-two"
+	fake := &inventoryAgent{
+		containers: map[string]bool{oldOne: false, oldTwo: false},
+		failures: map[string]error{
+			"remove_container:" + oldOne: errors.New("remove one failed"),
+			"remove_container:" + oldTwo: errors.New("remove two failed"),
+		},
+	}
+	actions := []Action{
+		{Kind: ActionIngress, IngressPath: filepath.Join(t.TempDir(), "production.Caddyfile")},
+		{Kind: ActionRemovePreserved, Host: scheduler.Host{Name: "web-1"}, ContainerName: oldOne},
+		{Kind: ActionRemovePreserved, Host: scheduler.Host{Name: "web-2"}, ContainerName: oldTwo},
+	}
+	result, err := ExecuteActionsWithResult(context.Background(), actions, func(host scheduler.Host) Agent { return fake }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CleanupWarnings) != 2 {
+		t.Fatalf("cleanup warnings = %+v", result.CleanupWarnings)
+	}
+	want := []string{
+		"remove preserved container old-one on web-1: remove one failed",
+		"remove preserved container old-two on web-2: remove two failed",
+	}
+	for i, warning := range result.CleanupWarnings {
+		if warning.Error() != want[i] {
+			t.Fatalf("warning %d = %q, want %q", i, warning.Error(), want[i])
 		}
 	}
 }
@@ -1226,6 +1386,72 @@ type fakeAgent struct {
 	methods []string
 }
 
+type inventoryAgent struct {
+	containers map[string]bool
+	failHealth bool
+	failures   map[string]error
+	calls      []string
+}
+
+func (f *inventoryAgent) Call(ctx context.Context, method string, params any, out any) error {
+	name := ""
+	switch method {
+	case "run_container":
+		name = params.(agent.RunContainerParams).Name
+	case "stop_container", "stop_container_keep", "start_container", "remove_container":
+		name = params.(map[string]string)["name"]
+	}
+	call := method
+	if name != "" {
+		call += ":" + name
+	}
+	f.calls = append(f.calls, call)
+	if err := f.failures[call]; err != nil {
+		return err
+	}
+	switch method {
+	case "ensure_network", "pull", "run_oneoff_container", "read_file":
+		return nil
+	case "write_file":
+		return nil
+	case "docker_inspect":
+		if result, ok := out.(*agent.DockerInspectResult); ok {
+			result.Inspect = json.RawMessage(`[{"State":{"Running":true}}]`)
+		}
+	case "run_container":
+		f.containers[name] = true
+	case "health_check":
+		if result, ok := out.(*agent.HealthCheckResult); ok {
+			*result = agent.HealthCheckResult{OK: !f.failHealth}
+		}
+	case "stop_container":
+		delete(f.containers, name)
+	case "stop_container_keep":
+		if _, ok := f.containers[name]; ok {
+			f.containers[name] = false
+		}
+	case "start_container":
+		if _, ok := f.containers[name]; !ok {
+			return fmt.Errorf("container %s does not exist", name)
+		}
+		f.containers[name] = true
+	case "remove_container":
+		delete(f.containers, name)
+	default:
+		return fmt.Errorf("unexpected method %s", method)
+	}
+	return nil
+}
+
+func indexOf(values []string, target string) int {
+	for i, value := range values {
+		if value == target {
+			return i
+		}
+	}
+	return -1
+}
+
 func (f *fakeAgent) Call(ctx context.Context, method string, params any, out any) error {
 	f.methods = append(f.methods, method)
 	if result, ok := out.(*agent.HealthCheckResult); ok {
@@ -1291,14 +1517,17 @@ func (f *fixedPortAgent) Call(ctx context.Context, method string, params any, ou
 		if result, ok := out.(*agent.HealthCheckResult); ok {
 			*result = agent.HealthCheckResult{OK: true}
 		}
-	case "stop_container":
+	case "stop_container", "stop_container_keep":
 		name := params.(map[string]string)["name"]
-		f.events = append(f.events, "stop_container:"+name)
+		f.events = append(f.events, method+":"+name)
 		for port, holder := range f.activePorts {
 			if holder == name {
 				delete(f.activePorts, port)
 			}
 		}
+	case "remove_container":
+		name := params.(map[string]string)["name"]
+		f.events = append(f.events, "remove_container:"+name)
 	default:
 		f.events = append(f.events, method)
 	}
