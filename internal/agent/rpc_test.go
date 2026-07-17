@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,97 @@ func TestServeUnknownMethodReturnsStructuredErrorAndRequestID(t *testing.T) {
 	if resp.OK || resp.ErrorCode != ErrorUnknownMethod || !strings.Contains(resp.Error, "unknown method") {
 		t.Fatalf("unexpected response: %+v", resp)
 	}
+}
+
+func TestRPCRegistryMatchesSupportedMethods(t *testing.T) {
+	methods := supportedMethods()
+	if len(methods) != len(rpcHandlers) {
+		t.Fatalf("supported methods = %d, registry entries = %d", len(methods), len(rpcHandlers))
+	}
+	if !sort.StringsAreSorted(methods) {
+		t.Fatalf("supported methods are not sorted: %#v", methods)
+	}
+
+	seen := make(map[string]struct{}, len(methods))
+	for _, method := range methods {
+		if _, ok := seen[method]; ok {
+			t.Fatalf("supported method %q appears more than once", method)
+		}
+		seen[method] = struct{}{}
+	}
+	for method := range rpcHandlers {
+		if _, ok := seen[method]; !ok {
+			t.Errorf("registry method %q is not supported", method)
+		}
+	}
+}
+
+func TestRPCRegistryUnknownMethod(t *testing.T) {
+	server := testServer(t)
+	resp := server.Handle(context.Background(), request(t, "unknown-1", "not_registered", nil))
+	if resp.OK || resp.ID != "unknown-1" || resp.ErrorCode != ErrorUnknownMethod {
+		t.Fatalf("response = %+v", resp)
+	}
+	if resp.Error != `unknown method "not_registered"` {
+		t.Fatalf("error = %q", resp.Error)
+	}
+}
+
+func TestRPCRegistryDispatchPreservesLockBoundaries(t *testing.T) {
+	t.Run("status", func(t *testing.T) {
+		server := testServer(t)
+		resp := server.Handle(context.Background(), request(t, "status-1", "status", nil))
+		if !resp.OK {
+			t.Fatalf("response = %+v", resp)
+		}
+		var status Status
+		decodeResult(t, resp, &status)
+		if status.Hostname != "host-a" {
+			t.Fatalf("hostname = %q", status.Hostname)
+		}
+		lockPath := filepath.Join(server.StateDir, "locks", "host.lock")
+		if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("status created a host lock: %v", err)
+		}
+	})
+
+	t.Run("pull", func(t *testing.T) {
+		fake := &fakeDocker{}
+		server := testServer(t)
+		server.Docker = fake
+		resp := server.Handle(context.Background(), request(t, "pull-1", "pull", map[string]string{"image": "example/web:1"}))
+		if !resp.OK {
+			t.Fatalf("response = %+v", resp)
+		}
+		if want := []string{"pull:example/web:1"}; !reflect.DeepEqual(fake.calls, want) {
+			t.Fatalf("calls = %#v, want %#v", fake.calls, want)
+		}
+		if _, err := os.Stat(filepath.Join(server.StateDir, "locks", "host.lock")); err != nil {
+			t.Fatalf("pull host lock was not created: %v", err)
+		}
+	})
+
+	t.Run("write_file", func(t *testing.T) {
+		server := testServer(t)
+		target := filepath.Join(t.TempDir(), "registered.txt")
+		resp := server.Handle(context.Background(), request(t, "write-1", "write_file", WriteFileParams{
+			Path:    target,
+			Content: "registered",
+		}))
+		if !resp.OK {
+			t.Fatalf("response = %+v", resp)
+		}
+		data, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "registered" {
+			t.Fatalf("file data = %q", data)
+		}
+		if _, err := os.Stat(filepath.Join(server.StateDir, "locks", "host.lock")); err != nil {
+			t.Fatalf("write_file host lock was not created: %v", err)
+		}
+	})
 }
 
 func TestServeInvalidJSONReturnsStructuredError(t *testing.T) {
