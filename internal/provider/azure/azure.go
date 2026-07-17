@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/provider"
@@ -22,6 +25,9 @@ const (
 	computeAPI     = "2026-03-01"
 	networkAPI     = "2025-05-01"
 	armScope       = "https://management.azure.com/.default"
+
+	defaultOperationPollInterval = 2 * time.Second
+	defaultOperationTimeout      = 30 * time.Minute
 
 	LabelManagedBy   = provider.LabelManagedBy
 	LabelProject     = provider.LabelProject
@@ -40,6 +46,12 @@ type Client struct {
 	HTTP             *http.Client
 	BaseURL          string
 	TokenURLTemplate string
+	// PollInterval controls how often Azure long-running operations are checked
+	// when the service does not return Retry-After.
+	PollInterval time.Duration
+	// OperationTimeout bounds Azure long-running operations when the caller has
+	// no earlier deadline.
+	OperationTimeout time.Duration
 }
 
 type InstancePlan = provider.HostPlan
@@ -234,9 +246,16 @@ func (c Client) Delete(ctx context.Context, host provider.Host) error {
 	if err := c.DeleteVirtualMachine(ctx, name); err != nil {
 		return err
 	}
-	_ = c.DeleteNetworkInterface(ctx, networkInterfaceName(name))
-	_ = c.DeletePublicIPAddress(ctx, publicIPName(name))
-	return nil
+	nicName := networkInterfaceName(name)
+	publicIPAddressName := publicIPName(name)
+	var cleanupErrors []error
+	if err := c.DeleteNetworkInterface(ctx, nicName); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("network interface %q cleanup failed: %w", nicName, err))
+	}
+	if err := c.DeletePublicIPAddress(ctx, publicIPAddressName); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("public IP address %q cleanup failed: %w", publicIPAddressName, err))
+	}
+	return errors.Join(cleanupErrors...)
 }
 
 func (c Client) ListVirtualMachines(ctx context.Context, project, environment string) ([]VirtualMachine, error) {
@@ -399,39 +418,82 @@ func (c Client) DeleteVirtualMachine(ctx context.Context, name string) error {
 	if c.DryRun {
 		return nil
 	}
-	return c.do(ctx, http.MethodDelete, c.resourceGroupPath("providers/Microsoft.Compute/virtualMachines/"+url.PathEscape(name), computeAPI), nil, nil)
+	return c.deleteResource(
+		ctx,
+		c.resourceGroupPath("providers/Microsoft.Compute/virtualMachines/"+url.PathEscape(name), computeAPI),
+		fmt.Sprintf("virtual machine %q", name),
+		false,
+	)
 }
 
 func (c Client) DeleteNetworkInterface(ctx context.Context, name string) error {
 	if c.DryRun {
 		return nil
 	}
-	return c.do(ctx, http.MethodDelete, c.resourceGroupPath("providers/Microsoft.Network/networkInterfaces/"+url.PathEscape(name), networkAPI), nil, nil)
+	return c.deleteResource(
+		ctx,
+		c.resourceGroupPath("providers/Microsoft.Network/networkInterfaces/"+url.PathEscape(name), networkAPI),
+		fmt.Sprintf("network interface %q", name),
+		true,
+	)
 }
 
 func (c Client) DeletePublicIPAddress(ctx context.Context, name string) error {
 	if c.DryRun {
 		return nil
 	}
-	return c.do(ctx, http.MethodDelete, c.resourceGroupPath("providers/Microsoft.Network/publicIPAddresses/"+url.PathEscape(name), networkAPI), nil, nil)
+	return c.deleteResource(
+		ctx,
+		c.resourceGroupPath("providers/Microsoft.Network/publicIPAddresses/"+url.PathEscape(name), networkAPI),
+		fmt.Sprintf("public IP address %q", name),
+		true,
+	)
 }
 
 func (c Client) do(ctx context.Context, method, path string, body any, out any) error {
+	resp, err := c.request(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	if !resp.successful() {
+		return responseError(method, path, resp)
+	}
+	if out == nil || len(strings.TrimSpace(string(resp.Body))) == 0 {
+		return nil
+	}
+	return json.Unmarshal(resp.Body, out)
+}
+
+type azureResponse struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+func (r azureResponse) successful() bool {
+	return r.StatusCode >= 200 && r.StatusCode < 300
+}
+
+func (c Client) request(ctx context.Context, method, target string, body any) (azureResponse, error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return azureResponse{}, err
 		}
 		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.apiBase()+path, reader)
+	requestURL, err := c.resolveRequestURL(target)
 	if err != nil {
-		return err
+		return azureResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, reader)
+	if err != nil {
+		return azureResponse{}, err
 	}
 	token, err := c.bearerToken(ctx)
 	if err != nil {
-		return err
+		return azureResponse{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -441,17 +503,190 @@ func (c Client) do(ctx context.Context, method, path string, body any, out any) 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		return azureResponse{}, err
+	}
+	data, readErr := io.ReadAll(resp.Body)
+	closeErr := resp.Body.Close()
+	result := azureResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: data}
+	if readErr != nil {
+		return result, readErr
+	}
+	if closeErr != nil {
+		return result, closeErr
+	}
+	return result, nil
+}
+
+func responseError(method, target string, resp azureResponse) error {
+	return fmt.Errorf("azure %s %s failed: %s", method, target, strings.TrimSpace(string(resp.Body)))
+}
+
+func (c Client) deleteResource(ctx context.Context, path, resource string, notFoundOK bool) error {
+	resp, err := c.request(ctx, http.MethodDelete, path, nil)
+	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("azure %s %s failed: %s", method, path, strings.TrimSpace(string(data)))
-	}
-	if out == nil || len(strings.TrimSpace(string(data))) == 0 {
+	if notFoundOK && resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
-	return json.Unmarshal(data, out)
+	if !resp.successful() {
+		return responseError(http.MethodDelete, path, resp)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		return nil
+	}
+	operationURL := strings.TrimSpace(resp.Header.Get("Azure-AsyncOperation"))
+	if operationURL == "" {
+		operationURL = strings.TrimSpace(resp.Header.Get("Location"))
+	}
+	if operationURL == "" {
+		return fmt.Errorf("azure delete %s returned 202 without an operation URL", resource)
+	}
+	resolvedURL, err := c.resolveOperationURL(operationURL)
+	if err != nil {
+		return fmt.Errorf("azure delete %s returned an invalid operation URL: %w", resource, err)
+	}
+	return c.waitOperation(ctx, resolvedURL, resource)
+}
+
+type azureOperationError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type azureOperation struct {
+	Status string               `json:"status"`
+	Error  *azureOperationError `json:"error"`
+}
+
+func (c Client) waitOperation(ctx context.Context, operationURL, resource string) error {
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+	interval := c.PollInterval
+	if interval <= 0 {
+		interval = defaultOperationPollInterval
+	}
+	for {
+		resp, err := c.request(ctx, http.MethodGet, operationURL, nil)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
+		if !resp.successful() {
+			return fmt.Errorf("azure %s deletion operation request failed with status %d: %s", resource, resp.StatusCode, strings.TrimSpace(string(resp.Body)))
+		}
+		var operation azureOperation
+		if err := json.Unmarshal(resp.Body, &operation); err != nil {
+			return fmt.Errorf("decode azure %s deletion operation: %w", resource, err)
+		}
+		status := strings.TrimSpace(operation.Status)
+		if status == "" {
+			return fmt.Errorf("azure %s deletion operation response missing status", resource)
+		}
+		switch strings.ToLower(status) {
+		case "succeeded":
+			return nil
+		case "failed", "canceled":
+			return operationFailure(resource, status, operation.Error)
+		}
+
+		delay := interval
+		if retryDelay, ok := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()); ok {
+			delay = retryDelay
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func operationFailure(resource, status string, operationError *azureOperationError) error {
+	message := fmt.Sprintf("azure %s deletion operation status %s", resource, status)
+	if operationError == nil {
+		return errors.New(message)
+	}
+	code := strings.TrimSpace(operationError.Code)
+	detail := strings.TrimSpace(operationError.Message)
+	switch {
+	case code != "" && detail != "":
+		return fmt.Errorf("%s: %s: %s", message, code, detail)
+	case code != "":
+		return fmt.Errorf("%s: %s", message, code)
+	case detail != "":
+		return fmt.Errorf("%s: %s", message, detail)
+	default:
+		return errors.New(message)
+	}
+}
+
+func (c Client) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.OperationTimeout
+	if timeout <= 0 {
+		timeout = defaultOperationTimeout
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 && seconds <= int64((1<<63-1)/time.Second) {
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
+}
+
+func (c Client) resolveOperationURL(operationURL string) (string, error) {
+	return c.resolveRequestURL(operationURL)
+}
+
+func (c Client) resolveRequestURL(target string) (string, error) {
+	baseURL := c.apiBase()
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" {
+		return "", fmt.Errorf("invalid Azure API base URL")
+	}
+	reference, err := url.Parse(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid Azure request URL")
+	}
+	var resolved *url.URL
+	if strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "//") {
+		resolved, err = url.Parse(strings.TrimRight(baseURL, "/") + target)
+		if err != nil {
+			return "", fmt.Errorf("invalid Azure request URL")
+		}
+	} else {
+		baseCopy := *base
+		baseCopy.Path = strings.TrimRight(baseCopy.Path, "/") + "/"
+		resolved = baseCopy.ResolveReference(reference)
+	}
+	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+		return "", fmt.Errorf("Azure request URL must use HTTP or HTTPS")
+	}
+	if !strings.EqualFold(resolved.Scheme, base.Scheme) || !strings.EqualFold(resolved.Host, base.Host) {
+		return "", fmt.Errorf("Azure request URL must use the configured API origin")
+	}
+	return resolved.String(), nil
 }
 
 func (c Client) bearerToken(ctx context.Context) (string, error) {
