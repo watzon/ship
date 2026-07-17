@@ -13,7 +13,9 @@ import (
 	"time"
 
 	accessorypkg "github.com/watzon/ship/internal/accessory"
+	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/deployment"
 	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/provider/hetzner"
 	"github.com/watzon/ship/internal/scheduler"
@@ -226,12 +228,57 @@ type migrateFailureHarness struct {
 	path             string
 	store            state.Store
 	events           []string
+	agentCalls       []migrateAgentCall
+	agentFailure     func(migrateAgentCall) error
 	infra            *acceptanceFakeInfra
 	provider         *acceptanceHetznerAPI
 	initialFacts     []state.HostFact
 	initialAccessory state.AccessoryState
 	initialRelease   state.Release
 	initialCreated   int
+}
+
+type migrateAgentCall struct {
+	Host      scheduler.Host
+	Method    string
+	Container string
+}
+
+type migrateFailurePoint string
+
+const (
+	migrateFailCreate               migrateFailurePoint = "provider create"
+	migrateFailPublicAddress        migrateFailurePoint = "public address"
+	migrateFailBinaryResolve        migrateFailurePoint = "binary resolve"
+	migrateFailBootstrap            migrateFailurePoint = "bootstrap"
+	migrateFailReplacementPreflight migrateFailurePoint = "replacement preflight"
+	migrateFailAccessoryBackup      migrateFailurePoint = "accessory backup"
+	migrateFailArtifactCopy         migrateFailurePoint = "artifact copy"
+	migrateFailAccessoryRestore     migrateFailurePoint = "accessory restore"
+	migrateFailOldAccessoryStop     migrateFailurePoint = "old accessory stop"
+	migrateFailHostFactRepoint      migrateFailurePoint = "host fact repoint"
+	migrateFailHostsAfterRepoint    migrateFailurePoint = "hosts after repoint"
+	migrateFailServiceRollout       migrateFailurePoint = "service rollout"
+	migrateFailAccessoryRestart     migrateFailurePoint = "accessory restart"
+	migrateFailOldWorkloadStop      migrateFailurePoint = "old workload stop"
+	migrateFailProviderDelete       migrateFailurePoint = "provider delete"
+)
+
+type migrateFailingBootstrapSSH struct {
+	delegate bootstrapSSH
+	failed   *bool
+}
+
+func (s migrateFailingBootstrapSSH) Run(ctx context.Context, command string) (string, error) {
+	if strings.TrimSpace(command) != "true" && !*s.failed {
+		*s.failed = true
+		return "", errors.New("injected bootstrap failure")
+	}
+	return s.delegate.Run(ctx, command)
+}
+
+func (s migrateFailingBootstrapSSH) RunWithStdin(ctx context.Context, command, stdin string) (string, error) {
+	return s.delegate.RunWithStdin(ctx, command, stdin)
 }
 
 func newMigrateFailureHarness(t *testing.T) *migrateFailureHarness {
@@ -245,11 +292,12 @@ func newMigrateFailureHarness(t *testing.T) *migrateFailureHarness {
 
 	h := &migrateFailureHarness{t: t, path: path}
 	h.infra = newAcceptanceFakeInfra(t, &h.events)
-	installAcceptanceDeployHooks(t, &acceptanceDocker{events: &h.events}, h.infra.agent)
+	installAcceptanceDeployHooks(t, &acceptanceDocker{events: &h.events}, h.agent)
 	installBootstrapHooks(t, &h.events)
 	installMigrateCopyHooks(t, &h.events)
 
 	h.provider = newAcceptanceHetznerAPI(t)
+	h.provider.events = &h.events
 	originalProvider := newEnvironmentProvider
 	newEnvironmentProvider = func(_ config.Environment, dryRun bool) (providerpkg.Provider, error) {
 		return hetzner.Client{
@@ -276,7 +324,140 @@ func newMigrateFailureHarness(t *testing.T) *migrateFailureHarness {
 		t.Fatal(err)
 	}
 	h.initialCreated = len(h.provider.createdIDs)
+	h.events = nil
+	h.agentCalls = nil
 	return h
+}
+
+func (h *migrateFailureHarness) agent(host scheduler.Host) deployAgent {
+	delegate := h.infra.agent(host)
+	return deployAgentFunc(func(ctx context.Context, method string, params any, out any) error {
+		call := migrateAgentCall{Host: host, Method: method, Container: migrateAgentContainer(method, params)}
+		h.agentCalls = append(h.agentCalls, call)
+		if h.agentFailure != nil {
+			if err := h.agentFailure(call); err != nil {
+				h.events = append(h.events, fmt.Sprintf("agent-failure:%s:%s:%s:%s", host.Name, host.ContactTarget(), method, call.Container))
+				return err
+			}
+		}
+		return delegate.Call(ctx, method, params, out)
+	})
+}
+
+func migrateAgentContainer(method string, params any) string {
+	switch method {
+	case "run_container":
+		if value, ok := params.(agent.RunContainerParams); ok {
+			return value.Name
+		}
+	case "stop_container":
+		if value, ok := params.(map[string]string); ok {
+			return value["name"]
+		}
+	}
+	return ""
+}
+
+func (h *migrateFailureHarness) inject(point migrateFailurePoint, hostName string) {
+	h.t.Helper()
+	oldContact := h.initialFact(hostName).PublicAddress
+	switch point {
+	case migrateFailCreate:
+		h.provider.failCreate = true
+	case migrateFailPublicAddress:
+		h.provider.createWithoutPublicAddress = true
+	case migrateFailBinaryResolve:
+		original := resolveShipBinaryForHost
+		resolveShipBinaryForHost = func(context.Context, scheduler.Host, *options) ([]byte, error) {
+			return nil, errors.New("injected binary resolution failure")
+		}
+		h.t.Cleanup(func() { resolveShipBinaryForHost = original })
+	case migrateFailBootstrap:
+		original := newBootstrapSSH
+		failed := false
+		newBootstrapSSH = func(host scheduler.Host, dryRun bool) bootstrapSSH {
+			return migrateFailingBootstrapSSH{delegate: original(host, dryRun), failed: &failed}
+		}
+		h.t.Cleanup(func() { newBootstrapSSH = original })
+	case migrateFailReplacementPreflight:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "negotiate" && call.Host.ContactTarget() != oldContact {
+				return errors.New("injected replacement preflight failure")
+			}
+			return nil
+		}
+	case migrateFailAccessoryBackup:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "accessory_backup" && call.Host.ContactTarget() == oldContact {
+				return errors.New("injected accessory backup failure")
+			}
+			return nil
+		}
+	case migrateFailArtifactCopy:
+		original := copyRemoteArtifact
+		copyRemoteArtifact = func(context.Context, scheduler.Host, string, scheduler.Host, string, bool) error {
+			h.events = append(h.events, "copy-artifact:injected-failure")
+			return errors.New("injected artifact copy failure")
+		}
+		h.t.Cleanup(func() { copyRemoteArtifact = original })
+	case migrateFailAccessoryRestore:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "accessory_restore" && call.Host.ContactTarget() != oldContact {
+				return errors.New("injected accessory restore failure")
+			}
+			return nil
+		}
+	case migrateFailOldAccessoryStop:
+		containerName := accessorypkg.ContainerName("sample", "production", "postgres")
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "stop_container" && call.Container == containerName && call.Host.ContactTarget() == oldContact {
+				return errors.New("injected old accessory stop failure")
+			}
+			return nil
+		}
+	case migrateFailHostFactRepoint:
+		original := migrateRepointHostFact
+		migrateRepointHostFact = func(state.Store, string, scheduler.Host, string, providerpkg.Host) (state.HostFact, error) {
+			return state.HostFact{}, errors.New("injected host-fact repoint failure")
+		}
+		h.t.Cleanup(func() { migrateRepointHostFact = original })
+	case migrateFailHostsAfterRepoint:
+		original := migrateResolvedHostsForEnvironment
+		calls := 0
+		migrateResolvedHostsForEnvironment = func(store state.Store, envName string, env config.Environment) ([]scheduler.Host, error) {
+			calls++
+			if calls == 2 {
+				return nil, errors.New("injected host re-resolution failure")
+			}
+			return original(store, envName, env)
+		}
+		h.t.Cleanup(func() { migrateResolvedHostsForEnvironment = original })
+	case migrateFailServiceRollout:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "run_container" && call.Host.ContactTarget() != oldContact && strings.Contains(call.Container, "_web_1_") {
+				return errors.New("injected service rollout failure")
+			}
+			return nil
+		}
+	case migrateFailAccessoryRestart:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "run_container" && strings.Contains(call.Container, "_web_") {
+				return errors.New("injected accessory restart failure")
+			}
+			return nil
+		}
+	case migrateFailOldWorkloadStop:
+		h.agentFailure = func(call migrateAgentCall) error {
+			if call.Method == "stop_container" && call.Host.ContactTarget() == oldContact && strings.Contains(call.Container, "_web_1_") {
+				return errors.New("injected old workload stop failure")
+			}
+			return nil
+		}
+	case migrateFailProviderDelete:
+		h.provider.failDelete = true
+	default:
+		h.t.Fatalf("unknown migration failure point %q", point)
+	}
 }
 
 func (h *migrateFailureHarness) fact(name string) state.HostFact {
@@ -315,6 +496,115 @@ func (h *migrateFailureHarness) hasContainer(contact, name string) bool {
 	return false
 }
 
+func (h *migrateFailureHarness) replacement(hostName string) (hetzner.Server, bool) {
+	h.t.Helper()
+	for name, server := range h.provider.servers {
+		if strings.HasPrefix(name, hostName+"-m") {
+			return server, true
+		}
+	}
+	return hetzner.Server{}, false
+}
+
+func (h *migrateFailureHarness) assertInitialFacts() {
+	h.t.Helper()
+	facts, err := h.store.ReadHostFacts("production")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if !reflect.DeepEqual(facts, h.initialFacts) {
+		h.t.Fatalf("host facts changed: got %+v, want %+v", facts, h.initialFacts)
+	}
+}
+
+func (h *migrateFailureHarness) assertReleaseUnchanged() {
+	h.t.Helper()
+	current, err := h.store.CurrentRelease("production")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current, h.initialRelease) {
+		h.t.Fatalf("current release changed: got %+v, want %+v", current, h.initialRelease)
+	}
+}
+
+func (h *migrateFailureHarness) assertAccessoryHost(contact string, wantOldRunning, wantReplacementRunning bool) {
+	h.t.Helper()
+	saved, err := h.store.ReadAccessoryState("production", "postgres")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if saved.Host.PublicAddress != contact {
+		h.t.Fatalf("accessory state contact = %q, want %q: %+v", saved.Host.PublicAddress, contact, saved)
+	}
+	containerName := accessorypkg.ContainerName("sample", "production", "postgres")
+	oldContact := h.initialAccessory.Host.PublicAddress
+	if got := h.hasContainer(oldContact, containerName); got != wantOldRunning {
+		h.t.Fatalf("old accessory running on %s = %t, want %t", oldContact, got, wantOldRunning)
+	}
+	if replacement, ok := h.replacement("data-1"); ok && replacement.PublicNet.IPv4.IP != "" {
+		newContact := replacement.PublicNet.IPv4.IP
+		if got := h.hasContainer(newContact, containerName); got != wantReplacementRunning {
+			h.t.Fatalf("replacement accessory running on %s = %t, want %t", newContact, got, wantReplacementRunning)
+		}
+	} else if wantReplacementRunning {
+		h.t.Fatal("replacement accessory should be running, but no addressed replacement exists")
+	}
+}
+
+func (h *migrateFailureHarness) assertMigrateEvent(status, message string) {
+	h.t.Helper()
+	events, err := h.store.Events("production")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var matches []state.Event
+	for _, event := range events {
+		if event.Kind == "migrate" {
+			matches = append(matches, event)
+		}
+	}
+	if len(matches) != 2 {
+		h.t.Fatalf("migrate events = %+v, want started and %s", matches, status)
+	}
+	if matches[0].Status != "started" || matches[1].Status != status {
+		h.t.Fatalf("migrate event statuses = %+v, want started then %s", matches, status)
+	}
+	if message != "" && !strings.Contains(matches[1].Message, message) {
+		h.t.Fatalf("migrate event message = %q, want %q", matches[1].Message, message)
+	}
+}
+
+func (h *migrateFailureHarness) assertNoProviderDelete() {
+	h.t.Helper()
+	if len(h.provider.deletedIDs) != 0 {
+		h.t.Fatalf("provider deleted server IDs: %v", h.provider.deletedIDs)
+	}
+	if eventIndexContaining(h.events, "provider:delete-attempt:") >= 0 {
+		h.t.Fatalf("provider delete was attempted: %v", h.events)
+	}
+}
+
+func (h *migrateFailureHarness) assertProviderBothRemain(hostName string) hetzner.Server {
+	h.t.Helper()
+	if _, ok := h.provider.servers[hostName]; !ok {
+		h.t.Fatalf("old provider server %s is absent: %+v", hostName, h.provider.servers)
+	}
+	replacement, ok := h.replacement(hostName)
+	if !ok {
+		h.t.Fatalf("replacement provider server for %s is absent: %+v", hostName, h.provider.servers)
+	}
+	if got, want := len(h.provider.createdIDs), h.initialCreated+1; got != want {
+		h.t.Fatalf("created provider server IDs = %v, want %d entries", h.provider.createdIDs, want)
+	}
+	return replacement
+}
+
+func (h *migrateFailureHarness) serviceContainer(service string, replica int) string {
+	h.t.Helper()
+	return deployment.ContainerName("sample", "production", service, replica, h.initialRelease.ID)
+}
+
 func eventIndexContaining(events []string, needle string) int {
 	for i, event := range events {
 		if strings.Contains(event, needle) {
@@ -333,15 +623,109 @@ func outputLineWithPrefix(output, prefix string) string {
 	return ""
 }
 
+func TestMigrateFailureBeforeRepoint(t *testing.T) {
+	tests := []struct {
+		name                 string
+		point                migrateFailurePoint
+		host                 string
+		wantError            string
+		wantReplacement      bool
+		wantBootstrap        bool
+		wantReplacementAgent bool
+		wantReplacementAcc   bool
+	}{
+		{name: "provider create", point: migrateFailCreate, host: "web-1", wantError: "create replacement server"},
+		{name: "missing public address", point: migrateFailPublicAddress, host: "web-1", wantError: "has no public address", wantReplacement: true},
+		{name: "binary resolution", point: migrateFailBinaryResolve, host: "web-1", wantError: "injected binary resolution failure", wantReplacement: true},
+		{name: "bootstrap", point: migrateFailBootstrap, host: "web-1", wantError: "injected bootstrap failure", wantReplacement: true, wantBootstrap: true},
+		{name: "replacement preflight", point: migrateFailReplacementPreflight, host: "web-1", wantError: "injected replacement preflight failure", wantReplacement: true, wantBootstrap: true, wantReplacementAgent: true},
+		{name: "accessory backup", point: migrateFailAccessoryBackup, host: "data-1", wantError: "injected accessory backup failure", wantReplacement: true, wantBootstrap: true, wantReplacementAgent: true},
+		{name: "artifact copy", point: migrateFailArtifactCopy, host: "data-1", wantError: "injected artifact copy failure", wantReplacement: true, wantBootstrap: true, wantReplacementAgent: true},
+		{name: "accessory restore", point: migrateFailAccessoryRestore, host: "data-1", wantError: "injected accessory restore failure", wantReplacement: true, wantBootstrap: true, wantReplacementAgent: true, wantReplacementAcc: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newMigrateFailureHarness(t)
+			h.inject(tt.point, tt.host)
+
+			out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", tt.host, "--yes")
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("migration error = %v, want %q\n%s", err, tt.wantError, out)
+			}
+			h.assertInitialFacts()
+			h.assertReleaseUnchanged()
+			h.assertMigrateEvent("failed", tt.wantError)
+			h.assertNoProviderDelete()
+			h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, tt.wantReplacementAcc)
+			if _, ok := h.provider.servers[tt.host]; !ok {
+				t.Fatalf("old provider server %s is absent: %+v", tt.host, h.provider.servers)
+			}
+			baselineWebContainer := h.serviceContainer("web", 1)
+			baselineWebContact := h.initialFact("web-1").PublicAddress
+			if !h.hasContainer(baselineWebContact, baselineWebContainer) {
+				t.Fatalf("baseline service container %s changed before repoint", baselineWebContainer)
+			}
+
+			oldFact := h.initialFact(tt.host)
+			if tt.host == "web-1" {
+				oldContainer := h.serviceContainer("web", 1)
+				if !h.hasContainer(oldFact.PublicAddress, oldContainer) {
+					t.Fatalf("old service container %s was moved or stopped", oldContainer)
+				}
+			}
+
+			replacement, replacementExists := h.replacement(tt.host)
+			if replacementExists != tt.wantReplacement {
+				t.Fatalf("replacement exists = %t, want %t: %+v", replacementExists, tt.wantReplacement, h.provider.servers)
+			}
+			if tt.wantReplacement {
+				h.assertProviderBothRemain(tt.host)
+				note := outputLineWithPrefix(out, "note: replacement server ")
+				if !strings.Contains(note, replacement.Name) || !strings.Contains(note, "delete it there before retrying") {
+					t.Fatalf("recovery note does not identify the disposable replacement:\n%s", out)
+				}
+				if tt.host == "web-1" && replacement.PublicNet.IPv4.IP != "" && h.hasContainer(replacement.PublicNet.IPv4.IP, h.serviceContainer("web", 1)) {
+					t.Fatalf("service moved to replacement before repoint: %v", h.events)
+				}
+			} else {
+				if got := len(h.provider.createdIDs); got != h.initialCreated {
+					t.Fatalf("provider created IDs = %v after create failure", h.provider.createdIDs)
+				}
+				if got := len(h.provider.servers); got != h.initialCreated {
+					t.Fatalf("provider inventory size = %d after create failure, want %d", got, h.initialCreated)
+				}
+				if strings.Contains(out, "note: replacement server") {
+					t.Fatalf("create failure claimed a replacement exists:\n%s", out)
+				}
+			}
+
+			if eventIndexContaining(h.events, "bootstrap:"+tt.host+":") >= 0 != tt.wantBootstrap {
+				t.Fatalf("bootstrap trace mismatch for %s: %v", tt.point, h.events)
+			}
+			var sourcePreflight, replacementPreflight bool
+			for _, call := range h.agentCalls {
+				if call.Method != "negotiate" || call.Host.Name != tt.host {
+					continue
+				}
+				if call.Host.ContactTarget() == oldFact.PublicAddress {
+					sourcePreflight = true
+				} else {
+					replacementPreflight = true
+				}
+			}
+			if !sourcePreflight || replacementPreflight != tt.wantReplacementAgent {
+				t.Fatalf("protocol preflight calls = %+v, want source=true replacement=%t", h.agentCalls, tt.wantReplacementAgent)
+			}
+		})
+	}
+}
+
 func TestMigrateAccessoryFailureAfterStateSaveReportsResidualState(t *testing.T) {
 	h := newMigrateFailureHarness(t)
 	migrationEventsStart := len(h.events)
 
-	originalRepoint := migrateRepointHostFact
-	migrateRepointHostFact = func(state.Store, string, scheduler.Host, string, providerpkg.Host) (state.HostFact, error) {
-		return state.HostFact{}, errors.New("injected host-fact repoint failure")
-	}
-	t.Cleanup(func() { migrateRepointHostFact = originalRepoint })
+	h.inject(migrateFailHostFactRepoint, "data-1")
 
 	out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "data-1", "--yes")
 	if err == nil || !strings.Contains(err.Error(), "injected host-fact repoint failure") {
@@ -431,6 +815,33 @@ func TestMigrateAccessoryFailureAfterStateSaveReportsResidualState(t *testing.T)
 	}
 }
 
+func TestMigrateAccessoryFailureAfterRestoreBeforeStateSave(t *testing.T) {
+	h := newMigrateFailureHarness(t)
+	h.inject(migrateFailOldAccessoryStop, "data-1")
+
+	out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "data-1", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "injected old accessory stop failure") {
+		t.Fatalf("migration error = %v, want old accessory stop failure\n%s", err, out)
+	}
+	h.assertInitialFacts()
+	h.assertReleaseUnchanged()
+	h.assertMigrateEvent("failed", "injected old accessory stop failure")
+	h.assertNoProviderDelete()
+	replacement := h.assertProviderBothRemain("data-1")
+	h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, true)
+
+	containerName := accessorypkg.ContainerName("sample", "production", "postgres")
+	restoreAt := eventIndexContaining(h.events, "agent:data-1:accessory_restore")
+	stopFailureAt := eventIndexContaining(h.events, "agent-failure:data-1:"+h.initialAccessory.Host.PublicAddress+":stop_container:"+containerName)
+	if restoreAt < 0 || stopFailureAt <= restoreAt {
+		t.Fatalf("restore and old stop ordering = %v", h.events)
+	}
+	note := outputLineWithPrefix(out, "note: replacement server ")
+	if !strings.Contains(note, replacement.Name) || !strings.Contains(note, "delete it there before retrying") {
+		t.Fatalf("recovery output does not direct cleanup of the disposable restored replacement:\n%s", out)
+	}
+}
+
 func TestMigrateAccessoryResidualHint(t *testing.T) {
 	created := providerpkg.Host{Name: "data-1-m20260717010101", PublicAddress: "192.0.2.5"}
 	source := scheduler.Host{Contact: "192.0.2.1"}
@@ -459,6 +870,241 @@ func TestMigrateAccessoryResidualHint(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMigrateFailureAfterRepoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		point     migrateFailurePoint
+		host      string
+		wantError string
+	}{
+		{name: "host re-resolution", point: migrateFailHostsAfterRepoint, host: "web-1", wantError: "injected host re-resolution failure"},
+		{name: "service rollout", point: migrateFailServiceRollout, host: "web-1", wantError: "injected service rollout failure"},
+		{name: "service restart after accessory move", point: migrateFailAccessoryRestart, host: "data-1", wantError: "injected accessory restart failure"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newMigrateFailureHarness(t)
+			h.inject(tt.point, tt.host)
+			oldContact := h.initialFact(tt.host).PublicAddress
+
+			out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", tt.host, "--yes")
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("migration error = %v, want %q\n%s", err, tt.wantError, out)
+			}
+			replacement := h.assertProviderBothRemain(tt.host)
+			newContact := replacement.PublicNet.IPv4.IP
+			fact := h.fact(tt.host)
+			if fact.PublicAddress != newContact || fact.ProviderName != replacement.Name {
+				t.Fatalf("host fact does not point at replacement: fact=%+v replacement=%+v", fact, replacement)
+			}
+			h.assertReleaseUnchanged()
+			h.assertMigrateEvent("failed", tt.wantError)
+			h.assertNoProviderDelete()
+
+			if tt.host == "data-1" {
+				h.assertAccessoryHost(newContact, false, true)
+			} else {
+				h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, false)
+			}
+
+			oldServiceHost := h.initialFact("web-1").PublicAddress
+			oldService := h.serviceContainer("web", 1)
+			if !h.hasContainer(oldServiceHost, oldService) {
+				t.Fatalf("old workload %s stopped before %s completed: %v", oldService, tt.point, h.events)
+			}
+			if tt.host == "web-1" && h.hasContainer(newContact, oldService) {
+				t.Fatalf("failed boundary left a completed replacement rollout for %s", oldService)
+			}
+
+			note := outputLineWithPrefix(out, "note: host ")
+			for _, want := range []string{"ship deploy production", oldContact, newContact} {
+				if !strings.Contains(note, want) {
+					t.Fatalf("post-repoint recovery note missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
+}
+
+func TestMigrateFinalCleanup(t *testing.T) {
+	t.Run("old workload stop warns and deletion continues", func(t *testing.T) {
+		h := newMigrateFailureHarness(t)
+		h.inject(migrateFailOldWorkloadStop, "web-1")
+		oldFact := h.initialFact("web-1")
+		oldServerID := h.provider.servers["web-1"].ID
+
+		out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "web-1", "--yes")
+		if err != nil {
+			t.Fatalf("migration failed after old workload warning: %v\n%s", err, out)
+		}
+		replacement, ok := h.replacement("web-1")
+		if !ok {
+			t.Fatalf("replacement missing: %+v", h.provider.servers)
+		}
+		if _, ok := h.provider.servers["web-1"]; ok {
+			t.Fatalf("old provider server remains after warning-only stop failure: %+v", h.provider.servers)
+		}
+		if !reflect.DeepEqual(h.provider.deletedIDs, []int64{oldServerID}) {
+			t.Fatalf("deleted provider IDs = %v, want [%d]", h.provider.deletedIDs, oldServerID)
+		}
+		fact := h.fact("web-1")
+		if fact.PublicAddress != replacement.PublicNet.IPv4.IP {
+			t.Fatalf("host fact = %+v, want replacement %s", fact, replacement.PublicNet.IPv4.IP)
+		}
+		h.assertReleaseUnchanged()
+		h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, false)
+		h.assertMigrateEvent("succeeded", "server "+oldFact.PublicAddress+" -> "+replacement.PublicNet.IPv4.IP)
+
+		containerName := h.serviceContainer("web", 1)
+		if !h.hasContainer(oldFact.PublicAddress, containerName) || !h.hasContainer(replacement.PublicNet.IPv4.IP, containerName) {
+			t.Fatalf("warning residual containers are wrong: old=%t new=%t", h.hasContainer(oldFact.PublicAddress, containerName), h.hasContainer(replacement.PublicNet.IPv4.IP, containerName))
+		}
+		for _, want := range []string{"warning: stop container " + containerName, "deleted old server web-1", "migrated host web-1"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("cleanup output missing %q:\n%s", want, out)
+			}
+		}
+		runAt := eventIndexContaining(h.events, "agent:web-1:run:"+containerName)
+		stopFailureAt := eventIndexContaining(h.events, "agent-failure:web-1:"+oldFact.PublicAddress+":stop_container:"+containerName)
+		deleteAt := eventIndexContaining(h.events, fmt.Sprintf("provider:deleted:%d:web-1", oldServerID))
+		if runAt < 0 || stopFailureAt <= runAt || deleteAt <= stopFailureAt {
+			t.Fatalf("rollout, stop warning, delete order = %v", h.events)
+		}
+	})
+
+	t.Run("provider deletion failure preserves both servers", func(t *testing.T) {
+		h := newMigrateFailureHarness(t)
+		h.inject(migrateFailProviderDelete, "web-1")
+		oldFact := h.initialFact("web-1")
+		oldServerID := h.provider.servers["web-1"].ID
+
+		out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "web-1", "--yes")
+		if err == nil || !strings.Contains(err.Error(), "delete old server") {
+			t.Fatalf("migration error = %v, want provider delete failure\n%s", err, out)
+		}
+		replacement := h.assertProviderBothRemain("web-1")
+		if len(h.provider.deletedIDs) != 0 {
+			t.Fatalf("provider deleted IDs despite injected failure: %v", h.provider.deletedIDs)
+		}
+		fact := h.fact("web-1")
+		if fact.PublicAddress != replacement.PublicNet.IPv4.IP {
+			t.Fatalf("host fact = %+v, want replacement %s", fact, replacement.PublicNet.IPv4.IP)
+		}
+		h.assertReleaseUnchanged()
+		h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, false)
+		h.assertMigrateEvent("failed", "delete old server")
+
+		containerName := h.serviceContainer("web", 1)
+		if h.hasContainer(oldFact.PublicAddress, containerName) || !h.hasContainer(replacement.PublicNet.IPv4.IP, containerName) {
+			t.Fatalf("delete failure workload state is wrong: old=%t new=%t", h.hasContainer(oldFact.PublicAddress, containerName), h.hasContainer(replacement.PublicNet.IPv4.IP, containerName))
+		}
+		note := outputLineWithPrefix(out, "note: host ")
+		for _, want := range []string{"ship deploy production", oldFact.PublicAddress, replacement.PublicNet.IPv4.IP} {
+			if !strings.Contains(note, want) {
+				t.Fatalf("delete failure recovery note missing %q:\n%s", want, out)
+			}
+		}
+		stopAt := eventIndexContaining(h.events, "agent:web-1:stop:"+containerName)
+		deleteAttemptAt := eventIndexContaining(h.events, fmt.Sprintf("provider:delete-attempt:%d:web-1", oldServerID))
+		if stopAt < 0 || deleteAttemptAt <= stopAt {
+			t.Fatalf("old workload stop and failed delete order = %v", h.events)
+		}
+	})
+
+	t.Run("keep server stops workloads without deletion", func(t *testing.T) {
+		h := newMigrateFailureHarness(t)
+		oldFact := h.initialFact("web-1")
+
+		out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "web-1", "--yes", "--keep-server")
+		if err != nil {
+			t.Fatalf("keep-server migration failed: %v\n%s", err, out)
+		}
+		replacement := h.assertProviderBothRemain("web-1")
+		h.assertNoProviderDelete()
+		fact := h.fact("web-1")
+		if fact.PublicAddress != replacement.PublicNet.IPv4.IP {
+			t.Fatalf("host fact = %+v, want replacement %s", fact, replacement.PublicNet.IPv4.IP)
+		}
+		h.assertReleaseUnchanged()
+		h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, false)
+		h.assertMigrateEvent("succeeded", "server "+oldFact.PublicAddress+" -> "+replacement.PublicNet.IPv4.IP)
+
+		containerName := h.serviceContainer("web", 1)
+		if h.hasContainer(oldFact.PublicAddress, containerName) || !h.hasContainer(replacement.PublicNet.IPv4.IP, containerName) {
+			t.Fatalf("keep-server workload state is wrong: old=%t new=%t", h.hasContainer(oldFact.PublicAddress, containerName), h.hasContainer(replacement.PublicNet.IPv4.IP, containerName))
+		}
+		for _, want := range []string{"keeping old server web-1 (" + oldFact.PublicAddress + ")", "will report it as extra", "migrated host web-1"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("keep-server output missing %q:\n%s", want, out)
+			}
+		}
+	})
+}
+
+func TestMigrateFailureRecovery(t *testing.T) {
+	h := newMigrateFailureHarness(t)
+	h.inject(migrateFailServiceRollout, "web-1")
+	oldFact := h.initialFact("web-1")
+	oldContainer := h.serviceContainer("web", 1)
+
+	migrateOut, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "web-1", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "injected service rollout failure") {
+		t.Fatalf("migration error = %v, want rollout failure\n%s", err, migrateOut)
+	}
+	replacement := h.assertProviderBothRemain("web-1")
+	newContact := replacement.PublicNet.IPv4.IP
+	if fact := h.fact("web-1"); fact.PublicAddress != newContact {
+		t.Fatalf("post-failure fact = %+v, want replacement %s", fact, newContact)
+	}
+	h.assertReleaseUnchanged()
+	h.assertAccessoryHost(h.initialAccessory.Host.PublicAddress, true, false)
+	h.assertMigrateEvent("failed", "injected service rollout failure")
+	h.assertNoProviderDelete()
+	if !h.hasContainer(oldFact.PublicAddress, oldContainer) || h.hasContainer(newContact, oldContainer) {
+		t.Fatalf("pre-recovery containers are wrong: old=%t new=%t", h.hasContainer(oldFact.PublicAddress, oldContainer), h.hasContainer(newContact, oldContainer))
+	}
+	note := outputLineWithPrefix(migrateOut, "note: host ")
+	for _, want := range []string{"ship deploy production", oldFact.PublicAddress, newContact} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("migration recovery note missing %q:\n%s", want, migrateOut)
+		}
+	}
+
+	h.agentFailure = nil
+	recoveryOut, err := runAcceptanceCommandError(t, deployCmd(&options{configPath: h.path}), "production")
+	if err != nil {
+		t.Fatalf("documented recovery deploy failed: %v\n%s", err, recoveryOut)
+	}
+	current, err := h.store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ID == h.initialRelease.ID || current.Status != state.ReleaseStatusHealthy {
+		t.Fatalf("recovery release = %+v, want a new healthy release after %s", current, h.initialRelease.ID)
+	}
+	if fact := h.fact("web-1"); fact.PublicAddress != newContact || fact.ProviderName != replacement.Name {
+		t.Fatalf("recovery changed replacement host fact: %+v", fact)
+	}
+	newContainer := deployment.ContainerName("sample", "production", "web", 1, current.ID)
+	if !h.hasContainer(newContact, newContainer) {
+		t.Fatalf("recovery did not start %s on replacement %s: %v", newContainer, newContact, h.events)
+	}
+	if h.hasContainer(oldFact.PublicAddress, newContainer) {
+		t.Fatalf("recovery started current container %s on old server %s", newContainer, oldFact.PublicAddress)
+	}
+	if !h.hasContainer(oldFact.PublicAddress, oldContainer) {
+		t.Fatalf("recovery unexpectedly mutated unreachable old server %s", oldFact.PublicAddress)
+	}
+	if _, ok := h.provider.servers["web-1"]; !ok {
+		t.Fatalf("recovery deleted old provider server: %+v", h.provider.servers)
+	}
+	if _, ok := h.replacement("web-1"); !ok {
+		t.Fatalf("recovery deleted replacement provider server: %+v", h.provider.servers)
+	}
+	h.assertNoProviderDelete()
 }
 
 func TestAcceptanceMigrateHostWorkflow(t *testing.T) {

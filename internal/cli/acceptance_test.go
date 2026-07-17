@@ -573,15 +573,19 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 }
 
 type acceptanceHetznerAPI struct {
-	t          *testing.T
-	server     *httptest.Server
-	servers    map[string]hetzner.Server
-	created    []string
-	createdIDs []int64
-	deleted    []string
-	deletedIDs []int64
-	nextID     int64
-	nextAction int64
+	t                          *testing.T
+	server                     *httptest.Server
+	servers                    map[string]hetzner.Server
+	created                    []string
+	createdIDs                 []int64
+	deleted                    []string
+	deletedIDs                 []int64
+	events                     *[]string
+	failCreate                 bool
+	createWithoutPublicAddress bool
+	failDelete                 bool
+	nextID                     int64
+	nextAction                 int64
 }
 
 func newAcceptanceHetznerAPI(t *testing.T) *acceptanceHetznerAPI {
@@ -638,6 +642,14 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			api.t.Fatal(err)
 		}
+		if api.events != nil {
+			*api.events = append(*api.events, "provider:create-attempt:"+req.Name)
+		}
+		if api.failCreate {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "injected_create_failure", "message": "injected provider create failure"}})
+			return
+		}
 		privateNet := make([]hetzner.PrivateNet, 0, len(req.Networks))
 		for _, networkID := range req.Networks {
 			privateNet = append(privateNet, hetzner.PrivateNet{Network: networkID})
@@ -650,19 +662,26 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		}
 		api.nextID++
 		api.nextAction++
+		publicAddress := "192.0.2." + strconv.FormatInt(api.nextID-100, 10)
+		if api.createWithoutPublicAddress {
+			publicAddress = ""
+		}
 		server := hetzner.Server{
 			ID:         api.nextID,
 			Name:       req.Name,
 			Labels:     req.Labels,
 			PrivateNet: privateNet,
 			PublicNet: hetzner.PublicNet{
-				IPv4:      hetzner.PublicIPv4{IP: "192.0.2." + strconv.FormatInt(api.nextID-100, 10)},
+				IPv4:      hetzner.PublicIPv4{IP: publicAddress},
 				Firewalls: firewalls,
 			},
 		}
 		api.servers[req.Name] = server
 		api.created = append(api.created, req.Name)
 		api.createdIDs = append(api.createdIDs, server.ID)
+		if api.events != nil {
+			*api.events = append(*api.events, fmt.Sprintf("provider:created:%d:%s", server.ID, server.Name))
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server": server,
 			"action": map[string]any{"id": api.nextAction, "status": "running"},
@@ -678,9 +697,20 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		}
 		for name, server := range api.servers {
 			if server.ID == id {
+				if api.events != nil {
+					*api.events = append(*api.events, fmt.Sprintf("provider:delete-attempt:%d:%s", id, name))
+				}
+				if api.failDelete {
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "injected_delete_failure", "message": "injected provider delete failure"}})
+					return
+				}
 				delete(api.servers, name)
 				api.deleted = append(api.deleted, name)
 				api.deletedIDs = append(api.deletedIDs, id)
+				if api.events != nil {
+					*api.events = append(*api.events, fmt.Sprintf("provider:deleted:%d:%s", id, name))
+				}
 				api.nextAction++
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"action": map[string]any{"id": api.nextAction, "status": "success"},

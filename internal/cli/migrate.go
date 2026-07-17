@@ -30,6 +30,7 @@ var uploadLocalArtifact = func(ctx context.Context, dst scheduler.Host, localPat
 }
 
 var migrateRepointHostFact = repointHostFact
+var migrateResolvedHostsForEnvironment = resolvedHostsForEnvironment
 
 func migrateCmd(opts *options) *cobra.Command {
 	var yes bool
@@ -78,7 +79,7 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 	if err != nil {
 		return err
 	}
-	hosts, err := resolvedHostsForEnvironment(store, envName, env)
+	hosts, err := migrateResolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
 		return err
 	}
@@ -176,7 +177,7 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 
 	current, currentErr := store.CurrentRelease(envName)
 	hasRelease := currentErr == nil
-	hostsAfter, err := resolvedHostsForEnvironment(store, envName, env)
+	hostsAfter, err := migrateResolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
 		return fail(err)
 	}
