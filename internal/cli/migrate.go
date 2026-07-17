@@ -29,6 +29,8 @@ var uploadLocalArtifact = func(ctx context.Context, dst scheduler.Host, localPat
 	return sshForHost(dst, dryRun).CopyFromLocal(ctx, localPath, writeCommand)
 }
 
+var migrateRepointHostFact = repointHostFact
+
 func migrateCmd(opts *options) *cobra.Command {
 	var yes bool
 	var keepServer bool
@@ -163,7 +165,7 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		}
 	}
 
-	oldFact, err := repointHostFact(store, envName, plan.source, prov.Name(), created)
+	oldFact, err := migrateRepointHostFact(store, envName, plan.source, prov.Name(), created)
 	if err != nil {
 		return fail(err)
 	}

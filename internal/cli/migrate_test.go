@@ -2,14 +2,17 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	accessorypkg "github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/config"
 	providerpkg "github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/provider/hetzner"
@@ -216,6 +219,216 @@ func installMigrateCopyHooks(t *testing.T, events *[]string) {
 		copyRemoteArtifact = originalCopy
 		uploadLocalArtifact = originalUpload
 	})
+}
+
+type migrateFailureHarness struct {
+	t                *testing.T
+	path             string
+	store            state.Store
+	events           []string
+	infra            *acceptanceFakeInfra
+	provider         *acceptanceHetznerAPI
+	initialFacts     []state.HostFact
+	initialAccessory state.AccessoryState
+	initialRelease   state.Release
+	initialCreated   int
+}
+
+func newMigrateFailureHarness(t *testing.T) *migrateFailureHarness {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(acceptanceFakeInfraConfigYAML(sampleAppPath(t))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &migrateFailureHarness{t: t, path: path}
+	h.infra = newAcceptanceFakeInfra(t, &h.events)
+	installAcceptanceDeployHooks(t, &acceptanceDocker{events: &h.events}, h.infra.agent)
+	installBootstrapHooks(t, &h.events)
+	installMigrateCopyHooks(t, &h.events)
+
+	h.provider = newAcceptanceHetznerAPI(t)
+	originalProvider := newEnvironmentProvider
+	newEnvironmentProvider = func(_ config.Environment, dryRun bool) (providerpkg.Provider, error) {
+		return hetzner.Client{
+			Token:        "acceptance-token",
+			DryRun:       dryRun,
+			HTTP:         h.provider.server.Client(),
+			BaseURL:      h.provider.server.URL,
+			PollInterval: time.Nanosecond,
+		}, nil
+	}
+	t.Cleanup(func() { newEnvironmentProvider = originalProvider })
+
+	runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "apply", "production", "--yes")
+	runAcceptanceCommand(t, deployCmd(&options{configPath: path}), "production")
+	h.store = state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	h.initialRelease = currentAcceptanceRelease(t, h.store)
+	var err error
+	h.initialFacts, err = h.store.ReadHostFacts("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.initialAccessory, err = h.store.ReadAccessoryState("production", "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.initialCreated = len(h.provider.createdIDs)
+	return h
+}
+
+func (h *migrateFailureHarness) fact(name string) state.HostFact {
+	h.t.Helper()
+	facts, err := h.store.ReadHostFacts("production")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	for _, fact := range facts {
+		if fact.Name == name {
+			return fact
+		}
+	}
+	h.t.Fatalf("host fact %q not found in %+v", name, facts)
+	return state.HostFact{}
+}
+
+func (h *migrateFailureHarness) initialFact(name string) state.HostFact {
+	h.t.Helper()
+	for _, fact := range h.initialFacts {
+		if fact.Name == name {
+			return fact
+		}
+	}
+	h.t.Fatalf("initial host fact %q not found in %+v", name, h.initialFacts)
+	return state.HostFact{}
+}
+
+func (h *migrateFailureHarness) hasContainer(contact, name string) bool {
+	h.t.Helper()
+	for _, container := range h.infra.containersFor(contact) {
+		if container.Names == name {
+			return true
+		}
+	}
+	return false
+}
+
+func eventIndexContaining(events []string, needle string) int {
+	for i, event := range events {
+		if strings.Contains(event, needle) {
+			return i
+		}
+	}
+	return -1
+}
+
+func outputLineWithPrefix(output, prefix string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+func TestMigrateAccessoryFailureAfterStateSaveReportsResidualState(t *testing.T) {
+	h := newMigrateFailureHarness(t)
+	migrationEventsStart := len(h.events)
+
+	originalRepoint := migrateRepointHostFact
+	migrateRepointHostFact = func(state.Store, string, scheduler.Host, string, providerpkg.Host) (state.HostFact, error) {
+		return state.HostFact{}, errors.New("injected host-fact repoint failure")
+	}
+	t.Cleanup(func() { migrateRepointHostFact = originalRepoint })
+
+	out, err := runAcceptanceCommandError(t, migrateCmd(&options{configPath: h.path}), "production", "data-1", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "injected host-fact repoint failure") {
+		t.Fatalf("migration error = %v, want injected host-fact repoint failure\n%s", err, out)
+	}
+
+	if got, want := len(h.provider.createdIDs), h.initialCreated+1; got != want {
+		t.Fatalf("created provider server IDs = %v, want one replacement after %d baseline servers", h.provider.createdIDs, h.initialCreated)
+	}
+	if len(h.provider.deletedIDs) != 0 {
+		t.Fatalf("provider deleted server IDs before host-fact repoint completed: %v", h.provider.deletedIDs)
+	}
+	if _, ok := h.provider.servers["data-1"]; !ok {
+		t.Fatalf("old provider server is absent: %+v", h.provider.servers)
+	}
+	var replacementName string
+	for name := range h.provider.servers {
+		if strings.HasPrefix(name, "data-1-m") {
+			replacementName = name
+			break
+		}
+	}
+	if replacementName == "" {
+		t.Fatalf("replacement provider server is absent: %+v", h.provider.servers)
+	}
+	replacement := h.provider.servers[replacementName]
+	newContact := replacement.PublicNet.IPv4.IP
+	oldFact := h.initialFact("data-1")
+	if got := h.fact("data-1"); got.PublicAddress != oldFact.PublicAddress || got.ProviderID != oldFact.ProviderID || got.ProviderName != oldFact.ProviderName {
+		t.Fatalf("host fact changed before repoint completed: got %+v, want old fact %+v", got, oldFact)
+	}
+
+	accessoryState, err := h.store.ReadAccessoryState("production", "postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accessoryState.Host.PublicAddress != newContact || accessoryState.LastRestore == nil || accessoryState.LastRestore.Host != "data-1" {
+		t.Fatalf("accessory state does not point at restored replacement %s: %+v", newContact, accessoryState)
+	}
+	containerName := accessorypkg.ContainerName("sample", "production", "postgres")
+	if h.hasContainer(oldFact.PublicAddress, containerName) {
+		t.Fatalf("old accessory container %s is still running on %s", containerName, oldFact.PublicAddress)
+	}
+	if !h.hasContainer(newContact, containerName) {
+		t.Fatalf("replacement accessory container %s is not running on %s", containerName, newContact)
+	}
+
+	current, err := h.store.CurrentRelease("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current, h.initialRelease) {
+		t.Fatalf("current release changed after migration failure: got %+v, want %+v", current, h.initialRelease)
+	}
+	stateEvents, err := h.store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var migrateFailed, accessorySucceeded bool
+	for _, event := range stateEvents {
+		if event.Kind == "migrate" && event.Status == "failed" && strings.Contains(event.Message, "injected host-fact repoint failure") {
+			migrateFailed = true
+		}
+		if event.Kind == "migrate_accessory" && event.Status == "succeeded" && event.Accessory == "postgres" {
+			accessorySucceeded = true
+		}
+	}
+	if !migrateFailed || !accessorySucceeded {
+		t.Fatalf("migration events do not record the residual transition: %+v", stateEvents)
+	}
+
+	migrationEvents := h.events[migrationEventsStart:]
+	backupAt := eventIndexContaining(migrationEvents, "agent:data-1:accessory_backup")
+	copyAt := eventIndexContaining(migrationEvents, "copy-artifact:data-1:")
+	restoreAt := eventIndexContaining(migrationEvents, "agent:data-1:accessory_restore")
+	stopAt := eventIndexContaining(migrationEvents, "agent:data-1:stop:"+containerName)
+	if backupAt < 0 || copyAt <= backupAt || restoreAt <= copyAt || stopAt <= restoreAt {
+		t.Fatalf("accessory migration order = %v", migrationEvents)
+	}
+
+	note := outputLineWithPrefix(out, "note: replacement server ")
+	if note == "" {
+		t.Fatalf("migration output has no recovery note:\n%s", out)
+	}
+	if !strings.Contains(note, "accessory postgres") || !strings.Contains(note, oldFact.PublicAddress) || strings.Contains(note, "delete it there before retrying") {
+		t.Fatalf("cleanup note is unsafe for the saved residual state; accessory postgres points at %s, its old container on %s is stopped, and the note says %q", newContact, oldFact.PublicAddress, note)
+	}
 }
 
 func TestAcceptanceMigrateHostWorkflow(t *testing.T) {
