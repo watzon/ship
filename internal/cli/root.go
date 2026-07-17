@@ -99,6 +99,7 @@ var newDeployAgent = func(host scheduler.Host) deployAgent {
 var deployNow = time.Now
 var deployGitRevision = docker.GitShortSHA
 var newReleaseID = docker.NewReleaseID
+var eventWarningWriter io.Writer = os.Stderr
 var runLocalHookCommand = defaultRunLocalHookCommand
 var sendWebhookNotification = defaultSendWebhookNotification
 var readCurrentShipBinary = func() ([]byte, error) {
@@ -1459,7 +1460,10 @@ func recordEvent(store state.Store, event state.Event) {
 	if event.Time.IsZero() {
 		event.Time = deployNow().UTC()
 	}
-	_ = store.RecordEvent(event)
+	if err := store.RecordEvent(event); err != nil {
+		fmt.Fprintf(eventWarningWriter, "warning: could not persist event environment=%q kind=%q status=%q: %v\n",
+			strings.TrimSpace(event.Environment), strings.TrimSpace(event.Kind), strings.TrimSpace(event.Status), err)
+	}
 }
 
 func runDeployHooks(ctx context.Context, w io.Writer, store state.Store, cfg *config.Config, envName, hookName, releaseID, failure, configPath string) error {

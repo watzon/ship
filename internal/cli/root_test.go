@@ -3905,6 +3905,43 @@ func TestEventsCommandJSONAndText(t *testing.T) {
 	}
 }
 
+func TestRecordEventWarnsOnceWithoutMessage(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state-file")
+	if err := os.WriteFile(statePath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := state.NewStore(statePath)
+	event := state.Event{
+		Environment: "production",
+		Kind:        "deploy",
+		Status:      "failed",
+		Message:     "sensitive command output",
+	}
+	wantErr := store.RecordEvent(event)
+	if wantErr == nil {
+		t.Fatal("expected RecordEvent error")
+	}
+
+	var warning bytes.Buffer
+	originalWarningWriter := eventWarningWriter
+	eventWarningWriter = &warning
+	t.Cleanup(func() { eventWarningWriter = originalWarningWriter })
+
+	recordEvent(store, event)
+	got := warning.String()
+	if strings.Count(got, "warning:") != 1 {
+		t.Fatalf("warning count = %d, output = %q", strings.Count(got, "warning:"), got)
+	}
+	for _, value := range []string{"production", "deploy", "failed", wantErr.Error()} {
+		if !strings.Contains(got, value) {
+			t.Fatalf("warning %q does not contain %q", got, value)
+		}
+	}
+	if strings.Contains(got, event.Message) {
+		t.Fatalf("warning leaked event message: %q", got)
+	}
+}
+
 func TestReleasesCommandShowsHistoryTextAndJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
