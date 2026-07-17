@@ -32,7 +32,7 @@ Allowed values: `TODO`, `IN PROGRESS`, `BLOCKED`, `DONE`, `STALE`. `DONE` means 
 | [006 — Visible, race-safe events](006-visible-race-safe-events.md) | P2 | Correctness / observability | S | LOW | DONE | — |
 | [007 — Migrate failure contracts](007-migrate-failure-contracts.md) | P1 | Test coverage | M | MED | DONE | 006 |
 | [008 — Archive stale V1 roadmap](008-archive-stale-v1-roadmap.md) | P2 | Documentation | S | LOW | DONE | — |
-| [009 — Split CLI command domains](009-split-cli-command-domains.md) | P2 | Architecture | L | MED | TODO | 005, 006, 007 |
+| [009 — Split CLI command domains](009-split-cli-command-domains.md) | P2 | Architecture | L | MED | DONE | 005, 006, 007 |
 | [010 — Bounded host fan-out](010-bounded-host-fanout.md) | P3 | Performance | L | MED | TODO | 002, 004, 005, 009 |
 | [011 — Applied scaling design spike](011-applied-scaling-design-spike.md) | Direction | Product design | M | MED | TODO | 009 |
 | [012 — Stale accessory recovery design](012-stale-accessory-recovery-design.md) | Direction | Recovery design | M | HIGH | TODO | 006, 007, 009 |
