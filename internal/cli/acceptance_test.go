@@ -577,7 +577,9 @@ type acceptanceHetznerAPI struct {
 	server     *httptest.Server
 	servers    map[string]hetzner.Server
 	created    []string
+	createdIDs []int64
 	deleted    []string
+	deletedIDs []int64
 	nextID     int64
 	nextAction int64
 }
@@ -660,6 +662,7 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		}
 		api.servers[req.Name] = server
 		api.created = append(api.created, req.Name)
+		api.createdIDs = append(api.createdIDs, server.ID)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server": server,
 			"action": map[string]any{"id": api.nextAction, "status": "running"},
@@ -677,6 +680,7 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 			if server.ID == id {
 				delete(api.servers, name)
 				api.deleted = append(api.deleted, name)
+				api.deletedIDs = append(api.deletedIDs, id)
 				api.nextAction++
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"action": map[string]any{"id": api.nextAction, "status": "success"},

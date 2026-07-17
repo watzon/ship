@@ -29,6 +29,8 @@ var uploadLocalArtifact = func(ctx context.Context, dst scheduler.Host, localPat
 	return sshForHost(dst, dryRun).CopyFromLocal(ctx, localPath, writeCommand)
 }
 
+var migrateRepointHostFact = repointHostFact
+
 func migrateCmd(opts *options) *cobra.Command {
 	var yes bool
 	var keepServer bool
@@ -157,13 +159,16 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		return fail(fmt.Errorf("replacement server %s failed agent preflight: %w", created.Name, err))
 	}
 
+	migratedAccessories := make([]string, 0, len(plan.accessories))
 	for _, name := range plan.accessories {
 		if err := migrateAccessory(ctx, w, opts, cfg, env, envName, store, name, plan.source, replacement, overrides[name]); err != nil {
 			return fail(err)
 		}
+		migratedAccessories = append(migratedAccessories, name)
+		cleanupHint = migrateAccessoryResidualHint(created, plan.source, migratedAccessories)
 	}
 
-	oldFact, err := repointHostFact(store, envName, plan.source, prov.Name(), created)
+	oldFact, err := migrateRepointHostFact(store, envName, plan.source, prov.Name(), created)
 	if err != nil {
 		return fail(err)
 	}
@@ -208,6 +213,15 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		fmt.Fprintf(w, "note: host %s serves ingress traffic; update any DNS records pointing at %s to %s\n", hostName, plan.source.ContactTarget(), created.PublicAddress)
 	}
 	return nil
+}
+
+func migrateAccessoryResidualHint(created provider.Host, source scheduler.Host, names []string) string {
+	migrated := append([]string(nil), names...)
+	sort.Strings(migrated)
+	if len(migrated) == 1 {
+		return fmt.Sprintf("note: replacement server %s (%s) is running migrated accessory %s; its old container on %s is stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server", created.Name, created.PublicAddress, migrated[0], source.ContactTarget())
+	}
+	return fmt.Sprintf("note: replacement server %s (%s) is running migrated accessories %s; their old containers on %s are stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server", created.Name, created.PublicAddress, strings.Join(migrated, ", "), source.ContactTarget())
 }
 
 func buildMigratePlan(cfg *config.Config, env config.Environment, store state.Store, prov provider.Provider, envName, hostName string, hosts []scheduler.Host) (migratePlan, error) {
