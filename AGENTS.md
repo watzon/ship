@@ -6,6 +6,7 @@ This repository contains the `ship` Go CLI. The entry point is `cmd/ship/main.go
 
 ## Build, Test, and Development Commands
 
+- `./scripts/ci-local.sh` runs the full pre-PR verification used by CI.
 - `go test ./...` runs the default CI-safe test suite.
 - `go build ./cmd/ship` builds the CLI binary.
 - `go install ./cmd/ship` installs the local CLI into your Go bin path.
