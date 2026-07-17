@@ -182,7 +182,9 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		return fail(err)
 	}
 	if hasRelease && len(plan.services) > 0 {
-		if err := migrateServiceRollout(ctx, opts, cfg, env, store, envName, stateDir, hostsAfter, replacement, current); err != nil {
+		rollout, err := migrateServiceRollout(ctx, opts, cfg, env, store, envName, stateDir, hostsAfter, replacement, current)
+		recordRolloutCleanupWarnings(w, store, envName, "migrate_cleanup", current.ID, rollout.CleanupWarnings)
+		if err != nil {
 			return fail(err)
 		}
 		fmt.Fprintf(w, "started release %s replicas on %s\n", current.ID, hostName)
@@ -476,21 +478,21 @@ func repointHostFact(store state.Store, envName string, source scheduler.Host, p
 	return oldFact, nil
 }
 
-func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Config, env config.Environment, store state.Store, envName, stateDir string, hosts []scheduler.Host, replacement scheduler.Host, current state.Release) error {
+func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Config, env config.Environment, store state.Store, envName, stateDir string, hosts []scheduler.Host, replacement scheduler.Host, current state.Release) (deployment.RolloutResult, error) {
 	secretOpts, err := secretSourceOptions(opts, envName)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	secretEnvFiles, secretWrites, err := serviceSecretEnvFiles(cfg, hosts, envName, secretFile)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	if err := writeRemoteSecretFiles(ctx, secretWrites); err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	images := make([]string, 0, len(current.Images))
 	for _, image := range current.Images {
@@ -498,9 +500,9 @@ func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Confi
 	}
 	sort.Strings(images)
 	if err := syncRemoteRegistryAuth(ctx, newDeployDocker(), []scheduler.Host{replacement}, images); err != nil {
-		return fmt.Errorf("write registry auth on replacement: %w", err)
+		return deployment.RolloutResult{}, fmt.Errorf("write registry auth on replacement: %w", err)
 	}
-	actions, err := deployment.Rollout(ctx, deployment.RolloutOptions{
+	rollout, err := deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
 		Config:         cfg,
 		Environment:    env,
 		Hosts:          hosts,
@@ -512,10 +514,13 @@ func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Confi
 		AgentFor:       deploymentAgentFactory(),
 	})
 	if err != nil {
-		return err
+		return rollout, err
 	}
-	recordIngressEvents(store, envName, current.ID, actions)
-	return syncRemoteReleaseStateWithEvents(ctx, store, envName, hosts, "migrate_release_state_write", current)
+	recordIngressEvents(store, envName, current.ID, rollout.Actions)
+	if err := syncRemoteReleaseStateWithEvents(ctx, store, envName, hosts, "migrate_release_state_write", current); err != nil {
+		return rollout, err
+	}
+	return rollout, nil
 }
 
 // stopOldWorkloads stops Ship-managed containers left on the old server. The

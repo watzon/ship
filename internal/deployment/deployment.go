@@ -146,11 +146,6 @@ func placementsForInput(input PlanInput) ([]scheduler.Placement, error) {
 	return scheduler.PlaceServicesOnHosts(input.Config, hosts)
 }
 
-func Rollout(ctx context.Context, opts RolloutOptions) ([]Action, error) {
-	result, err := RolloutWithResult(ctx, opts)
-	return result.Actions, err
-}
-
 // RolloutWithResult executes a rollout and preserves post-commit cleanup warnings.
 func RolloutWithResult(ctx context.Context, opts RolloutOptions) (RolloutResult, error) {
 	hosts := inputHosts(opts.Environment, opts.Hosts)
