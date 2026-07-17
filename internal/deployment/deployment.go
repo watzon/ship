@@ -209,6 +209,7 @@ func BuildActions(input PlanInput) ([]Action, error) {
 	pendingStops := map[string][]ObservedContainer{}
 	surgeCounts := map[string]int{}
 	startedCounts := map[string]int{}
+	pulledImages := map[string]struct{}{}
 	desiredCounts := desiredServiceCounts(placements)
 	var actions []Action
 	networkName := DockerNetworkName(input.Config, input.EnvName)
@@ -224,15 +225,19 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		labels := ContainerLabels(input.Config.Project, input.EnvName, placement.Service, placement.Replica, input.ReleaseID, svc.Labels)
 		args := DockerArgs(svc, input.SecretEnvFiles[placement.Service])
 		networkAliases := ServiceNetworkAliases(placement.Service, svc)
-		actions = append(actions, Action{
-			Kind:          ActionPull,
-			Host:          placement.Host,
-			Service:       placement.Service,
-			Replica:       placement.Replica,
-			Release:       input.ReleaseID,
-			ContainerName: name,
-			Image:         image,
-		})
+		pullKey := placement.Host.Name + "\x00" + image
+		if _, ok := pulledImages[pullKey]; !ok {
+			actions = append(actions, Action{
+				Kind:          ActionPull,
+				Host:          placement.Host,
+				Service:       placement.Service,
+				Replica:       placement.Replica,
+				Release:       input.ReleaseID,
+				ContainerName: name,
+				Image:         image,
+			})
+			pulledImages[pullKey] = struct{}{}
+		}
 		if usesFixedHostPorts(svc) {
 			for _, old := range replacementStopCandidates(input.Config, input.EnvName, placement, name, input.Observed) {
 				actions = appendPreserveStopActions(actions, old, svc)
@@ -493,6 +498,7 @@ func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor Ag
 	var started []Action
 	var preserved []Action
 	var cleanup []Action
+	ensuredNetworks := map[string]struct{}{}
 	fail := func(primary error) (ExecutionResult, error) {
 		return ExecutionResult{}, compensateActions(ctx, primary, started, preserved, agentFor)
 	}
@@ -505,7 +511,7 @@ func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor Ag
 			}
 		case ActionStart:
 			client := agentFor(action.Host)
-			if err := ensureNetwork(ctx, client, action); err != nil {
+			if err := ensureNetworkOnce(ctx, client, action.Host, action, ensuredNetworks); err != nil {
 				return fail(fmt.Errorf("ensure network %s on %s: %w", action.Network, action.Host.Name, err))
 			}
 			params := agent.RunContainerParams{
@@ -526,7 +532,7 @@ func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor Ag
 				return fail(err)
 			}
 		case ActionIngress:
-			if err := executeIngressAction(ctx, action, agentFor); err != nil {
+			if err := executeIngressAction(ctx, action, agentFor, ensuredNetworks); err != nil {
 				return fail(err)
 			}
 		case ActionDrain:
@@ -615,7 +621,7 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 // running. The snapshot is read live from the host, not from local .ship/
 // state: a CI runner's checkout never carries state from prior deploys, so
 // sourcing "previous" locally silently turned rollback into a no-op there.
-func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory) error {
+func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	remotePath := remoteCaddyfilePath(action.IngressPath)
 	previous := map[string]ingressSnapshot{}
 	for _, host := range action.IngressHosts {
@@ -624,8 +630,8 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 
 	var reloaded []scheduler.Host
 	for _, host := range action.IngressHosts {
-		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
-			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if err := applyCaddyContainer(ctx, host, action, agentFor, ensuredNetworks); err != nil {
+			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 				return fmt.Errorf("reload ingress on %s: %w; additionally failed to roll back ingress: %v", host.Name, err, rollbackErr)
 			}
 			return fmt.Errorf("reload ingress on %s: %w", host.Name, err)
@@ -634,13 +640,13 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 	}
 
 	if err := os.MkdirAll(filepath.Dir(action.IngressPath), 0o755); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 			return fmt.Errorf("prepare ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("prepare ingress state: %w", err)
 	}
 	if err := fsatomic.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 			return fmt.Errorf("write ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("write ingress state: %w", err)
@@ -720,7 +726,7 @@ func hostsByName(byName map[string]scheduler.Host) []scheduler.Host {
 	return hosts
 }
 
-func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous map[string]ingressSnapshot, base Action, agentFor AgentFactory) error {
+func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous map[string]ingressSnapshot, base Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	var errs []string
 	for _, host := range hosts {
 		snap, ok := previous[host.Name]
@@ -729,7 +735,7 @@ func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous 
 		}
 		action := base
 		action.IngressConfig = snap.content
-		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
+		if err := applyCaddyContainer(ctx, host, action, agentFor, ensuredNetworks); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", host.Name, err))
 		}
 	}
@@ -739,7 +745,7 @@ func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous 
 	return nil
 }
 
-func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action, agentFor AgentFactory) error {
+func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	client := agentFor(host)
 	if strings.TrimSpace(action.IngressConfig) == "" {
 		if action.CaddyName != "" {
@@ -773,7 +779,7 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 	if configVolume == "" {
 		configVolume = name + "_config"
 	}
-	if err := ensureNetwork(ctx, client, action); err != nil {
+	if err := ensureNetworkOnce(ctx, client, host, action, ensuredNetworks); err != nil {
 		return err
 	}
 	if err := validateCaddyfile(ctx, client, remotePath, image); err != nil {
@@ -876,6 +882,21 @@ func ensureNetwork(ctx context.Context, client Agent, action Action) error {
 		return nil
 	}
 	return client.Call(ctx, "ensure_network", agent.EnsureNetworkParams{Name: action.Network, Driver: action.NetworkDriver}, nil)
+}
+
+func ensureNetworkOnce(ctx context.Context, client Agent, host scheduler.Host, action Action, ensuredNetworks map[string]struct{}) error {
+	if strings.TrimSpace(action.Network) == "" {
+		return nil
+	}
+	key := host.Name + "\x00" + action.Network
+	if _, ok := ensuredNetworks[key]; ok {
+		return nil
+	}
+	if err := ensureNetwork(ctx, client, action); err != nil {
+		return err
+	}
+	ensuredNetworks[key] = struct{}{}
+	return nil
 }
 
 func remoteCaddyfilePath(localPath string) string {
