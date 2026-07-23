@@ -29,6 +29,9 @@ var uploadLocalArtifact = func(ctx context.Context, dst scheduler.Host, localPat
 	return sshForHost(dst, dryRun).CopyFromLocal(ctx, localPath, writeCommand)
 }
 
+var migrateRepointHostFact = repointHostFact
+var migrateResolvedHostsForEnvironment = resolvedHostsForEnvironment
+
 func migrateCmd(opts *options) *cobra.Command {
 	var yes bool
 	var keepServer bool
@@ -76,7 +79,7 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 	if err != nil {
 		return err
 	}
-	hosts, err := resolvedHostsForEnvironment(store, envName, env)
+	hosts, err := migrateResolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
 		return err
 	}
@@ -157,13 +160,16 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		return fail(fmt.Errorf("replacement server %s failed agent preflight: %w", created.Name, err))
 	}
 
+	migratedAccessories := make([]string, 0, len(plan.accessories))
 	for _, name := range plan.accessories {
 		if err := migrateAccessory(ctx, w, opts, cfg, env, envName, store, name, plan.source, replacement, overrides[name]); err != nil {
 			return fail(err)
 		}
+		migratedAccessories = append(migratedAccessories, name)
+		cleanupHint = migrateAccessoryResidualHint(created, plan.source, migratedAccessories)
 	}
 
-	oldFact, err := repointHostFact(store, envName, plan.source, prov.Name(), created)
+	oldFact, err := migrateRepointHostFact(store, envName, plan.source, prov.Name(), created)
 	if err != nil {
 		return fail(err)
 	}
@@ -171,12 +177,14 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 
 	current, currentErr := store.CurrentRelease(envName)
 	hasRelease := currentErr == nil
-	hostsAfter, err := resolvedHostsForEnvironment(store, envName, env)
+	hostsAfter, err := migrateResolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
 		return fail(err)
 	}
 	if hasRelease && len(plan.services) > 0 {
-		if err := migrateServiceRollout(ctx, opts, cfg, env, store, envName, stateDir, hostsAfter, replacement, current); err != nil {
+		rollout, err := migrateServiceRollout(ctx, opts, cfg, env, store, envName, stateDir, hostsAfter, replacement, current)
+		recordRolloutCleanupWarnings(w, store, envName, "migrate_cleanup", current.ID, rollout.CleanupWarnings)
+		if err != nil {
 			return fail(err)
 		}
 		fmt.Fprintf(w, "started release %s replicas on %s\n", current.ID, hostName)
@@ -208,6 +216,15 @@ func runMigrate(ctx context.Context, w io.Writer, opts *options, envName, hostNa
 		fmt.Fprintf(w, "note: host %s serves ingress traffic; update any DNS records pointing at %s to %s\n", hostName, plan.source.ContactTarget(), created.PublicAddress)
 	}
 	return nil
+}
+
+func migrateAccessoryResidualHint(created provider.Host, source scheduler.Host, names []string) string {
+	migrated := append([]string(nil), names...)
+	sort.Strings(migrated)
+	if len(migrated) == 1 {
+		return fmt.Sprintf("note: replacement server %s (%s) is running migrated accessory %s; its old container on %s is stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server", created.Name, created.PublicAddress, migrated[0], source.ContactTarget())
+	}
+	return fmt.Sprintf("note: replacement server %s (%s) is running migrated accessories %s; their old containers on %s are stopped while host facts still point to the old server. Do not delete the replacement or retry `ship migrate`; inspect the saved accessory state and both servers, then manually converge host facts and workloads before deleting either server", created.Name, created.PublicAddress, strings.Join(migrated, ", "), source.ContactTarget())
 }
 
 func buildMigratePlan(cfg *config.Config, env config.Environment, store state.Store, prov provider.Provider, envName, hostName string, hosts []scheduler.Host) (migratePlan, error) {
@@ -461,21 +478,21 @@ func repointHostFact(store state.Store, envName string, source scheduler.Host, p
 	return oldFact, nil
 }
 
-func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Config, env config.Environment, store state.Store, envName, stateDir string, hosts []scheduler.Host, replacement scheduler.Host, current state.Release) error {
+func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Config, env config.Environment, store state.Store, envName, stateDir string, hosts []scheduler.Host, replacement scheduler.Host, current state.Release) (deployment.RolloutResult, error) {
 	secretOpts, err := secretSourceOptions(opts, envName)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	secretFile, err := secrets.RenderScopedForEnv(cfg, secretOpts)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	secretEnvFiles, secretWrites, err := serviceSecretEnvFiles(cfg, hosts, envName, secretFile)
 	if err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	if err := writeRemoteSecretFiles(ctx, secretWrites); err != nil {
-		return err
+		return deployment.RolloutResult{}, err
 	}
 	images := make([]string, 0, len(current.Images))
 	for _, image := range current.Images {
@@ -483,9 +500,9 @@ func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Confi
 	}
 	sort.Strings(images)
 	if err := syncRemoteRegistryAuth(ctx, newDeployDocker(), []scheduler.Host{replacement}, images); err != nil {
-		return fmt.Errorf("write registry auth on replacement: %w", err)
+		return deployment.RolloutResult{}, fmt.Errorf("write registry auth on replacement: %w", err)
 	}
-	actions, err := deployment.Rollout(ctx, deployment.RolloutOptions{
+	rollout, err := deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
 		Config:         cfg,
 		Environment:    env,
 		Hosts:          hosts,
@@ -497,10 +514,13 @@ func migrateServiceRollout(ctx context.Context, opts *options, cfg *config.Confi
 		AgentFor:       deploymentAgentFactory(),
 	})
 	if err != nil {
-		return err
+		return rollout, err
 	}
-	recordIngressEvents(store, envName, current.ID, actions)
-	return syncRemoteReleaseStateWithEvents(ctx, store, envName, hosts, "migrate_release_state_write", current)
+	recordIngressEvents(store, envName, current.ID, rollout.Actions)
+	if err := syncRemoteReleaseStateWithEvents(ctx, store, envName, hosts, "migrate_release_state_write", current); err != nil {
+		return rollout, err
+	}
+	return rollout, nil
 }
 
 // stopOldWorkloads stops Ship-managed containers left on the old server. The

@@ -509,6 +509,19 @@ func (f *acceptanceFakeInfra) removeContainer(host, name string) {
 	f.containers[host] = filtered
 }
 
+func (f *acceptanceFakeInfra) setContainerStatus(host, name, status string) error {
+	containers := f.containers[host]
+	for i := range containers {
+		if containers[i].Names != name {
+			continue
+		}
+		containers[i].Status = status
+		f.containers[host] = containers
+		return nil
+	}
+	return fmt.Errorf("container %s does not exist", name)
+}
+
 type acceptanceFakeAgent struct {
 	infra *acceptanceFakeInfra
 	host  scheduler.Host
@@ -516,6 +529,15 @@ type acceptanceFakeAgent struct {
 
 func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any, out any) error {
 	switch method {
+	case "negotiate":
+		a.infra.record("agent:%s:negotiate", a.host.Name)
+		if result, ok := out.(*agent.NegotiateResult); ok {
+			*result = agent.NegotiateResult{
+				AgentVersion:     agent.Version(),
+				ProtocolVersion:  agent.AgentProtocol,
+				SupportedMethods: []string{"remove_container", "start_container", "stop_container_keep"},
+			}
+		}
 	case "write_release_state":
 		p := params.(agent.WriteReleaseStateParams)
 		a.infra.record("agent:%s:write_release_state:%s:%s", a.host.Name, p.Release.ID, p.Release.Status)
@@ -551,6 +573,22 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 		name := params.(map[string]string)["name"]
 		a.infra.record("agent:%s:stop:%s", a.host.Name, name)
 		a.infra.removeContainer(containerKey(a.host), name)
+	case "stop_container_keep":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:stop_keep:%s", a.host.Name, name)
+		if err := a.infra.setContainerStatus(containerKey(a.host), name, "Exited (0)"); err != nil {
+			return err
+		}
+	case "start_container":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:start_existing:%s", a.host.Name, name)
+		if err := a.infra.setContainerStatus(containerKey(a.host), name, "Up 1 second"); err != nil {
+			return err
+		}
+	case "remove_container":
+		name := params.(map[string]string)["name"]
+		a.infra.record("agent:%s:stop:%s", a.host.Name, name)
+		a.infra.removeContainer(containerKey(a.host), name)
 	case "logs":
 		p := params.(agent.LogsParams)
 		a.infra.record("agent:%s:logs:%s:%d", a.host.Name, p.Name, p.Lines)
@@ -573,13 +611,19 @@ func (a acceptanceFakeAgent) Call(ctx context.Context, method string, params any
 }
 
 type acceptanceHetznerAPI struct {
-	t          *testing.T
-	server     *httptest.Server
-	servers    map[string]hetzner.Server
-	created    []string
-	deleted    []string
-	nextID     int64
-	nextAction int64
+	t                          *testing.T
+	server                     *httptest.Server
+	servers                    map[string]hetzner.Server
+	created                    []string
+	createdIDs                 []int64
+	deleted                    []string
+	deletedIDs                 []int64
+	events                     *[]string
+	failCreate                 bool
+	createWithoutPublicAddress bool
+	failDelete                 bool
+	nextID                     int64
+	nextAction                 int64
 }
 
 func newAcceptanceHetznerAPI(t *testing.T) *acceptanceHetznerAPI {
@@ -636,6 +680,14 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			api.t.Fatal(err)
 		}
+		if api.events != nil {
+			*api.events = append(*api.events, "provider:create-attempt:"+req.Name)
+		}
+		if api.failCreate {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "injected_create_failure", "message": "injected provider create failure"}})
+			return
+		}
 		privateNet := make([]hetzner.PrivateNet, 0, len(req.Networks))
 		for _, networkID := range req.Networks {
 			privateNet = append(privateNet, hetzner.PrivateNet{Network: networkID})
@@ -648,18 +700,26 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		}
 		api.nextID++
 		api.nextAction++
+		publicAddress := "192.0.2." + strconv.FormatInt(api.nextID-100, 10)
+		if api.createWithoutPublicAddress {
+			publicAddress = ""
+		}
 		server := hetzner.Server{
 			ID:         api.nextID,
 			Name:       req.Name,
 			Labels:     req.Labels,
 			PrivateNet: privateNet,
 			PublicNet: hetzner.PublicNet{
-				IPv4:      hetzner.PublicIPv4{IP: "192.0.2." + strconv.FormatInt(api.nextID-100, 10)},
+				IPv4:      hetzner.PublicIPv4{IP: publicAddress},
 				Firewalls: firewalls,
 			},
 		}
 		api.servers[req.Name] = server
 		api.created = append(api.created, req.Name)
+		api.createdIDs = append(api.createdIDs, server.ID)
+		if api.events != nil {
+			*api.events = append(*api.events, fmt.Sprintf("provider:created:%d:%s", server.ID, server.Name))
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"server": server,
 			"action": map[string]any{"id": api.nextAction, "status": "running"},
@@ -675,8 +735,20 @@ func (api *acceptanceHetznerAPI) handle(w http.ResponseWriter, r *http.Request) 
 		}
 		for name, server := range api.servers {
 			if server.ID == id {
+				if api.events != nil {
+					*api.events = append(*api.events, fmt.Sprintf("provider:delete-attempt:%d:%s", id, name))
+				}
+				if api.failDelete {
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "injected_delete_failure", "message": "injected provider delete failure"}})
+					return
+				}
 				delete(api.servers, name)
 				api.deleted = append(api.deleted, name)
+				api.deletedIDs = append(api.deletedIDs, id)
+				if api.events != nil {
+					*api.events = append(*api.events, fmt.Sprintf("provider:deleted:%d:%s", id, name))
+				}
 				api.nextAction++
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"action": map[string]any{"id": api.nextAction, "status": "success"},

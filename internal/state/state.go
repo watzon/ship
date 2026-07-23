@@ -379,7 +379,7 @@ func (s Store) RecordAccessoryRestore(environment, name string, restore Accessor
 	return accessory, nil
 }
 
-func (s Store) RecordEvent(event Event) error {
+func (s Store) RecordEvent(event Event) (retErr error) {
 	event.Environment = strings.TrimSpace(event.Environment)
 	event.Kind = strings.TrimSpace(event.Kind)
 	event.Status = strings.TrimSpace(event.Status)
@@ -397,6 +397,26 @@ func (s Store) RecordEvent(event Event) error {
 	} else {
 		event.Time = event.Time.UTC()
 	}
+	lockPath := s.eventLockPath(event.Environment)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lockFile.Close()
+		return err
+	}
+	defer func() {
+		unlockErr := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		closeErr := lockFile.Close()
+		if retErr == nil {
+			retErr = errors.Join(unlockErr, closeErr)
+		}
+	}()
+
 	events, err := s.Events(event.Environment)
 	if err != nil {
 		return err
@@ -456,6 +476,10 @@ func (s Store) accessoryStatePath(environment, name string) string {
 
 func (s Store) eventsPath(environment string) string {
 	return filepath.Join(s.Dir, "events", environment+".json")
+}
+
+func (s Store) eventLockPath(environment string) string {
+	return filepath.Join(s.Dir, "events", environment+".lock")
 }
 
 func (s Store) deployLockPath(environment string) string {

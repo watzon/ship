@@ -21,13 +21,15 @@ import (
 )
 
 const (
-	ActionPull    ActionKind = "pull"
-	ActionStart   ActionKind = "start"
-	ActionHealth  ActionKind = "health"
-	ActionIngress ActionKind = "ingress"
-	ActionDrain   ActionKind = "drain"
-	ActionCanary  ActionKind = "canary_pause"
-	ActionStop    ActionKind = "stop"
+	ActionPull            ActionKind = "pull"
+	ActionStart           ActionKind = "start"
+	ActionHealth          ActionKind = "health"
+	ActionIngress         ActionKind = "ingress"
+	ActionDrain           ActionKind = "drain"
+	ActionCanary          ActionKind = "canary_pause"
+	ActionStop            ActionKind = "stop"
+	ActionPreserveStop    ActionKind = "preserve_stop"
+	ActionRemovePreserved ActionKind = "remove_preserved"
 )
 
 const defaultHealthTimeoutSeconds = 30
@@ -110,6 +112,28 @@ type RolloutOptions struct {
 	Sleep          func(time.Duration)
 }
 
+// CleanupWarning reports a preserved container that could not be removed after commit.
+type CleanupWarning struct {
+	Host          scheduler.Host
+	ContainerName string
+	Err           error
+}
+
+func (w CleanupWarning) Error() string {
+	return fmt.Sprintf("remove preserved container %s on %s: %v", w.ContainerName, w.Host.Name, w.Err)
+}
+
+// ExecutionResult reports non-fatal work left after a committed action stream.
+type ExecutionResult struct {
+	CleanupWarnings []CleanupWarning
+}
+
+// RolloutResult contains the planned actions and any post-commit cleanup warnings.
+type RolloutResult struct {
+	Actions         []Action
+	CleanupWarnings []CleanupWarning
+}
+
 func inputHosts(env config.Environment, hosts []scheduler.Host) []scheduler.Host {
 	if len(hosts) > 0 {
 		return append([]scheduler.Host(nil), hosts...)
@@ -122,11 +146,12 @@ func placementsForInput(input PlanInput) ([]scheduler.Placement, error) {
 	return scheduler.PlaceServicesOnHosts(input.Config, hosts)
 }
 
-func Rollout(ctx context.Context, opts RolloutOptions) ([]Action, error) {
+// RolloutWithResult executes a rollout and preserves post-commit cleanup warnings.
+func RolloutWithResult(ctx context.Context, opts RolloutOptions) (RolloutResult, error) {
 	hosts := inputHosts(opts.Environment, opts.Hosts)
 	observed, err := InspectObservedOnHosts(ctx, hosts, opts.AgentFor)
 	if err != nil {
-		return nil, err
+		return RolloutResult{}, err
 	}
 	actions, err := BuildActions(PlanInput{
 		Config:         opts.Config,
@@ -140,12 +165,14 @@ func Rollout(ctx context.Context, opts RolloutOptions) ([]Action, error) {
 		SecretEnvFiles: opts.SecretEnvFiles,
 	})
 	if err != nil {
-		return nil, err
+		return RolloutResult{}, err
 	}
-	if err := ExecuteActions(ctx, actions, opts.AgentFor, opts.Sleep); err != nil {
-		return actions, err
+	execution, err := ExecuteActionsWithResult(ctx, actions, opts.AgentFor, opts.Sleep)
+	result := RolloutResult{Actions: actions, CleanupWarnings: execution.CleanupWarnings}
+	if err != nil {
+		return result, err
 	}
-	return actions, nil
+	return result, nil
 }
 
 func InspectObserved(ctx context.Context, env config.Environment, agentFor AgentFactory) ([]ObservedContainer, error) {
@@ -182,6 +209,7 @@ func BuildActions(input PlanInput) ([]Action, error) {
 	pendingStops := map[string][]ObservedContainer{}
 	surgeCounts := map[string]int{}
 	startedCounts := map[string]int{}
+	pulledImages := map[string]struct{}{}
 	desiredCounts := desiredServiceCounts(placements)
 	var actions []Action
 	networkName := DockerNetworkName(input.Config, input.EnvName)
@@ -197,18 +225,22 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		labels := ContainerLabels(input.Config.Project, input.EnvName, placement.Service, placement.Replica, input.ReleaseID, svc.Labels)
 		args := DockerArgs(svc, input.SecretEnvFiles[placement.Service])
 		networkAliases := ServiceNetworkAliases(placement.Service, svc)
-		actions = append(actions, Action{
-			Kind:          ActionPull,
-			Host:          placement.Host,
-			Service:       placement.Service,
-			Replica:       placement.Replica,
-			Release:       input.ReleaseID,
-			ContainerName: name,
-			Image:         image,
-		})
+		pullKey := placement.Host.Name + "\x00" + image
+		if _, ok := pulledImages[pullKey]; !ok {
+			actions = append(actions, Action{
+				Kind:          ActionPull,
+				Host:          placement.Host,
+				Service:       placement.Service,
+				Replica:       placement.Replica,
+				Release:       input.ReleaseID,
+				ContainerName: name,
+				Image:         image,
+			})
+			pulledImages[pullKey] = struct{}{}
+		}
 		if usesFixedHostPorts(svc) {
 			for _, old := range replacementStopCandidates(input.Config, input.EnvName, placement, name, input.Observed) {
-				actions = appendStopActions(actions, old, svc)
+				actions = appendPreserveStopActions(actions, old, svc)
 				preStopped[observedKey(old)] = struct{}{}
 			}
 		} else {
@@ -218,7 +250,7 @@ func BuildActions(input PlanInput) ([]Action, error) {
 					return nil, fmt.Errorf("service %q rolling strategy cannot have max_surge=0 and max_unavailable=0", placement.Service)
 				}
 				for _, old := range replacements {
-					actions = appendStopActions(actions, old, svc)
+					actions = appendPreserveStopActions(actions, old, svc)
 					preStopped[observedKey(old)] = struct{}{}
 				}
 			} else {
@@ -315,6 +347,15 @@ func BuildActions(input PlanInput) ([]Action, error) {
 		serviceName := old.Container.Labels[docker.LabelService]
 		actions = appendStopActions(actions, old, input.Config.Services[serviceName])
 	}
+	preCommitCount := len(actions)
+	for i := 0; i < preCommitCount; i++ {
+		if actions[i].Kind != ActionPreserveStop {
+			continue
+		}
+		cleanup := actions[i]
+		cleanup.Kind = ActionRemovePreserved
+		actions = append(actions, cleanup)
+	}
 	return actions, nil
 }
 
@@ -367,7 +408,7 @@ func flushPendingStops(actions []Action, pendingStops map[string][]ObservedConta
 		if _, ok := preStopped[observedKey(old)]; ok {
 			continue
 		}
-		actions = appendStopActions(actions, old, svc)
+		actions = appendPreserveStopActions(actions, old, svc)
 		preStopped[observedKey(old)] = struct{}{}
 	}
 	pendingStops[serviceName] = nil
@@ -442,23 +483,36 @@ func FixedPortRollbackConflicts(input PlanInput) ([]FixedPortRollbackConflict, e
 }
 
 func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory, sleep func(time.Duration)) error {
+	_, err := ExecuteActionsWithResult(ctx, actions, agentFor, sleep)
+	return err
+}
+
+// ExecuteActionsWithResult executes actions transactionally through the ingress commit point.
+func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor AgentFactory, sleep func(time.Duration)) (ExecutionResult, error) {
 	if agentFor == nil {
-		return errors.New("agent factory is required")
+		return ExecutionResult{}, errors.New("agent factory is required")
 	}
 	if sleep == nil {
 		sleep = time.Sleep
+	}
+	var started []Action
+	var preserved []Action
+	var cleanup []Action
+	ensuredNetworks := map[string]struct{}{}
+	fail := func(primary error) (ExecutionResult, error) {
+		return ExecutionResult{}, compensateActions(ctx, primary, started, preserved, agentFor)
 	}
 	for _, action := range actions {
 		switch action.Kind {
 		case ActionPull:
 			client := agentFor(action.Host)
 			if err := client.Call(ctx, "pull", map[string]string{"image": action.Image}, nil); err != nil {
-				return fmt.Errorf("pull %s on %s: %w", action.Image, action.Host.Name, err)
+				return fail(fmt.Errorf("pull %s on %s: %w", action.Image, action.Host.Name, err))
 			}
 		case ActionStart:
 			client := agentFor(action.Host)
-			if err := ensureNetwork(ctx, client, action); err != nil {
-				return fmt.Errorf("ensure network %s on %s: %w", action.Network, action.Host.Name, err)
+			if err := ensureNetworkOnce(ctx, client, action.Host, action, ensuredNetworks); err != nil {
+				return fail(fmt.Errorf("ensure network %s on %s: %w", action.Network, action.Host.Name, err))
 			}
 			params := agent.RunContainerParams{
 				Name:           action.ContainerName,
@@ -470,15 +524,16 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 				NetworkAliases: action.NetworkAliases,
 			}
 			if err := client.Call(ctx, "run_container", params, nil); err != nil {
-				return fmt.Errorf("start %s on %s: %w", action.ContainerName, action.Host.Name, err)
+				return fail(fmt.Errorf("start %s on %s: %w", action.ContainerName, action.Host.Name, err))
 			}
+			started = append(started, action)
 		case ActionHealth:
 			if err := executeHealthAction(ctx, action, agentFor, sleep); err != nil {
-				return err
+				return fail(err)
 			}
 		case ActionIngress:
-			if err := executeIngressAction(ctx, action, agentFor); err != nil {
-				return err
+			if err := executeIngressAction(ctx, action, agentFor, ensuredNetworks); err != nil {
+				return fail(err)
 			}
 		case ActionDrain:
 			sleep(action.DrainTimeout)
@@ -487,13 +542,52 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 		case ActionStop:
 			client := agentFor(action.Host)
 			if err := client.Call(ctx, "stop_container", map[string]string{"name": action.ContainerName}, nil); err != nil {
-				return fmt.Errorf("stop %s on %s: %w", action.ContainerName, action.Host.Name, err)
+				return fail(fmt.Errorf("stop %s on %s: %w", action.ContainerName, action.Host.Name, err))
 			}
+		case ActionPreserveStop:
+			client := agentFor(action.Host)
+			if err := client.Call(ctx, "stop_container_keep", map[string]string{"name": action.ContainerName}, nil); err != nil {
+				return fail(fmt.Errorf("preserve %s on %s: %w", action.ContainerName, action.Host.Name, err))
+			}
+			preserved = append(preserved, action)
+		case ActionRemovePreserved:
+			cleanup = append(cleanup, action)
 		default:
-			return fmt.Errorf("unknown deployment action %q", action.Kind)
+			return fail(fmt.Errorf("unknown deployment action %q", action.Kind))
 		}
 	}
-	return nil
+	result := ExecutionResult{}
+	for _, action := range cleanup {
+		client := agentFor(action.Host)
+		if err := client.Call(ctx, "remove_container", map[string]string{"name": action.ContainerName}, nil); err != nil {
+			result.CleanupWarnings = append(result.CleanupWarnings, CleanupWarning{
+				Host:          action.Host,
+				ContainerName: action.ContainerName,
+				Err:           err,
+			})
+		}
+	}
+	return result, nil
+}
+
+func compensateActions(ctx context.Context, primary error, started, preserved []Action, agentFor AgentFactory) error {
+	var failures []string
+	for i := len(started) - 1; i >= 0; i-- {
+		action := started[i]
+		if err := agentFor(action.Host).Call(ctx, "remove_container", map[string]string{"name": action.ContainerName}, nil); err != nil {
+			failures = append(failures, fmt.Sprintf("remove %s on %s: %v", action.ContainerName, action.Host.Name, err))
+		}
+	}
+	for i := len(preserved) - 1; i >= 0; i-- {
+		action := preserved[i]
+		if err := agentFor(action.Host).Call(ctx, "start_container", map[string]string{"name": action.ContainerName}, nil); err != nil {
+			failures = append(failures, fmt.Sprintf("restart %s on %s: %v", action.ContainerName, action.Host.Name, err))
+		}
+	}
+	if len(failures) == 0 {
+		return primary
+	}
+	return fmt.Errorf("%w; additionally failed to compensate: %s", primary, strings.Join(failures, "; "))
 }
 
 func executeHealthAction(ctx context.Context, action Action, agentFor AgentFactory, sleep func(time.Duration)) error {
@@ -527,7 +621,7 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 // running. The snapshot is read live from the host, not from local .ship/
 // state: a CI runner's checkout never carries state from prior deploys, so
 // sourcing "previous" locally silently turned rollback into a no-op there.
-func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory) error {
+func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	remotePath := remoteCaddyfilePath(action.IngressPath)
 	previous := map[string]ingressSnapshot{}
 	for _, host := range action.IngressHosts {
@@ -536,8 +630,8 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 
 	var reloaded []scheduler.Host
 	for _, host := range action.IngressHosts {
-		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
-			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if err := applyCaddyContainer(ctx, host, action, agentFor, ensuredNetworks); err != nil {
+			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 				return fmt.Errorf("reload ingress on %s: %w; additionally failed to roll back ingress: %v", host.Name, err, rollbackErr)
 			}
 			return fmt.Errorf("reload ingress on %s: %w", host.Name, err)
@@ -546,13 +640,13 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 	}
 
 	if err := os.MkdirAll(filepath.Dir(action.IngressPath), 0o755); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 			return fmt.Errorf("prepare ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("prepare ingress state: %w", err)
 	}
 	if err := fsatomic.WriteFile(action.IngressPath, []byte(action.IngressConfig), 0o644); err != nil {
-		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor); rollbackErr != nil {
+		if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 			return fmt.Errorf("write ingress state: %w; additionally failed to roll back ingress: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("write ingress state: %w", err)
@@ -632,7 +726,7 @@ func hostsByName(byName map[string]scheduler.Host) []scheduler.Host {
 	return hosts
 }
 
-func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous map[string]ingressSnapshot, base Action, agentFor AgentFactory) error {
+func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous map[string]ingressSnapshot, base Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	var errs []string
 	for _, host := range hosts {
 		snap, ok := previous[host.Name]
@@ -641,7 +735,7 @@ func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous 
 		}
 		action := base
 		action.IngressConfig = snap.content
-		if err := applyCaddyContainer(ctx, host, action, agentFor); err != nil {
+		if err := applyCaddyContainer(ctx, host, action, agentFor, ensuredNetworks); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", host.Name, err))
 		}
 	}
@@ -651,7 +745,7 @@ func rollbackIngressHosts(ctx context.Context, hosts []scheduler.Host, previous 
 	return nil
 }
 
-func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action, agentFor AgentFactory) error {
+func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
 	client := agentFor(host)
 	if strings.TrimSpace(action.IngressConfig) == "" {
 		if action.CaddyName != "" {
@@ -685,7 +779,7 @@ func applyCaddyContainer(ctx context.Context, host scheduler.Host, action Action
 	if configVolume == "" {
 		configVolume = name + "_config"
 	}
-	if err := ensureNetwork(ctx, client, action); err != nil {
+	if err := ensureNetworkOnce(ctx, client, host, action, ensuredNetworks); err != nil {
 		return err
 	}
 	if err := validateCaddyfile(ctx, client, remotePath, image); err != nil {
@@ -788,6 +882,21 @@ func ensureNetwork(ctx context.Context, client Agent, action Action) error {
 		return nil
 	}
 	return client.Call(ctx, "ensure_network", agent.EnsureNetworkParams{Name: action.Network, Driver: action.NetworkDriver}, nil)
+}
+
+func ensureNetworkOnce(ctx context.Context, client Agent, host scheduler.Host, action Action, ensuredNetworks map[string]struct{}) error {
+	if strings.TrimSpace(action.Network) == "" {
+		return nil
+	}
+	key := host.Name + "\x00" + action.Network
+	if _, ok := ensuredNetworks[key]; ok {
+		return nil
+	}
+	if err := ensureNetwork(ctx, client, action); err != nil {
+		return err
+	}
+	ensuredNetworks[key] = struct{}{}
+	return nil
 }
 
 func remoteCaddyfilePath(localPath string) string {
@@ -1276,6 +1385,14 @@ func replacementStopCandidates(cfg *config.Config, envName string, placement sch
 }
 
 func appendStopActions(actions []Action, old ObservedContainer, svc config.Service) []Action {
+	return appendContainerStopActions(actions, old, svc, ActionStop)
+}
+
+func appendPreserveStopActions(actions []Action, old ObservedContainer, svc config.Service) []Action {
+	return appendContainerStopActions(actions, old, svc, ActionPreserveStop)
+}
+
+func appendContainerStopActions(actions []Action, old ObservedContainer, svc config.Service, kind ActionKind) []Action {
 	serviceName := old.Container.Labels[docker.LabelService]
 	replica, _ := strconv.Atoi(old.Container.Labels[docker.LabelReplica])
 	if svc.Rolling.DrainTimeoutSeconds > 0 {
@@ -1290,7 +1407,7 @@ func appendStopActions(actions []Action, old ObservedContainer, svc config.Servi
 		})
 	}
 	return append(actions, Action{
-		Kind:          ActionStop,
+		Kind:          kind,
 		Host:          old.Host,
 		Service:       serviceName,
 		Replica:       replica,

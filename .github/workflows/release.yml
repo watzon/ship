@@ -42,32 +42,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Verify module
-        run: go mod verify
-
-      - name: Check formatting
-        run: |
-          UNFORMATTED="$(gofmt -l .)"
-          if [ -n "$UNFORMATTED" ]; then
-            echo "gofmt needed on:" && echo "$UNFORMATTED"
-            exit 1
-          fi
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Install Caddy
+      - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y caddy
+          sudo apt-get install -y build-essential caddy
 
-      - name: Test
+      - name: Run local verification gates
         env:
-          SHIP_DOCS_VERSION_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
-        run: go test -race ./...
-
-      - name: Vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          SHIP_DOCS_VERSION_TAG: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.tag) || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+        run: ./scripts/ci-local.sh
 
   build:
     name: Build ${{ matrix.goos }}-${{ matrix.goarch }}

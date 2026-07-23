@@ -321,4 +321,4 @@ Root hooks run before environment hooks. Hook env includes `SHIP_PROJECT`, `SHIP
 | Recovery | `docs/recovery.md` |
 | Sample config | `internal/config/config.go` → `Sample()` |
 
-When editing Ship itself (not deploying an app), run `go test ./...` and `go build ./cmd/ship`.
+When editing Ship itself (not deploying an app), use `go test ./...` for faster inner-loop checks. Run `./scripts/ci-local.sh` for full verification before handing off changes.

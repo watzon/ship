@@ -2,9 +2,12 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -240,6 +243,209 @@ func TestRecordAndReadEvents(t *testing.T) {
 	}
 	if !json.Valid(data) {
 		t.Fatalf("events file is not json: %s", data)
+	}
+}
+
+func TestRecordEventConcurrentWritesPreserveEveryEvent(t *testing.T) {
+	const eventCount = 32
+
+	store := NewStore(t.TempDir())
+	start := make(chan struct{})
+	errs := make(chan error, eventCount)
+	var wg sync.WaitGroup
+	for i := 0; i < eventCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs <- store.RecordEvent(Event{
+				Time:        time.Unix(int64(eventCount-i), 0),
+				Environment: "production",
+				Kind:        "deploy",
+				Status:      "succeeded",
+				Message:     fmt.Sprintf("event-%02d", i),
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("RecordEvent returned an error: %v", err)
+		}
+	}
+
+	events, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != eventCount {
+		t.Fatalf("event count = %d, want %d", len(events), eventCount)
+	}
+	seen := make(map[string]bool, eventCount)
+	for i, event := range events {
+		if seen[event.Message] {
+			t.Fatalf("duplicate event message %q", event.Message)
+		}
+		seen[event.Message] = true
+		wantMessage := fmt.Sprintf("event-%02d", eventCount-1-i)
+		if event.Message != wantMessage {
+			t.Fatalf("event %d message = %q, want %q", i, event.Message, wantMessage)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Join(store.Dir, "events", "production.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("events file is not valid JSON: %s", data)
+	}
+}
+
+func TestRecordEventPreservesCorruptHistory(t *testing.T) {
+	store := NewStore(t.TempDir())
+	path := store.eventsPath("production")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("{corrupt event history")
+	if err := os.WriteFile(path, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.RecordEvent(Event{
+		Environment: "production",
+		Kind:        "deploy",
+		Status:      "succeeded",
+	})
+	if err == nil {
+		t.Fatal("expected corrupt history error")
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("corrupt history changed to %q, want %q", got, want)
+	}
+}
+
+func TestRecordEventDifferentEnvironmentsDoNotBlockOrMix(t *testing.T) {
+	store := NewStore(t.TempDir())
+	productionLockPath := store.eventLockPath("production")
+	if err := os.MkdirAll(filepath.Dir(productionLockPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	productionLock, err := os.OpenFile(productionLockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			_ = syscall.Flock(int(productionLock.Fd()), syscall.LOCK_UN)
+		}
+		_ = productionLock.Close()
+	})
+	if err := syscall.Flock(int(productionLock.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	stagingDone := make(chan error, 1)
+	go func() {
+		stagingDone <- store.RecordEvent(Event{
+			Environment: "staging",
+			Kind:        "deploy",
+			Status:      "succeeded",
+			Message:     "staging event",
+		})
+	}()
+	select {
+	case err := <-stagingDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("staging event was blocked by the production event lock")
+	}
+
+	if err := syscall.Flock(int(productionLock.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	locked = false
+	if err := store.RecordEvent(Event{
+		Environment: "production",
+		Kind:        "deploy",
+		Status:      "succeeded",
+		Message:     "production event",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	productionEvents, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagingEvents, err := store.Events("staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(productionEvents) != 1 || productionEvents[0].Message != "production event" {
+		t.Fatalf("production events = %+v", productionEvents)
+	}
+	if len(stagingEvents) != 1 || stagingEvents[0].Message != "staging event" {
+		t.Fatalf("staging events = %+v", stagingEvents)
+	}
+}
+
+func TestRecordEventEqualTimestampsRetainInsertionOrder(t *testing.T) {
+	store := NewStore(t.TempDir())
+	timestamp := time.Unix(10, 0)
+	for _, message := range []string{"first", "second", "third"} {
+		if err := store.RecordEvent(Event{
+			Time:        timestamp,
+			Environment: "production",
+			Kind:        "deploy",
+			Status:      "succeeded",
+			Message:     message,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := store.Events("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %+v", events)
+	}
+	for i, want := range []string{"first", "second", "third"} {
+		if events[i].Message != want {
+			t.Fatalf("event %d message = %q, want %q", i, events[i].Message, want)
+		}
+	}
+}
+
+func TestRecordEventReturnsLockOpenFailure(t *testing.T) {
+	store := NewStore(t.TempDir())
+	lockPath := store.eventLockPath("production")
+	if err := os.MkdirAll(lockPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.RecordEvent(Event{
+		Environment: "production",
+		Kind:        "deploy",
+		Status:      "succeeded",
+	})
+	if err == nil {
+		t.Fatal("expected lock open error")
+	}
+	if _, statErr := os.Stat(store.eventsPath("production")); !os.IsNotExist(statErr) {
+		t.Fatalf("event history should not exist after lock failure: %v", statErr)
 	}
 }
 

@@ -1,7 +1,15 @@
 # Development
 
 
-Default CI-safe coverage:
+Run the full local verification used by CI before opening a pull request:
+
+```bash
+./scripts/ci-local.sh
+```
+
+The full gate requires a C compiler because it runs the Go race detector with cgo enabled.
+
+For a faster inner loop while editing, run:
 
 ```bash
 go test ./...

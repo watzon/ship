@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/provider"
@@ -129,6 +132,237 @@ func TestListFiltersTagsAndDeleteRemovesCompanionResources(t *testing.T) {
 	}
 }
 
+func TestDeleteWaitsForAzureOperations(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	api.operations = map[string][]fakeOperationResponse{
+		"vm": {
+			{Status: "Running", RetryAfter: "0"},
+			{Status: "Succeeded"},
+		},
+		"nic": {
+			{Status: "InProgress", RetryAfter: "0"},
+			{Status: "Succeeded"},
+		},
+		"pip": {
+			{Status: "Accepted", RetryAfter: "0"},
+			{Status: "sUcCeEdEd"},
+		},
+	}
+	api.operationHeaders = map[string]string{
+		"vm":  "Azure-AsyncOperation",
+		"nic": "Location",
+		"pip": "Azure-AsyncOperation",
+	}
+
+	client := api.client()
+	client.PollInterval = time.Hour
+	err := client.Delete(context.Background(), provider.Host{ID: "web-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api.prematureNIC {
+		t.Fatal("network interface deletion began before the virtual machine operation succeeded")
+	}
+	if got, want := strings.Join(api.events, ","), "delete:vm,poll:vm:Running,poll:vm:Succeeded,delete:nic,poll:nic:InProgress,poll:nic:Succeeded,delete:pip,poll:pip:Accepted,poll:pip:sUcCeEdEd"; got != want {
+		t.Fatalf("events = %q, want %q", got, want)
+	}
+}
+
+func TestDeleteVirtualMachineOperationFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  string
+		code    string
+		message string
+	}{
+		{name: "failed", status: "Failed", code: "DeleteFailed", message: "the VM is locked"},
+		{name: "canceled", status: "Canceled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newFakeAzureAPI(t, nil)
+			api.operations = map[string][]fakeOperationResponse{
+				"vm": {{Status: tt.status, Code: tt.code, Message: tt.message}},
+			}
+			err := api.client().DeleteVirtualMachine(context.Background(), "web-1")
+			if err == nil {
+				t.Fatal("expected operation failure")
+			}
+			for _, want := range []string{"virtual machine", "web-1", tt.status} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error = %q, want %q", err, want)
+				}
+			}
+			if tt.code != "" && (!strings.Contains(err.Error(), tt.code) || !strings.Contains(err.Error(), tt.message)) {
+				t.Fatalf("error = %q, want Azure error details", err)
+			}
+			if strings.Contains(err.Error(), "test-token") {
+				t.Fatalf("error contains bearer token: %q", err)
+			}
+		})
+	}
+}
+
+func TestDeleteVirtualMachineOperationStopsWithContext(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		api := newFakeAzureAPI(t, nil)
+		api.operations = map[string][]fakeOperationResponse{
+			"vm": {{Status: "Running"}},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		err := api.client().DeleteVirtualMachine(ctx, "web-1")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want deadline exceeded", err)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		api := newFakeAzureAPI(t, nil)
+		api.operations = map[string][]fakeOperationResponse{
+			"vm": {{Status: "Running"}},
+		}
+		polled := make(chan struct{})
+		var once sync.Once
+		api.operationPollHook = func(kind string) {
+			if kind == "vm" {
+				once.Do(func() { close(polled) })
+			}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-polled
+			cancel()
+		}()
+		err := api.client().DeleteVirtualMachine(ctx, "web-1")
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context canceled", err)
+		}
+	})
+
+	t.Run("configured operation timeout", func(t *testing.T) {
+		api := newFakeAzureAPI(t, nil)
+		api.operations = map[string][]fakeOperationResponse{
+			"vm": {{Status: "Running"}},
+		}
+		client := api.client()
+		client.OperationTimeout = 10 * time.Millisecond
+		err := client.DeleteVirtualMachine(context.Background(), "web-1")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want configured operation timeout", err)
+		}
+	})
+}
+
+func TestDeleteVirtualMachineAcceptedWithoutOperationURL(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	api.operations = map[string][]fakeOperationResponse{
+		"vm": {{Status: "Succeeded"}},
+	}
+	api.omitOperationURL = map[string]bool{"vm": true}
+	err := api.client().DeleteVirtualMachine(context.Background(), "web-1")
+	if err == nil || !strings.Contains(err.Error(), "202") || !strings.Contains(err.Error(), "operation URL") {
+		t.Fatalf("error = %v, want missing operation URL", err)
+	}
+}
+
+func TestDeleteReturnsCompanionCleanupFailures(t *testing.T) {
+	tests := []struct {
+		name          string
+		failures      map[string]fakeDeleteFailure
+		wantFragments []string
+	}{
+		{
+			name:     "network interface failure still attempts public IP",
+			failures: map[string]fakeDeleteFailure{"nic": {Status: http.StatusConflict, Body: `{"error":{"code":"NicBusy"}}`}},
+			wantFragments: []string{
+				"web-1-nic",
+			},
+		},
+		{
+			name:     "public IP failure",
+			failures: map[string]fakeDeleteFailure{"pip": {Status: http.StatusConflict, Body: `{"error":{"code":"IPBusy"}}`}},
+			wantFragments: []string{
+				"web-1-pip",
+			},
+		},
+		{
+			name: "failures use stable cleanup order",
+			failures: map[string]fakeDeleteFailure{
+				"nic": {Status: http.StatusConflict, Body: `{"error":{"code":"NicBusy"}}`},
+				"pip": {Status: http.StatusConflict, Body: `{"error":{"code":"IPBusy"}}`},
+			},
+			wantFragments: []string{"web-1-nic", "web-1-pip"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := newFakeAzureAPI(t, nil)
+			api.deleteFailures = tt.failures
+			err := api.client().Delete(context.Background(), provider.Host{ID: "web-1"})
+			if err == nil {
+				t.Fatal("expected cleanup failure")
+			}
+			if got, want := strings.Join(api.deletes, ","), "vm:web-1,nic:web-1-nic,pip:web-1-pip"; got != want {
+				t.Fatalf("deletes = %q, want %q", got, want)
+			}
+			previous := -1
+			for _, want := range tt.wantFragments {
+				index := strings.Index(err.Error(), want)
+				if index < 0 {
+					t.Fatalf("error = %q, want %q", err, want)
+				}
+				if index <= previous {
+					t.Fatalf("error = %q, cleanup errors are out of order", err)
+				}
+				previous = index
+			}
+		})
+	}
+}
+
+func TestDeleteAttemptsPublicIPAfterNetworkInterfaceOperationFailure(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	api.operations = map[string][]fakeOperationResponse{
+		"nic": {{Status: "Failed", Code: "NicBusy", Message: "network interface is still attached"}},
+	}
+	err := api.client().Delete(context.Background(), provider.Host{ID: "web-1"})
+	if err == nil || !strings.Contains(err.Error(), "web-1-nic") || !strings.Contains(err.Error(), "Failed") {
+		t.Fatalf("error = %v, want network interface operation failure", err)
+	}
+	if got, want := strings.Join(api.deletes, ","), "vm:web-1,nic:web-1-nic,pip:web-1-pip"; got != want {
+		t.Fatalf("deletes = %q, want %q", got, want)
+	}
+}
+
+func TestDeleteTreatsMissingCompanionResourcesAsAbsent(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	api.deleteFailures = map[string]fakeDeleteFailure{
+		"nic": {Status: http.StatusNotFound, Body: `{"error":{"code":"ResourceNotFound"}}`},
+		"pip": {Status: http.StatusNotFound, Body: `{"error":{"code":"ResourceNotFound"}}`},
+	}
+	if err := api.client().Delete(context.Background(), provider.Host{ID: "web-1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	api.publicIPGetFailure = &fakeDeleteFailure{Status: http.StatusNotFound, Body: `{"error":{"code":"ResourceNotFound"}}`}
+	if _, err := api.client().GetPublicIPAddress(context.Background(), "web-1-pip"); err == nil {
+		t.Fatal("GET 404 must remain an error")
+	}
+}
+
+func TestDeleteDryRunPerformsNoRequests(t *testing.T) {
+	api := newFakeAzureAPI(t, nil)
+	client := api.client()
+	client.DryRun = true
+	if err := client.Delete(context.Background(), provider.Host{ID: "web-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.events) != 0 || len(api.deletes) != 0 {
+		t.Fatalf("dry-run requests = events %v, deletes %v", api.events, api.deletes)
+	}
+}
+
 func TestBearerTokenUsesClientCredentials(t *testing.T) {
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -195,13 +429,35 @@ func testEnvironment(count int) config.Environment {
 }
 
 type fakeAzureAPI struct {
-	server            *httptest.Server
-	existing          []VirtualMachine
-	securityGroups    []securityGroupRequest
-	publicIPs         []publicIPRequest
-	networkInterfaces []networkInterfaceRequest
-	virtualMachines   []virtualMachineRequest
-	deletes           []string
+	server             *httptest.Server
+	existing           []VirtualMachine
+	securityGroups     []securityGroupRequest
+	publicIPs          []publicIPRequest
+	networkInterfaces  []networkInterfaceRequest
+	virtualMachines    []virtualMachineRequest
+	deletes            []string
+	events             []string
+	operations         map[string][]fakeOperationResponse
+	operationPolls     map[string]int
+	operationHeaders   map[string]string
+	omitOperationURL   map[string]bool
+	operationSucceeded map[string]bool
+	operationPollHook  func(string)
+	deleteFailures     map[string]fakeDeleteFailure
+	publicIPGetFailure *fakeDeleteFailure
+	prematureNIC       bool
+}
+
+type fakeOperationResponse struct {
+	Status     string
+	Code       string
+	Message    string
+	RetryAfter string
+}
+
+type fakeDeleteFailure struct {
+	Status int
+	Body   string
 }
 
 type securityGroupRequest struct {
@@ -274,13 +530,41 @@ type virtualMachineRequest struct {
 
 func newFakeAzureAPI(t *testing.T, existing []VirtualMachine) *fakeAzureAPI {
 	t.Helper()
-	api := &fakeAzureAPI{existing: existing}
+	api := &fakeAzureAPI{
+		existing:           existing,
+		operationPolls:     make(map[string]int),
+		operationSucceeded: make(map[string]bool),
+	}
 	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
 		}
 		path := r.URL.Path
 		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/operations/"):
+			kind := pathBase(path)
+			responses := api.operations[kind]
+			if len(responses) == 0 {
+				t.Fatalf("no operation responses for %q", kind)
+			}
+			poll := api.operationPolls[kind]
+			response := responses[min(poll, len(responses)-1)]
+			api.operationPolls[kind] = poll + 1
+			api.events = append(api.events, "poll:"+kind+":"+response.Status)
+			if strings.EqualFold(response.Status, "Succeeded") {
+				api.operationSucceeded[kind] = true
+			}
+			if response.RetryAfter != "" {
+				w.Header().Set("Retry-After", response.RetryAfter)
+			}
+			if api.operationPollHook != nil {
+				api.operationPollHook(kind)
+			}
+			body := map[string]any{"status": response.Status}
+			if response.Code != "" || response.Message != "" {
+				body["error"] = map[string]string{"code": response.Code, "message": response.Message}
+			}
+			_ = json.NewEncoder(w).Encode(body)
 		case r.Method == http.MethodPut && strings.Contains(path, "/providers/Microsoft.Network/networkSecurityGroups/"):
 			var req securityGroupRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -316,19 +600,27 @@ func newFakeAzureAPI(t *testing.T, existing []VirtualMachine) *fakeAzureAPI {
 			name := pathBase(path)
 			_ = json.NewEncoder(w).Encode(VirtualMachine{Name: name, Tags: req.Tags, Location: req.Location})
 		case r.Method == http.MethodGet && strings.Contains(path, "/providers/Microsoft.Network/publicIPAddresses/"):
+			if api.publicIPGetFailure != nil {
+				w.WriteHeader(api.publicIPGetFailure.Status)
+				_, _ = w.Write([]byte(api.publicIPGetFailure.Body))
+				return
+			}
 			name := pathBase(path)
 			_ = json.NewEncoder(w).Encode(PublicIPAddress{Name: name, Properties: struct {
 				IPAddress string `json:"ipAddress"`
 			}{IPAddress: "203.0.113.20"}})
 		case r.Method == http.MethodDelete && strings.Contains(path, "/providers/Microsoft.Compute/virtualMachines/"):
-			api.deletes = append(api.deletes, "vm:"+pathBase(path))
-			w.WriteHeader(http.StatusAccepted)
+			api.handleDelete(w, "vm", pathBase(path))
 		case r.Method == http.MethodDelete && strings.Contains(path, "/providers/Microsoft.Network/networkInterfaces/"):
-			api.deletes = append(api.deletes, "nic:"+pathBase(path))
-			w.WriteHeader(http.StatusAccepted)
+			if _, waits := api.operations["vm"]; waits && !api.operationSucceeded["vm"] {
+				api.prematureNIC = true
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":"VMStillDeleting"}}`))
+				return
+			}
+			api.handleDelete(w, "nic", pathBase(path))
 		case r.Method == http.MethodDelete && strings.Contains(path, "/providers/Microsoft.Network/publicIPAddresses/"):
-			api.deletes = append(api.deletes, "pip:"+pathBase(path))
-			w.WriteHeader(http.StatusAccepted)
+			api.handleDelete(w, "pip", pathBase(path))
 		default:
 			t.Fatalf("%s %s", r.Method, r.URL.String())
 		}
@@ -337,13 +629,37 @@ func newFakeAzureAPI(t *testing.T, existing []VirtualMachine) *fakeAzureAPI {
 	return api
 }
 
+func (api *fakeAzureAPI) handleDelete(w http.ResponseWriter, kind, name string) {
+	api.deletes = append(api.deletes, kind+":"+name)
+	api.events = append(api.events, "delete:"+kind)
+	if failure, ok := api.deleteFailures[kind]; ok {
+		w.WriteHeader(failure.Status)
+		_, _ = w.Write([]byte(failure.Body))
+		return
+	}
+	if _, async := api.operations[kind]; async {
+		if !api.omitOperationURL[kind] {
+			header := api.operationHeaders[kind]
+			if header == "" {
+				header = "Azure-AsyncOperation"
+			}
+			w.Header().Set(header, "/operations/"+kind)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (api *fakeAzureAPI) client() Client {
 	return Client{
-		AccessToken:    "test-token",
-		SubscriptionID: "sub-123",
-		ResourceGroup:  "rg-ship",
-		HTTP:           api.server.Client(),
-		BaseURL:        api.server.URL,
+		AccessToken:      "test-token",
+		SubscriptionID:   "sub-123",
+		ResourceGroup:    "rg-ship",
+		HTTP:             api.server.Client(),
+		BaseURL:          api.server.URL,
+		PollInterval:     time.Millisecond,
+		OperationTimeout: 100 * time.Millisecond,
 	}
 }
 
