@@ -42,7 +42,7 @@ ship --dry-run rollback production --to RELEASE_ID --allow-data-rollback
 ship rollback production --to RELEASE_ID --allow-data-rollback
 ```
 
-Use `--allow-data-rollback` when configured accessories make data compatibility a manual decision. Real rollbacks also compare the target release's recorded secret digests with currently rendered secrets before touching hosts; if they differ, Ship blocks before mutation and records a blocked rollback event. Use `ship secrets diff ENV` to inspect drift, restore the intended secret values, or pass `--allow-secret-drift` when you intentionally want the old image to run with the current secrets.
+Use `--allow-data-rollback` when configured accessories make data compatibility a manual decision. Real rollbacks also compare the target release's recorded secret digests with currently rendered secrets before touching hosts; if they differ, Ship blocks before mutation and records a blocked rollback event. Use `ship secrets diff ENV` to compare the encrypted store with the release. If the rollback environment intentionally overlays secrets from process environment variables, use `ship secrets diff ENV --with-process-env` to inspect those effective values. Restore the intended secret values, or pass `--allow-secret-drift` when you intentionally want the old image to run with the current secrets.
 
 Accessory restore:
 

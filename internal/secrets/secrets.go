@@ -27,31 +27,39 @@ type Check struct {
 }
 
 type RenderedEnvFile struct {
-	Content  string
-	Redacted string
-	Checks   []Check
-	Digests  map[string]string
+	Content                  string
+	Redacted                 string
+	Checks                   []Check
+	Digests                  map[string]string
+	ProcessEnvStoreOverrides []string
 }
 
 type SourceOptions struct {
-	EnvName      string
-	ConfigPath   string
-	StateDir     string
-	EnvFiles     []string
-	IdentityFile string
-	LookupEnv    func(string) (string, bool)
+	EnvName        string
+	ConfigPath     string
+	StateDir       string
+	EnvFiles       []string
+	IdentityFile   string
+	LookupEnv      func(string) (string, bool)
+	SkipProcessEnv bool
 }
 
 type ScopedRenderedEnvFiles struct {
-	Scopes  map[string]RenderedEnvFile
-	Checks  []Check
-	Digests map[string]string
+	Scopes                   map[string]RenderedEnvFile
+	Checks                   []Check
+	Digests                  map[string]string
+	ProcessEnvStoreOverrides []string
 }
 
 type DigestDiff struct {
 	Missing []string
 	Changed []string
 	Extra   []string
+}
+
+type resolvedValues struct {
+	values                   map[string]string
+	processEnvStoreOverrides []string
 }
 
 func Verify(cfg *config.Config) ([]Check, error) {
@@ -128,11 +136,16 @@ func RenderForEnv(cfg *config.Config, opts SourceOptions) (RenderedEnvFile, erro
 	if err != nil {
 		return RenderedEnvFile{}, err
 	}
-	values, err := ResolveValues(names, opts)
+	resolved, err := resolveValues(names, opts)
 	if err != nil {
 		return RenderedEnvFile{}, err
 	}
-	return renderEnvFileFromValues(names, values)
+	rendered, err := renderEnvFileFromValues(names, resolved.values)
+	if err != nil {
+		return RenderedEnvFile{}, err
+	}
+	rendered.ProcessEnvStoreOverrides = resolved.processEnvStoreOverrides
+	return rendered, nil
 }
 
 func RenderScopedForEnv(cfg *config.Config, opts SourceOptions, onlyScopes ...string) (ScopedRenderedEnvFiles, error) {
@@ -160,20 +173,21 @@ func RenderScopedForEnv(cfg *config.Config, opts SourceOptions, onlyScopes ...st
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	values, err := ResolveValues(names, opts)
+	resolved, err := resolveValues(names, opts)
 	if err != nil {
 		return ScopedRenderedEnvFiles{}, err
 	}
 	out := ScopedRenderedEnvFiles{
-		Scopes:  map[string]RenderedEnvFile{},
-		Digests: map[string]string{},
+		Scopes:                   map[string]RenderedEnvFile{},
+		Digests:                  map[string]string{},
+		ProcessEnvStoreOverrides: resolved.processEnvStoreOverrides,
 	}
 	checksByName := map[string]Check{}
 	for _, name := range names {
-		checksByName[name] = Check{Name: name, Present: true, Digest: Digest(values[name])}
+		checksByName[name] = Check{Name: name, Present: true, Digest: Digest(resolved.values[name])}
 	}
 	for scope, scopeNames := range scopes {
-		rendered, err := renderEnvFileFromValues(scopeNames, values)
+		rendered, err := renderEnvFileFromValues(scopeNames, resolved.values)
 		if err != nil {
 			return ScopedRenderedEnvFiles{}, err
 		}
@@ -189,11 +203,18 @@ func RenderScopedForEnv(cfg *config.Config, opts SourceOptions, onlyScopes ...st
 }
 
 func ResolveValues(names []string, opts SourceOptions) (map[string]string, error) {
+	resolved, err := resolveValues(names, opts)
+	return resolved.values, err
+}
+
+func resolveValues(names []string, opts SourceOptions) (resolvedValues, error) {
 	values := map[string]string{}
+	storeValues := map[string]string{}
 	if opts.EnvName != "" {
-		storeValues, err := ReadStore(opts)
+		var err error
+		storeValues, err = ReadStore(opts)
 		if err != nil {
-			return nil, err
+			return resolvedValues{}, err
 		}
 		for name, value := range storeValues {
 			values[name] = value
@@ -202,34 +223,46 @@ func ResolveValues(names []string, opts SourceOptions) (map[string]string, error
 	for _, file := range opts.EnvFiles {
 		fileValues, err := ReadDotenv(file)
 		if err != nil {
-			return nil, err
+			return resolvedValues{}, err
 		}
 		for name, value := range fileValues {
 			values[name] = value
 		}
 	}
-	lookup := opts.LookupEnv
-	if lookup == nil {
-		lookup = os.LookupEnv
+	var processEnvStoreOverrides []string
+	if !opts.SkipProcessEnv {
+		lookup := opts.LookupEnv
+		if lookup == nil {
+			lookup = os.LookupEnv
+		}
+		for _, name := range names {
+			if value, ok := lookup(name); ok {
+				if storedValue, stored := storeValues[name]; stored && storedValue != value && values[name] != value {
+					processEnvStoreOverrides = append(processEnvStoreOverrides, name)
+				}
+				values[name] = value
+			}
+		}
 	}
 	var missing []string
 	for _, name := range names {
-		if value, ok := lookup(name); ok {
-			values[name] = value
-		}
 		if _, ok := values[name]; !ok {
 			missing = append(missing, name)
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing secrets: %s", strings.Join(missing, ", "))
+		return resolvedValues{}, fmt.Errorf("missing secrets: %s", strings.Join(missing, ", "))
 	}
 	for _, name := range names {
 		if err := validateEnvFileValue(name, values[name]); err != nil {
-			return nil, err
+			return resolvedValues{}, err
 		}
 	}
-	return values, nil
+	sort.Strings(processEnvStoreOverrides)
+	return resolvedValues{
+		values:                   values,
+		processEnvStoreOverrides: processEnvStoreOverrides,
+	}, nil
 }
 
 func RequiredNames(cfg *config.Config) ([]string, error) {

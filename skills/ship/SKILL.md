@@ -222,6 +222,8 @@ ship secrets diff ENV
 ship secrets export ENV [--redacted]
 ```
 
+`verify`, `render`, and `diff` use the encrypted store by default. Add `--with-process-env` only when the current shell or CI environment intentionally overrides stored values. Deploy still accepts process-environment overrides and warns when a differing ambient value shadows an encrypted-store key.
+
 ### Recovery
 
 ```bash

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -142,7 +143,8 @@ func secretsCmd(opts *options) *cobra.Command {
 	exportCmd.Flags().BoolVar(&exportRedacted, "redacted", false, "redact values and show digests")
 	cmd.AddCommand(exportCmd)
 
-	cmd.AddCommand(&cobra.Command{
+	var verifyWithProcessEnv bool
+	verifyCmd := &cobra.Command{
 		Use:   "verify [ENV]",
 		Short: "Check required secrets exist",
 		Args:  cobra.RangeArgs(0, 1),
@@ -161,6 +163,7 @@ func secretsCmd(opts *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				secretOpts.SkipProcessEnv = !verifyWithProcessEnv
 				checks, err = secrets.VerifyForEnv(resolved, secretOpts)
 			} else {
 				checks, err = secrets.Verify(cfg)
@@ -174,10 +177,13 @@ func secretsCmd(opts *options) *cobra.Command {
 			}
 			return err
 		},
-	})
-	cmd.AddCommand(&cobra.Command{
+	}
+	verifyCmd.Flags().BoolVar(&verifyWithProcessEnv, "with-process-env", false, "include ambient process environment overrides when ENV is provided")
+	cmd.AddCommand(verifyCmd)
+	var diffWithProcessEnv bool
+	diffCmd := &cobra.Command{
 		Use:   "diff ENV",
-		Short: "Compare local secret digests with the current release",
+		Short: "Compare encrypted-store secret digests with the current release",
 		Args:  ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
@@ -192,6 +198,7 @@ func secretsCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			secretOpts.SkipProcessEnv = !diffWithProcessEnv
 			rendered, err := secrets.RenderScopedForEnv(resolved, secretOpts)
 			if err != nil {
 				return err
@@ -214,15 +221,18 @@ func secretsCmd(opts *options) *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "missing %s\n", name)
 			}
 			for _, name := range diff.Changed {
-				fmt.Fprintf(cmd.OutOrStdout(), "changed %s\n", name)
+				fmt.Fprintf(cmd.OutOrStdout(), "changed %s%s\n", name, secretDiffSourceSuffix(name, rendered.ProcessEnvStoreOverrides))
 			}
 			for _, name := range diff.Extra {
-				fmt.Fprintf(cmd.OutOrStdout(), "extra %s\n", name)
+				fmt.Fprintf(cmd.OutOrStdout(), "extra %s%s\n", name, secretDiffSourceSuffix(name, rendered.ProcessEnvStoreOverrides))
 			}
 			return fmt.Errorf("secret drift detected")
 		},
-	})
+	}
+	diffCmd.Flags().BoolVar(&diffWithProcessEnv, "with-process-env", false, "include ambient process environment overrides")
+	cmd.AddCommand(diffCmd)
 	var renderDryRun bool
+	var renderWithProcessEnv bool
 	render := &cobra.Command{
 		Use:   "render ENV",
 		Short: "Render redacted remote secret env files",
@@ -243,6 +253,7 @@ func secretsCmd(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			secretOpts.SkipProcessEnv = !renderWithProcessEnv
 			rendered, err := secrets.RenderScopedForEnv(resolved, secretOpts)
 			if err != nil {
 				return err
@@ -262,8 +273,29 @@ func secretsCmd(opts *options) *cobra.Command {
 		},
 	}
 	render.Flags().BoolVar(&renderDryRun, "dry-run", false, "print redacted env-file output without exposing values")
+	render.Flags().BoolVar(&renderWithProcessEnv, "with-process-env", false, "include ambient process environment overrides")
 	cmd.AddCommand(render)
 	return cmd
+}
+
+func printProcessEnvStoreOverrideWarning(w io.Writer, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	ui.PrintWarn(w, "warning: process environment overrides encrypted store secrets: "+strings.Join(names, ", ")+"; unset them to deploy the stored values")
+}
+
+func secretDiffSourceSuffix(scopedName string, processEnvStoreOverrides []string) string {
+	name := scopedName
+	if index := strings.LastIndexByte(name, ':'); index >= 0 {
+		name = name[index+1:]
+	}
+	for _, overridden := range processEnvStoreOverrides {
+		if name == overridden {
+			return " (local source: process env, not store)"
+		}
+	}
+	return ""
 }
 
 func secretRenderScopes(cfg *config.Config, env config.Environment, envName string) []string {

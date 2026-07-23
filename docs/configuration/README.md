@@ -32,6 +32,8 @@ ship secrets diff production
 
 `ship config ENV` prints the resolved environment config after root-level defaults and environment overrides are merged. It shows secret names, not decrypted secret values. Both config and plan commands support `--json` for CI gates, custom dashboards, and preflight automation that wants structured data without parsing human text.
 
+Environment-scoped `ship secrets verify`, `render`, and `diff` use the encrypted store plus any explicit `--env-file` inputs. Ambient process environment variables are ignored unless `--with-process-env` is passed. Deploys continue to accept process-environment overrides for CI workflows and warn when a differing ambient value shadows a key already present in the encrypted store.
+
 `ship plan ENV --observed` contacts every resolved host agent, compares the current release to observed Ship-managed containers, and shows the typed rollout actions Ship would use to converge from the real remote state. Use `--json` for pre-deploy gates that need drift summaries and planned pull/start/health/ingress/drain/stop actions.
 
 `ship hosts ENV` shows the resolved host inventory and SSH contact targets Ship will use. Before provisioning it reports config-derived hosts; after `ship provision apply`, it uses saved provider host facts such as public addresses, SSH ports, jump hosts, and identity files.

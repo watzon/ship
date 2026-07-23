@@ -358,9 +358,11 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			if opts.dryRun {
-				if _, err := secrets.VerifyForEnv(cfg, secretOpts); err != nil {
+				rendered, err := secrets.RenderForEnv(cfg, secretOpts)
+				if err != nil {
 					return err
 				}
+				printProcessEnvStoreOverrideWarning(cmd.OutOrStdout(), rendered.ProcessEnvStoreOverrides)
 				stateDir, err := localStateDirForConfig(opts.configPath)
 				if err != nil {
 					return err
@@ -412,6 +414,7 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
+			printProcessEnvStoreOverrideWarning(cmd.OutOrStdout(), secretFiles.ProcessEnvStoreOverrides)
 			// Local validation is done; check CLI/agent compatibility before
 			// spending time on builds or touching remote state.
 			if err := preflightAgentProtocols(ctx, cmd.OutOrStdout(), opts, envName, hosts, autoUpgradeAgents); err != nil {

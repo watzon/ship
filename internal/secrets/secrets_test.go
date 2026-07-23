@@ -182,6 +182,9 @@ func TestRenderForEnvUsesEncryptedStoreDotenvAndEnvPrecedence(t *testing.T) {
 	if err := SetStoredSecret(opts, "", "SHIP_TEST_DOTENV", "from-store"); err != nil {
 		t.Fatal(err)
 	}
+	if err := SetStoredSecret(opts, "", "SHIP_TEST_ENV", "from-store"); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("SHIP_TEST_ENV", "from-env")
 	cfg := &config.Config{Secrets: []string{"SHIP_TEST_STORE", "SHIP_TEST_DOTENV", "SHIP_TEST_ENV"}}
 	rendered, err := RenderForEnv(cfg, opts)
@@ -196,6 +199,21 @@ func TestRenderForEnvUsesEncryptedStoreDotenvAndEnvPrecedence(t *testing.T) {
 		if !strings.Contains(rendered.Content, needle) {
 			t.Fatalf("rendered content missing %q:\n%s", needle, rendered.Content)
 		}
+	}
+	if !reflect.DeepEqual(rendered.ProcessEnvStoreOverrides, []string{"SHIP_TEST_ENV"}) {
+		t.Fatalf("process env store overrides = %#v", rendered.ProcessEnvStoreOverrides)
+	}
+
+	opts.SkipProcessEnv = true
+	rendered, err = RenderForEnv(cfg, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.Content, "SHIP_TEST_ENV=from-dotenv") {
+		t.Fatalf("rendered content did not retain explicit dotenv value:\n%s", rendered.Content)
+	}
+	if len(rendered.ProcessEnvStoreOverrides) != 0 {
+		t.Fatalf("disabled process env reported overrides: %#v", rendered.ProcessEnvStoreOverrides)
 	}
 }
 

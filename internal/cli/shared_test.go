@@ -13,12 +13,15 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
+
 	accessorypkg "github.com/watzon/ship/internal/accessory"
 	"github.com/watzon/ship/internal/agent"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
 	"github.com/watzon/ship/internal/docker"
 	"github.com/watzon/ship/internal/scheduler"
+	secretspkg "github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/state"
 )
 
@@ -335,6 +338,32 @@ accessories:
     pool: web
     primary: true
 `
+}
+
+func writeEncryptedSecretStore(t *testing.T, configPath, envName string, values map[string]string) string {
+	t.Helper()
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityFile := filepath.Join(t.TempDir(), "identity.txt")
+	if err := os.WriteFile(identityFile, []byte(identity.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts := secretspkg.SourceOptions{
+		EnvName:      envName,
+		ConfigPath:   configPath,
+		IdentityFile: identityFile,
+	}
+	if err := secretspkg.InitStore(opts, identity.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range values {
+		if err := secretspkg.SetStoredSecret(opts, identity.Recipient().String(), name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return identityFile
 }
 
 func secretDeployConfig() string {

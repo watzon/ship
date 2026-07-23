@@ -47,7 +47,7 @@ ship secrets list production
 ship secrets export production --redacted
 ```
 
-`ship secrets set ENV NAME` reads the value from environment variable `NAME` unless `--value` is provided. `ship secrets export ENV` prints plaintext dotenv output for local inspection; prefer `--redacted` in logs or shared terminal output.
+`ship secrets set ENV NAME` reads the value from environment variable `NAME` unless `--value` is provided. `ship secrets export ENV` prints plaintext dotenv output for local inspection; prefer `--redacted` in logs or shared terminal output. Environment-scoped `verify`, `render`, and `diff` read the encrypted store by default, so unrelated variables exported in the current shell cannot change their result. Pass `--with-process-env` only when you intentionally want to inspect the values a CI or deploy environment would overlay.
 
 Ship uses your local Docker credentials for deploys. Log in with `docker login` or configure `DOCKER_AUTH_CONFIG`/Docker credential helpers on the machine running `ship`; during deploy, Ship copies only the needed registry auth entry to each target host before pulling service, accessory, or custom Caddy images. This lets fresh hosts pull from private registries such as GHCR, Docker Hub private repos, ECR-compatible registries, or self-hosted registries without manual `docker login` on every server.
 

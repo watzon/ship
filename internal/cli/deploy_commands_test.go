@@ -1618,7 +1618,11 @@ func TestDeployWritesRemoteSecretFileAndStoresOnlyDigests(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)
+	storedSecret := "postgres://stored"
 	secretValue := "postgres://user:pass@example/db"
+	identityFile := writeEncryptedSecretStore(t, path, "production", map[string]string{
+		"SHIP_TEST_DATABASE_URL": storedSecret,
+	})
 	t.Setenv("SHIP_TEST_DATABASE_URL", secretValue)
 
 	var events []string
@@ -1630,10 +1634,15 @@ func TestDeployWritesRemoteSecretFileAndStoresOnlyDigests(t *testing.T) {
 		return &secretDeployAgent{host: host.Name, events: &events, writes: &writes, runs: &runs}
 	})
 
-	cmd := deployCmd(&options{configPath: path})
+	var out bytes.Buffer
+	cmd := deployCmd(&options{configPath: path, secretsIdentityFile: identityFile})
+	cmd.SetOut(&out)
 	cmd.SetArgs([]string{"production"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "warning: process environment overrides encrypted store secrets: SHIP_TEST_DATABASE_URL") {
+		t.Fatalf("deploy output missing secret override warning:\n%s", out.String())
 	}
 
 	secretPath := "/var/lib/ship/secrets/production/service-web.env"

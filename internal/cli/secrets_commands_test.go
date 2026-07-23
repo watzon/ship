@@ -14,31 +14,45 @@ import (
 	"github.com/watzon/ship/internal/state"
 )
 
-func TestSecretsRenderDryRunRedactsValues(t *testing.T) {
+func TestSecretsRenderUsesStoreUnlessProcessEnvOptedIn(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.DefaultConfigFile)
 	if err := os.WriteFile(path, []byte(secretDeployConfig()), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	secretValue := "postgres://user:pass@example/db"
-	t.Setenv("SHIP_TEST_DATABASE_URL", secretValue)
+	storeValue := "postgres://stored"
+	processValue := "postgres://ambient"
+	identityFile := writeEncryptedSecretStore(t, path, "production", map[string]string{
+		"SHIP_TEST_DATABASE_URL": storeValue,
+	})
+	t.Setenv("SHIP_TEST_DATABASE_URL", processValue)
 
-	var out bytes.Buffer
-	cmd := secretsCmd(&options{configPath: path})
-	cmd.SetOut(&out)
-	cmd.SetArgs([]string{"render", "production", "--dry-run"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
+	runRender := func(args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		cmd := secretsCmd(&options{configPath: path, secretsIdentityFile: identityFile})
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
 	}
-	text := out.String()
-	if !strings.Contains(text, "/var/lib/ship/secrets/production/service-web.env") {
-		t.Fatalf("render output missing remote path:\n%s", text)
+
+	storeOutput := runRender("render", "production", "--dry-run")
+	if !strings.Contains(storeOutput, "/var/lib/ship/secrets/production/service-web.env") {
+		t.Fatalf("render output missing remote path:\n%s", storeOutput)
 	}
-	if !strings.Contains(text, "SHIP_TEST_DATABASE_URL=<redacted:") {
-		t.Fatalf("render output missing redacted secret:\n%s", text)
+	if !strings.Contains(storeOutput, "SHIP_TEST_DATABASE_URL=<redacted:"+secretspkg.Digest(storeValue)+">") {
+		t.Fatalf("render output did not use encrypted store:\n%s", storeOutput)
 	}
-	if strings.Contains(text, secretValue) {
-		t.Fatalf("render output leaked secret value:\n%s", text)
+	if strings.Contains(storeOutput, secretspkg.Digest(processValue)) {
+		t.Fatalf("render output used ambient process environment:\n%s", storeOutput)
+	}
+
+	processOutput := runRender("render", "production", "--dry-run", "--with-process-env")
+	if !strings.Contains(processOutput, "SHIP_TEST_DATABASE_URL=<redacted:"+secretspkg.Digest(processValue)+">") {
+		t.Fatalf("opt-in render output did not use process environment:\n%s", processOutput)
 	}
 }
 
@@ -123,7 +137,7 @@ func TestSecretsDiffReportsDriftWithoutValues(t *testing.T) {
 	var out bytes.Buffer
 	cmd := secretsCmd(&options{configPath: path})
 	cmd.SetOut(&out)
-	cmd.SetArgs([]string{"diff", "production"})
+	cmd.SetArgs([]string{"diff", "production", "--with-process-env"})
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "secret drift detected") {
 		t.Fatalf("expected drift error, got %v", err)
@@ -136,5 +150,93 @@ func TestSecretsDiffReportsDriftWithoutValues(t *testing.T) {
 	}
 	if strings.Contains(text, secretValue) || strings.Contains(text, "old-secret") {
 		t.Fatalf("diff output leaked secret value:\n%s", text)
+	}
+}
+
+func TestSecretsDiffUsesStoreUnlessProcessEnvOptedIn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(secretDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storeValue := "stored-secret"
+	processValue := "ambient-secret"
+	identityFile := writeEncryptedSecretStore(t, path, "production", map[string]string{
+		"SHIP_TEST_DATABASE_URL": storeValue,
+	})
+	t.Setenv("SHIP_TEST_DATABASE_URL", processValue)
+	store := state.NewStore(filepath.Join(dir, config.LocalStateDir))
+	if err := store.SaveRelease(state.Release{
+		ID:          "release-1",
+		Environment: "production",
+		Images:      map[string]string{"web": "registry.local/acme/web@sha256:" + strings.Repeat("1", 64)},
+		SecretDigests: map[string]string{
+			"service-web:SHIP_TEST_DATABASE_URL": secretspkg.Digest(storeValue),
+		},
+		CreatedAt: time.Unix(30, 0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var storeOut bytes.Buffer
+	storeCmd := secretsCmd(&options{configPath: path, secretsIdentityFile: identityFile})
+	storeCmd.SetOut(&storeOut)
+	storeCmd.SetArgs([]string{"diff", "production"})
+	if err := storeCmd.Execute(); err != nil {
+		t.Fatalf("store-only diff: %v\n%s", err, storeOut.String())
+	}
+	if !strings.Contains(storeOut.String(), "secrets match current release release-1") {
+		t.Fatalf("store-only diff output:\n%s", storeOut.String())
+	}
+
+	var processOut bytes.Buffer
+	processCmd := secretsCmd(&options{configPath: path, secretsIdentityFile: identityFile})
+	processCmd.SetOut(&processOut)
+	processCmd.SetArgs([]string{"diff", "production", "--with-process-env"})
+	err := processCmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "secret drift detected") {
+		t.Fatalf("expected process-env drift error, got %v", err)
+	}
+	text := processOut.String()
+	if !strings.Contains(text, "changed service-web:SHIP_TEST_DATABASE_URL (local source: process env, not store)") {
+		t.Fatalf("process-env diff did not label source:\n%s", text)
+	}
+	if strings.Contains(text, storeValue) || strings.Contains(text, processValue) {
+		t.Fatalf("diff output leaked secret value:\n%s", text)
+	}
+}
+
+func TestSecretsVerifyUsesStoreUnlessProcessEnvOptedIn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(secretDeployConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storeValue := "stored-secret"
+	processValue := "ambient-secret"
+	identityFile := writeEncryptedSecretStore(t, path, "production", map[string]string{
+		"SHIP_TEST_DATABASE_URL": storeValue,
+	})
+	t.Setenv("SHIP_TEST_DATABASE_URL", processValue)
+
+	runVerify := func(args ...string) string {
+		t.Helper()
+		var out bytes.Buffer
+		cmd := secretsCmd(&options{configPath: path, secretsIdentityFile: identityFile})
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+
+	storeOutput := runVerify("verify", "production")
+	if !strings.Contains(storeOutput, "digest="+secretspkg.Digest(storeValue)) {
+		t.Fatalf("verify output did not use encrypted store:\n%s", storeOutput)
+	}
+	processOutput := runVerify("verify", "production", "--with-process-env")
+	if !strings.Contains(processOutput, "digest="+secretspkg.Digest(processValue)) {
+		t.Fatalf("opt-in verify output did not use process environment:\n%s", processOutput)
 	}
 }
