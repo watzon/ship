@@ -11,11 +11,11 @@ ship --help
 In application CI, pin Ship to an explicit released version instead of floating on `@latest`:
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@v0.5.3
+go install github.com/watzon/ship/cmd/ship@v0.6.0
 ship version
 ```
 
-Use a version that publishes release assets for your host platforms before relying on `ship agent upgrade` from CI — verify with `ship release check v0.5.3` before pinning. For runners or hosts without GitHub access, see [docs/airgap.md](airgap.md).
+Before you pin a version for CI, run `ship release check v0.6.0` to verify that it has assets for your host platforms. The `ship agent upgrade` command needs these assets. For runners or hosts without GitHub access, see [docs/airgap.md](airgap.md).
 
 From a blank application repo:
 

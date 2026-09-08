@@ -18,7 +18,7 @@ Per-provider YAML examples, firewall defaults, optional fields, and credentials 
 
 ### [Deploy and operate](deploy-and-operate.md)
 
-Day-2 operations: rollouts, scaling, logs, exec, maintenance mode, Caddy ingress, build options, hooks, webhooks, schedules, and accessory management.
+Day-2 operations: rollouts, scaling, logs, exec, maintenance mode, Caddy ingress, build options, hooks, webhooks, schedules, accessory management, and [private container access](deploy-and-operate.md#connect-to-a-private-container-port).
 
 ### [Recovery](recovery.md)
 

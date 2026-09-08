@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -301,6 +302,7 @@ type CommandRunner func(ctx context.Context, name string, args ...string) (strin
 
 type Server struct {
 	Docker          DockerOps
+	ProxyDial       func(context.Context, string, string) (net.Conn, error)
 	CommandRunner   CommandRunner
 	HTTPClient      *http.Client
 	StateDir        string
@@ -408,6 +410,7 @@ func init() {
 		"migrate_state_dir":    lockedRPCHandler("migrate_state_dir", rpcHandlerWithoutContext(Server.migrateStateDir)),
 		"negotiate":            rpcHandlerWithoutContext(Server.negotiate),
 		"prune_images":         Server.handlePruneImages,
+		"proxy_target":         Server.handleProxyTarget,
 		"pull":                 Server.handlePull,
 		"read_file":            rpcHandlerWithoutContext(Server.readFile),
 		"read_release_state":   rpcHandlerWithoutContext(Server.readReleaseState),

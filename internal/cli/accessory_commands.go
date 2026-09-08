@@ -46,6 +46,7 @@ func countChangedAccessories(results []accessoryEnsureResult) int {
 
 func accessoryCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{Use: "accessory", Short: "Manage stateful single-primary accessories"}
+	cmd.AddCommand(accessoryProxyCmd(opts))
 	cmd.AddCommand(&cobra.Command{
 		Use:   "deploy ENV [NAME]",
 		Short: "Deploy one accessory container per accessory",

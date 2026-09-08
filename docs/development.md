@@ -47,6 +47,20 @@ go test ./internal/ingress -run TestGeneratedCaddyfileValidatesWithCaddyBinary -
 
 The registry test starts a local Docker `registry:2` container. The Caddy validation test runs when a local `caddy` binary is available.
 
+## Test private container access
+
+Run the optional proxy integration gate:
+
+```bash
+SHIP_PROXY_INTEGRATION=1 go test ./internal/cli -run TestProxyIntegration -count=1 -timeout 15m
+```
+
+The gate uses a disposable privileged Linux Docker fixture with SSH and a nested Docker daemon. It requires a running Docker engine, Go, `ssh`, and `ssh-keygen`. Docker must permit privileged containers. The fixture can run under Docker Desktop without routing from the host to container bridge addresses.
+
+The test builds the local and Linux Ship binaries and pulls fixture images. The longer test timeout allows for image pulls and builds. It uses temporary SSH keys and known-hosts files, then removes its containers and temporary files. It needs no cloud credentials and does not use an existing deployment.
+
+The gate exercises the CLI and remote agent through OpenSSH with an unpublished Postgres container and the HTTP service in `testdata/sample-app/`. A test client sends the SQL query, so `psql` is not required. Keep this gate separate from `go test ./...`, which does not require Docker. Record its result separately from the full local CI gate.
+
 ## Safety notes
 
 Commands that can touch real infrastructure support the global `--dry-run` flag where mutation is possible. Provider and agent interactions are injectable in tests, so normal CI does not require Docker, SSH hosts, registry credentials, or cloud credentials.

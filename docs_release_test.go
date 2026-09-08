@@ -11,7 +11,24 @@ import (
 	"testing"
 )
 
-var stableVersionRE = regexp.MustCompile(`\bv?([0-9]+)\.([0-9]+)\.([0-9]+)\b`)
+var stableVersionRE = regexp.MustCompile(`\bv([0-9]+)\.([0-9]+)\.([0-9]+)\b`)
+var releaseAssetVersionRE = regexp.MustCompile(`\bship_([0-9]+\.[0-9]+\.[0-9]+)_`)
+
+func pinnedReleaseVersions(body []byte) [][]byte {
+	versions := stableVersionRE.FindAll(body, -1)
+	for _, match := range releaseAssetVersionRE.FindAllSubmatch(body, -1) {
+		versions = append(versions, match[1])
+	}
+	return versions
+}
+
+func TestPinnedReleaseVersions(t *testing.T) {
+	body := []byte("Requires Go 1.26.6+. Install ship@v0.6.0 or ship_0.6.0_linux_amd64.tar.gz.")
+	got := pinnedReleaseVersions(body)
+	if len(got) != 2 || string(got[0]) != "v0.6.0" || string(got[1]) != "0.6.0" {
+		t.Fatalf("release versions = %q; want v0.6.0 and 0.6.0, without the Go version", got)
+	}
+}
 
 func TestPinnedReleaseDocsUseCurrentOrNextReleaseTag(t *testing.T) {
 	tag := docsReleaseTag(t)
@@ -29,7 +46,7 @@ func TestPinnedReleaseDocsUseCurrentOrNextReleaseTag(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			matches := stableVersionRE.FindAll(body, -1)
+			matches := pinnedReleaseVersions(body)
 			if len(matches) == 0 {
 				t.Fatalf("no pinned stable release version found; expected %s", tag)
 			}

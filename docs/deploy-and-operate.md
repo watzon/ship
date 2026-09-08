@@ -470,3 +470,35 @@ ship accessory backup production postgres
 ship --dry-run accessory restore production postgres --artifact /var/lib/ship/backups/postgres-20260630T120000.000000000Z.backup
 ship accessory restore production postgres --artifact /var/lib/ship/backups/postgres-20260630T120000.000000000Z.backup --yes
 ```
+
+
+## Connect to a private container port
+
+Use `proxy` to connect a local TCP client to one running service replica or accessory:
+
+```bash
+ship accessory proxy production postgres 15432:5432
+ship proxy production web 18080:8080 --replica 2
+ship proxy production web.2 18080:8080
+ship --dry-run accessory proxy production postgres 15432:5432
+```
+
+Specify `LOCAL:REMOTE` with two TCP ports from 1 through 65535. `REMOTE` is the container port. Ship does not infer it from the image or configuration. The listener always binds to `127.0.0.1`; addresses, port ranges, and multiple mappings are not accepted.
+
+Wait for the `listening on` message, then connect your client to the local address. For the Postgres example, use `127.0.0.1:15432`. Use the database's existing credentials and TLS settings. The proxy does not change database authentication.
+
+Keep the command in the foreground. Press Ctrl-C to close the listener, active connections, and SSH processes. Each command accepts up to 64 concurrent connections, including connections still in setup. Each connection starts a separate SSH process. Use this access for interactive database and service work.
+
+Services default to replica 1. Select another replica with `--replica N` or `service.N`. You can also use an exact container name from `ship ps production`. If two running releases match the same replica, use an exact container name to select one.
+
+The session stays tied to the selected container instance and network endpoint. After a restart, replacement, or accessory failover, run the command again. Ship does not reconnect an established session to a new container.
+
+The target must use the enabled Ship-managed Docker bridge network. Keep `docker.network` enabled with the `bridge` driver. If the host agent does not support proxy streams, upgrade it:
+
+```bash
+ship agent upgrade production
+```
+
+A container does not need `ports` or `publish` entries for proxy access. For a private-only database, omit both entries. Existing published ports stay published; the proxy reports a binding for the selected port and does not remove it. The command does not change ingress, firewall rules, or deployments.
+
+Use `--dry-run` to validate the requested mapping and view candidate hosts without SSH calls or a local listener. Live container identity, agent support, and reachability checks remain pending until you run the command without `--dry-run`.

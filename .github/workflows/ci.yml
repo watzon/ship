@@ -31,3 +31,21 @@ jobs:
 
       - name: Run local verification gates
         run: ./scripts/ci-local.sh
+
+  proxy-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test private proxy with real SSH and Docker
+        env:
+          SHIP_PROXY_INTEGRATION: "1"
+        run: go test ./internal/cli -run '^TestProxyIntegration$' -count=1 -timeout 15m -v

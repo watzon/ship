@@ -23,14 +23,14 @@ Repo docs live in `docs/`. This skill is the agent playbook for setup, migration
 
 ## Install
 
-Requires Go 1.26+ for `go install`, and Docker on the machine that runs deploys.
+Requires Go 1.26.6+ for `go install`, and Docker on the machine that runs deploys.
 
 ### Option A: `go install` (recommended for dev and CI)
 
 Pin an asset-backed release tag (check [GitHub Releases](https://github.com/watzon/ship/releases) for the newest):
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@v0.5.3
+go install github.com/watzon/ship/cmd/ship@v0.6.0
 ```
 
 `@latest` is acceptable for interactive use, but never for CI: it can jump to
@@ -53,7 +53,7 @@ Ensure `$(go env GOPATH)/bin` is on your `PATH` (or set `GOBIN`).
 Download a published asset from [GitHub Releases](https://github.com/watzon/ship/releases). Archives are named `ship_<version>_<os>_<arch>.tar.gz` for `linux`/`darwin` × `amd64`/`arm64`.
 
 ```bash
-VERSION=v0.5.3                          # release tag
+VERSION=v0.6.0                          # release tag
 VER="${VERSION#v}"                      # filename uses version without v prefix
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)

@@ -545,6 +545,7 @@ func countVersionFailures(view versionView) int {
 
 func agentCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Manage or run the Ship node agent"}
+	cmd.AddCommand(agentProxyCmd())
 	cmd.AddCommand(&cobra.Command{
 		Use:    "rpc",
 		Short:  "Serve one or more JSON-RPC requests over stdin/stdout",

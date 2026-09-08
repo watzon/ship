@@ -262,3 +262,21 @@ ship doctor staging   # limit remote checks to one environment
 Co-located ingress (app and Caddy on the same host, shared Docker network) uses Docker service aliases such as `web:3000` for upstreams. Dedicated ingress pools reach app hosts via contact addresses or public IPs.
 
 Fix validation errors before any `--dry-run provision apply` or `--dry-run deploy`.
+
+## Private container access
+
+`ship accessory proxy ENV NAME LOCAL:REMOTE` forwards a local TCP port to one running accessory. `ship proxy ENV SERVICE LOCAL:REMOTE` selects a service replica. Replica 1 is the default; `--replica N` and `service.N` select another replica.
+
+```bash
+ship accessory proxy production db 15432:5432
+ship proxy production web 18080:3000 --replica 2
+ship proxy production web.2 18080:3000
+```
+
+Both commands require an enabled Ship-managed Docker bridge network and an agent that supports proxy streams. An older agent returns an instruction to run `ship agent upgrade ENV`.
+
+The mapping requires explicit TCP ports. The listener binds to `127.0.0.1` and runs in the foreground until Ctrl-C. A restart, replacement, or network endpoint change stops the session. A new command must select the current container.
+
+Proxy access needs no `ports` or `publish` entries. Those entries publish server ports and remain effective while the proxy runs. Database authentication and TLS settings remain unchanged.
+
+Each local connection starts one SSH process, with at most 64 concurrent connections per command. This access is intended for interactive database and service work. `--dry-run` opens no listener and makes no SSH calls.

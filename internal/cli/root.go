@@ -71,6 +71,8 @@ func Execute() error {
 	restart.GroupID = ui.GroupOperate
 	execSvc := execServiceCmd(opts)
 	execSvc.GroupID = ui.GroupOperate
+	proxy := proxyCmd(opts)
+	proxy.GroupID = ui.GroupOperate
 	inspect := inspectCmd(opts)
 	inspect.GroupID = ui.GroupOperate
 	support := supportCmd(opts)
@@ -99,7 +101,7 @@ func Execute() error {
 		cfg, hosts, plan, scale,
 		provision, migrate, agent, version, release,
 		deploy, promote,
-		status, ps, health, logs, execSvc, restart, inspect, support, events, releases, lock, unlock, maintenance, prune,
+		status, ps, health, logs, execSvc, proxy, restart, inspect, support, events, releases, lock, unlock, maintenance, prune,
 		accessory,
 		secrets,
 		recover, rollback,

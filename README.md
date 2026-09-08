@@ -11,18 +11,19 @@ The model is Kamal-like: you define host pools, services, and accessories in YAM
 - Cloud provisioning for Hetzner, Vultr, DigitalOcean, Linode, AWS, GCP, Azure, and [others](docs/configuration/providers/README.md)
 - Inventory-backed targets through Terraform, Pulumi, Ansible, OpenSSH config, or manual host lists
 - SSH-framed agent RPC (no open agent port on the host)
+- Local TCP access to private services and accessories through SSH
 - Deterministic placement across host pools
 - Managed Caddy ingress with TLS, redirects, and upstream health checks
 - Encrypted secrets, accessories with backup/restore, and release rollback
 
 ## Install
 
-Requires [Go](https://go.dev/dl/) 1.26+ and Docker for deploys.
+Requires [Go](https://go.dev/dl/) 1.26.6+ and Docker for deploys.
 
 Install the CLI with `go install`, pinned to a released version:
 
 ```bash
-go install github.com/watzon/ship/cmd/ship@v0.5.3
+go install github.com/watzon/ship/cmd/ship@v0.6.0
 ```
 
 `@latest` works for interactive use; pin an explicit release in CI. Avoid
