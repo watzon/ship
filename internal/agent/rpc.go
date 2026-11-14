@@ -242,6 +242,24 @@ type CaddyReloadParams struct {
 
 type CommandResult struct {
 	Output string `json:"output,omitempty"`
+	// Stderr and ExitCode are set by exec_container so a failed command's
+	// output and exit status reach the operator.
+	Stderr   string `json:"stderr,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+}
+
+// CommandError is returned by a CommandRunner when the command ran but exited
+// unsuccessfully, carrying what it printed and its exit code.
+type CommandError struct {
+	Name     string
+	Stdout   string
+	Stderr   string
+	ExitCode int
+	Message  string
+}
+
+func (e *CommandError) Error() string {
+	return e.Message
 }
 
 type AccessoryCommandParams struct {
@@ -656,6 +674,16 @@ func (s Server) execContainer(ctx context.Context, req Request) Response {
 	defer cancel()
 	out, err := s.command()(commandCtx, "docker", "exec", p.Name, "sh", "-lc", p.Command)
 	if err != nil {
+		var cmdErr *CommandError
+		if errors.As(err, &cmdErr) {
+			// The command ran and failed: return what it printed and its exit
+			// code along with the failure instead of dropping them.
+			failed := failure(req.ID, ErrorCommandFailed, fmt.Errorf("exec %q failed: %w", p.Name, err))
+			if data, marshalErr := json.Marshal(CommandResult{Output: trimOutput(cmdErr.Stdout), Stderr: trimOutput(cmdErr.Stderr), ExitCode: cmdErr.ExitCode}); marshalErr == nil {
+				failed.Result = data
+			}
+			return failed
+		}
 		return failure(req.ID, ErrorCommandFailed, fmt.Errorf("exec %q failed: %w", p.Name, err))
 	}
 	return result(req.ID, CommandResult{Output: trimOutput(out)})
@@ -1196,7 +1224,12 @@ func defaultCommandRunner(ctx context.Context, name string, args ...string) (str
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("%s failed: %s", name, msg)
+		failed := fmt.Errorf("%s failed: %s", name, msg)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", &CommandError{Name: name, Stdout: string(out), Stderr: stderr.String(), ExitCode: exitErr.ExitCode(), Message: failed.Error()}
+		}
+		return "", failed
 	}
 	return string(out), nil
 }

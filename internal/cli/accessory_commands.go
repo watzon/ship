@@ -125,6 +125,7 @@ func accessoryCmd(opts *options) *cobra.Command {
 	execCmd := &cobra.Command{
 		Use:   "exec ENV NAME -- COMMAND",
 		Short: "Run a command inside a deployed accessory container",
+		Long:  execLongHelp,
 		Args:  ui.MinimumArgs(3, ui.Env, ui.Accessory, ui.ArgNamed("COMMAND", "command to run inside the container")),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if execTimeoutSeconds < 0 {
@@ -137,11 +138,11 @@ func accessoryCmd(opts *options) *cobra.Command {
 			if _, ok := cfg.Accessories[args[1]]; !ok {
 				return fmt.Errorf("unknown accessory %q", args[1])
 			}
-			command := strings.TrimSpace(strings.Join(args[2:], " "))
+			command := execCommandString(args[2:])
 			if command == "" {
 				return fmt.Errorf("command is required")
 			}
-			return runAccessoryExec(cmd.Context(), cmd.OutOrStdout(), opts, cfg, env, args[0], store, args[1], command, execTimeoutSeconds, execJSONOutput)
+			return runAccessoryExec(cmd.Context(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts, cfg, env, args[0], store, args[1], command, execTimeoutSeconds, execJSONOutput)
 		},
 	}
 	execCmd.Flags().IntVar(&execTimeoutSeconds, "timeout", 0, "command timeout in seconds")
@@ -562,7 +563,7 @@ func runAccessoryLogs(ctx context.Context, w io.Writer, opts *options, cfg *conf
 	return nil
 }
 
-func runAccessoryExec(ctx context.Context, w io.Writer, opts *options, cfg *config.Config, env config.Environment, envName string, store state.Store, name, command string, timeoutSeconds int, jsonOutput bool) error {
+func runAccessoryExec(ctx context.Context, w, errW io.Writer, opts *options, cfg *config.Config, env config.Environment, envName string, store state.Store, name, command string, timeoutSeconds int, jsonOutput bool) error {
 	hosts, err := resolvedHostsForEnvironment(store, envName, env)
 	if err != nil {
 		return err
@@ -611,13 +612,26 @@ func runAccessoryExec(ctx context.Context, w io.Writer, opts *options, cfg *conf
 	recordEvent(store, state.Event{Environment: envName, Kind: "accessory_exec", Status: "started", Accessory: name, Host: placement.Host.Name, Message: command})
 	if err := newDeployAgent(placement.Host).Call(ctx, "exec_container", params, &result); err != nil {
 		recordEvent(store, state.Event{Environment: envName, Kind: "accessory_exec", Status: "failed", Accessory: name, Host: placement.Host.Name, Message: err.Error()})
-		return fmt.Errorf("exec accessory %s on %s: %w", name, placement.Host.Name, err)
+		err = fmt.Errorf("exec accessory %s on %s: %w", name, placement.Host.Name, err)
+		exitErr, ok := execFailure(w, errW, fmt.Sprintf("==> %s/%s <==", placement.Host.Name, containerName), err, result, jsonOutput)
+		if !ok {
+			return err
+		}
+		if jsonOutput {
+			view.Entries = append(view.Entries, execEntry{Host: placement.Host.Name, Accessory: name, Container: containerName, Output: result.Output, Stderr: result.Stderr, ExitCode: result.ExitCode})
+			if err := writeJSON(w, view); err != nil {
+				return err
+			}
+		}
+		return exitErr
 	}
 	entry := execEntry{
 		Host:      placement.Host.Name,
 		Accessory: name,
 		Container: containerName,
 		Output:    result.Output,
+		Stderr:    result.Stderr,
+		ExitCode:  result.ExitCode,
 	}
 	view.Entries = append(view.Entries, entry)
 	recordEvent(store, state.Event{Environment: envName, Kind: "accessory_exec", Status: "succeeded", Accessory: name, Host: placement.Host.Name})
@@ -625,6 +639,9 @@ func runAccessoryExec(ctx context.Context, w io.Writer, opts *options, cfg *conf
 		return writeJSON(w, view)
 	}
 	fmt.Fprintf(w, "==> %s/%s <==\n%s\n", placement.Host.Name, containerName, result.Output)
+	if result.Stderr != "" {
+		fmt.Fprintln(errW, result.Stderr)
+	}
 	return nil
 }
 
