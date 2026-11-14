@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -2246,4 +2247,58 @@ func (a *inventoryDeployAgent) Call(ctx context.Context, method string, params a
 		return fmt.Errorf("unexpected method %s", method)
 	}
 	return nil
+}
+
+func deployProgressConfig() string {
+	return strings.Replace(deployWithAccessoryConfig(), "    scale: 1\n", "    scale: 1\n    release:\n      command: php artisan migrate --force\n      timeout_seconds: 600\n", 1)
+}
+
+func TestDeployPlanMatchesExecutedStepsAndReportsProgress(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DefaultConfigFile)
+	if err := os.WriteFile(path, []byte(deployProgressConfig()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	var events []string
+	var oneOffRuns []agent.RunOneOffContainerParams
+	installDeployHooks(t, &recordingDeployDocker{events: &events}, func(host scheduler.Host) deployAgent {
+		return recordingDeployAgent{host: host.Name, events: &events, oneOffRuns: &oneOffRuns}
+	})
+
+	var out bytes.Buffer
+	cmd := deployCmd(&options{configPath: path})
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"production"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	var planned, executed []string
+	progressLine := regexp.MustCompile(`^([a-z-]+) (\S+)(?: on \S+)?: ok \(`)
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.HasPrefix(line, "- ") {
+			fields := strings.Fields(strings.TrimPrefix(line, "- "))
+			planned = append(planned, fields[0]+" "+strings.TrimSuffix(fields[1], ":"))
+		} else if m := progressLine.FindStringSubmatch(line); m != nil {
+			executed = append(executed, m[1]+" "+m[2])
+		}
+	}
+	if !strings.Contains(out.String(), "- release web: php artisan migrate --force (replica 1, timeout 600s)") {
+		t.Fatalf("plan missing release step:\n%s", out.String())
+	}
+	if len(oneOffRuns) != 1 {
+		t.Fatalf("release command ran %d times", len(oneOffRuns))
+	}
+	if !reflect.DeepEqual(planned, executed) {
+		t.Fatalf("plan order %v != executed order %v\n%s", planned, executed, out.String())
+	}
+	want := []string{"resolve web", "accessory redis", "release web", "start web.1"}
+	if !reflect.DeepEqual(executed, want) {
+		t.Fatalf("executed = %v, want %v", executed, want)
+	}
+	if !strings.Contains(out.String(), "is current") {
+		t.Fatalf("missing final current-release line:\n%s", out.String())
+	}
 }
