@@ -92,6 +92,8 @@ type execEntry struct {
 	Replica   int    `json:"replica,omitempty"`
 	Container string `json:"container"`
 	Output    string `json:"output,omitempty"`
+	Stderr    string `json:"stderr,omitempty"`
+	ExitCode  int    `json:"exit_code,omitempty"`
 }
 
 type healthView struct {
@@ -1219,11 +1221,12 @@ func execServiceCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "exec ENV SERVICE -- COMMAND",
 		Short: "Run a command inside deployed service containers",
+		Long:  execLongHelp,
 		Args:  ui.MinimumArgs(3, ui.Env, ui.Service, ui.ArgNamed("COMMAND", "command to run inside the container")),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			envName := args[0]
 			serviceName := args[1]
-			command := strings.TrimSpace(strings.Join(args[2:], " "))
+			command := execCommandString(args[2:])
 			if command == "" {
 				return fmt.Errorf("command is required")
 			}
@@ -1306,19 +1309,36 @@ func execServiceCmd(opts *options) *cobra.Command {
 					Command:        command,
 					TimeoutSeconds: timeoutSeconds,
 				}
-				if err := newDeployAgent(placement.Host).Call(cmd.Context(), "exec_container", params, &result); err != nil {
-					return fmt.Errorf("exec %s on %s: %w", name, placement.Host.Name, err)
-				}
+				callErr := newDeployAgent(placement.Host).Call(cmd.Context(), "exec_container", params, &result)
 				entry := execEntry{
 					Host:      placement.Host.Name,
 					Service:   placement.Service,
 					Replica:   placement.Replica,
 					Container: name,
 					Output:    result.Output,
+					Stderr:    result.Stderr,
+					ExitCode:  result.ExitCode,
+				}
+				if callErr != nil {
+					callErr = fmt.Errorf("exec %s on %s: %w", name, placement.Host.Name, callErr)
+					exitErr, ok := execFailure(cmd.OutOrStdout(), cmd.ErrOrStderr(), fmt.Sprintf("==> %s/%s <==", placement.Host.Name, name), callErr, result, jsonOutput)
+					if !ok {
+						return callErr
+					}
+					if jsonOutput {
+						view.Entries = append(view.Entries, entry)
+						if err := writeJSON(cmd.OutOrStdout(), view); err != nil {
+							return err
+						}
+					}
+					return exitErr
 				}
 				view.Entries = append(view.Entries, entry)
 				if !jsonOutput {
 					fmt.Fprintf(cmd.OutOrStdout(), "==> %s/%s <==\n%s\n", placement.Host.Name, name, result.Output)
+					if result.Stderr != "" {
+						fmt.Fprintln(cmd.ErrOrStderr(), result.Stderr)
+					}
 				}
 			}
 			if jsonOutput {
