@@ -67,6 +67,37 @@ func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
 		plan.Actions = append(plan.Actions, Action{Kind: "push", Target: name, Details: cfg.Registry})
 		plan.Actions = append(plan.Actions, Action{Kind: "resolve", Target: name, Details: "pushed image -> immutable digest"})
 	}
+	// Actions are listed in the order `ship deploy` executes them: images,
+	// accessories, release commands, then rollout (start) and ingress.
+	accessoryNames := make([]string, 0, len(cfg.Accessories))
+	for name := range cfg.Accessories {
+		accessoryNames = append(accessoryNames, name)
+	}
+	sort.Strings(accessoryNames)
+	for _, name := range accessoryNames {
+		acc := cfg.Accessories[name]
+		plan.Actions = append(plan.Actions, Action{Kind: "accessory", Target: name, Details: fmt.Sprintf("ensure %s on pool %s", acc.Image, acc.Pool)})
+		if acc.Backup.BackupRequired() {
+			plan.Actions = append(plan.Actions, Action{Kind: "backup-check", Target: name, Details: acc.Backup.Command})
+		}
+	}
+	for _, name := range serviceNames {
+		release := cfg.Services[name].Release
+		command := strings.TrimSpace(release.Command)
+		if command == "" {
+			continue
+		}
+		replica := release.Replica
+		if replica == 0 {
+			replica = 1
+		}
+		details := fmt.Sprintf("%s (replica %d", command, replica)
+		if release.TimeoutSeconds > 0 {
+			details += fmt.Sprintf(", timeout %ds", release.TimeoutSeconds)
+		}
+		details += ")"
+		plan.Actions = append(plan.Actions, Action{Kind: "release", Target: name, Details: details})
+	}
 	for _, placement := range placements {
 		plan.Actions = append(plan.Actions, Action{
 			Kind:    "start",
@@ -78,18 +109,6 @@ func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
 		svc := cfg.Services[name]
 		if svc.Ingress != nil && len(svc.Ingress.Domains) > 0 {
 			plan.Actions = append(plan.Actions, Action{Kind: "ingress", Target: name, Details: strings.Join(svc.Ingress.Domains, ", ")})
-		}
-	}
-	accessoryNames := make([]string, 0, len(cfg.Accessories))
-	for name := range cfg.Accessories {
-		accessoryNames = append(accessoryNames, name)
-	}
-	sort.Strings(accessoryNames)
-	for _, name := range accessoryNames {
-		acc := cfg.Accessories[name]
-		plan.Actions = append(plan.Actions, Action{Kind: "accessory", Target: name, Details: fmt.Sprintf("ensure %s on pool %s", acc.Image, acc.Pool)})
-		if acc.Backup.BackupRequired() {
-			plan.Actions = append(plan.Actions, Action{Kind: "backup-check", Target: name, Details: acc.Backup.Command})
 		}
 	}
 	return plan, nil

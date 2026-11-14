@@ -64,3 +64,26 @@ func sampleConfig() *config.Config {
 func boolPtr(value bool) *bool {
 	return &value
 }
+
+func TestDeploymentPlanIncludesReleaseInRunOrder(t *testing.T) {
+	cfg := sampleConfig()
+	svc := cfg.Services["web"]
+	svc.Release = config.ReleaseCommand{Command: "php artisan migrate --force", TimeoutSeconds: 600}
+	cfg.Services["web"] = svc
+	plan, err := DeploymentPlan(cfg, "production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, a := range plan.Actions {
+		kinds = append(kinds, a.Kind)
+	}
+	got := strings.Join(kinds, ",")
+	want := "build,push,resolve,accessory,backup-check,release,start,start,ingress"
+	if got != want {
+		t.Fatalf("order = %s, want %s", got, want)
+	}
+	if !strings.Contains(plan.String(), "- release web: php artisan migrate --force (replica 1, timeout 600s)") {
+		t.Fatalf("plan missing release line:\n%s", plan.String())
+	}
+}

@@ -725,7 +725,16 @@ func (s Server) runOneOffContainer(ctx context.Context, req Request) Response {
 	args = append(args, tokens...)
 	out, err := s.command()(commandCtx, "docker", args...)
 	if err != nil {
-		return failure(req.ID, ErrorDocker, fmt.Errorf("one-off container %q failed: %w", p.Name, err))
+		failed := failure(req.ID, ErrorDocker, fmt.Errorf("one-off container %q failed: %w", p.Name, err))
+		var cmdErr *CommandError
+		if errors.As(err, &cmdErr) {
+			// The container ran and failed: return what it printed and its exit
+			// code along with the failure instead of dropping them.
+			if data, marshalErr := json.Marshal(CommandResult{Output: trimOutput(cmdErr.Stdout), Stderr: trimOutput(cmdErr.Stderr), ExitCode: cmdErr.ExitCode}); marshalErr == nil {
+				failed.Result = data
+			}
+		}
+		return failed
 	}
 	return result(req.ID, CommandResult{Output: trimOutput(out)})
 }
