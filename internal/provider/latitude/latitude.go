@@ -216,6 +216,9 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	if err := provider.PreflightHosts(ctx, projectLister{client: c, latitudeProject: env.Provider.Latitude.Project}, project, environment, desired); err != nil {
+		return provider.ReconcileResult{}, err
+	}
 	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
 	if err != nil {
 		return provider.ReconcileResult{}, err
@@ -339,11 +342,26 @@ func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (p
 }
 
 func (c Client) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
+	return c.listIn(ctx, project, environment, "")
+}
+
+// projectLister lists servers read-only with the same Latitude project filter
+// the reconcile backend uses, without creating the ownership tags first.
+type projectLister struct {
+	client          Client
+	latitudeProject string
+}
+
+func (l projectLister) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
+	return l.client.listIn(ctx, project, environment, l.latitudeProject)
+}
+
+func (c Client) listIn(ctx context.Context, project, environment, latitudeProject string) ([]provider.Host, error) {
 	tagIDs, err := c.FindTagIDs(ctx, provider.ShipLabels(project, environment, ""))
 	if err != nil {
 		return nil, err
 	}
-	servers, err := c.ListServers(ctx, project, environment, "", tagIDs)
+	servers, err := c.ListServers(ctx, project, environment, latitudeProject, tagIDs)
 	if err != nil {
 		return nil, err
 	}
