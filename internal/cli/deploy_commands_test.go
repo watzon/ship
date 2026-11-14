@@ -2247,3 +2247,7 @@ func (a *inventoryDeployAgent) Call(ctx context.Context, method string, params a
 	}
 	return nil
 }
+
+func deployProgressConfig() string {
+	return strings.Replace(deployWithAccessoryConfig(), "    scale: 1\n", "    scale: 1\n    release:\n      command: php artisan migrate --force\n      timeout_seconds: 600\n", 1)
+}

@@ -72,6 +72,11 @@ func (c Client) Call(ctx context.Context, method string, params any, out any) er
 		return fmt.Errorf("agent response id %q did not match request id %q", resp.ID, requestID)
 	}
 	if !resp.OK {
+		// A failed response may still carry a result (for example the output
+		// of a command that exited non-zero); decode it best-effort.
+		if out != nil && len(resp.Result) > 0 {
+			_ = json.Unmarshal(resp.Result, out)
+		}
 		return RemoteError{Code: resp.ErrorCode, Message: resp.Error}
 	}
 	if out != nil && len(resp.Result) > 0 {

@@ -353,6 +353,7 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			fmt.Fprint(cmd.OutOrStdout(), plan.String())
+			progress := newDeployProgress(cmd.OutOrStdout(), plan)
 			secretOpts, err := secretSourceOptions(opts, envName)
 			if err != nil {
 				return err
@@ -426,7 +427,7 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
-			images, err := prepareDeployImages(ctx, deployClient, cfg, releaseID)
+			images, err := prepareDeployImagesWithProgress(ctx, deployClient, cfg, releaseID, progress.done)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
@@ -459,6 +460,7 @@ func deployCmd(opts *options) *cobra.Command {
 			accessoryNames := accessory.SortedNames(cfg, "")
 			if len(accessoryNames) > 0 {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "started", Release: releaseID, Message: fmt.Sprintf("accessories=%d", len(accessoryNames))})
+				accessoryBegan := deployClock()
 				results, err := ensureAccessories(ctx, cmd.OutOrStdout(), opts, cfg, env, envName, store, accessoryNames, accessoryEnsureOnly)
 				if err != nil {
 					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "failed", Release: releaseID, Message: err.Error()})
@@ -474,6 +476,13 @@ func deployCmd(opts *options) *cobra.Command {
 					}
 					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 					return err
+				}
+				accessoryNote := ""
+				if len(accessoryNames) > 1 {
+					accessoryNote = fmt.Sprintf("together with %d accessories", len(accessoryNames))
+				}
+				for _, name := range accessoryNames {
+					progress.doneNote("accessory", name, deployClock().Sub(accessoryBegan), accessoryNote)
 				}
 				changed := countChangedAccessories(results)
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "succeeded", Release: releaseID, Message: fmt.Sprintf("changed=%d", changed)})
@@ -537,7 +546,7 @@ func deployCmd(opts *options) *cobra.Command {
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_registry_auth", Status: "succeeded", Release: releaseID, Message: fmt.Sprintf("images=%d hosts=%d", len(registryImages), len(hosts))})
 			if hasReleaseCommands(cfg) {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "started", Release: releaseID})
-				if err := runReleaseCommands(ctx, cfg, hosts, args[0], releaseID, images, secretEnvFiles); err != nil {
+				if err := runReleaseCommandsWithProgress(ctx, cfg, hosts, args[0], releaseID, images, secretEnvFiles, progress.releaseReporter()); err != nil {
 					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "failed", Release: releaseID, Message: err.Error()})
 					failedRelease, markErr := store.MarkReleaseFailed(releaseID, err.Error(), deployNow())
 					if markErr != nil {
@@ -555,7 +564,15 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "succeeded", Release: releaseID})
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_rollout", Status: "started", Release: releaseID})
+			var ingressElapsed time.Duration
 			rollout, err := deployment.RolloutWithResult(ctx, deployment.RolloutOptions{
+				Now: deployClock,
+				Observe: func(event deployment.StepEvent) {
+					if event.Kind == deployment.ActionIngress && event.Err == nil {
+						ingressElapsed += event.Elapsed
+					}
+					progress.rolloutEvent(event)
+				},
 				Config:         cfg,
 				Environment:    env,
 				Hosts:          hosts,
@@ -583,6 +600,7 @@ func deployCmd(opts *options) *cobra.Command {
 			}
 			actions := rollout.Actions
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_rollout", Status: "succeeded", Release: releaseID})
+			progress.doneKind("ingress", ingressElapsed)
 			recordRolloutCleanupWarnings(cmd.OutOrStdout(), store, args[0], "deploy_cleanup", releaseID, rollout.CleanupWarnings)
 			recordIngressEvents(store, args[0], releaseID, actions)
 			if err := preserveMaintenanceIngress(ctx, cfg, args[0], stateDir, hosts, store); err != nil {
@@ -644,6 +662,10 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "succeeded", Release: releaseID})
+			fmt.Fprintf(cmd.OutOrStdout(), "release %s is current\n", releaseID)
+			if err := progress.Err(); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
+			}
 			runNotifications(ctx, store, cfg, envName, "deploy", "succeeded", releaseID, "", images)
 			return nil
 		},
@@ -928,6 +950,21 @@ func failPromotedRelease(ctx context.Context, store state.Store, envName, releas
 }
 
 func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Config, releaseID string) (map[string]string, error) {
+	return prepareDeployImagesWithProgress(ctx, dc, cfg, releaseID, nil)
+}
+
+// prepareDeployImagesWithProgress builds, pushes, and resolves service images.
+// onStep, when set, is called with the plan kind (build, push, resolve), the
+// service name, and how long that step took after each step finishes.
+func prepareDeployImagesWithProgress(ctx context.Context, dc deployDocker, cfg *config.Config, releaseID string, onStep func(kind, target string, elapsed time.Duration)) (map[string]string, error) {
+	began := deployClock()
+	step := func(kind, target string) {
+		now := deployClock()
+		if onStep != nil {
+			onStep(kind, target, now.Sub(began))
+		}
+		began = now
+	}
 	images := map[string]string{}
 	for _, name := range sortedServiceNames(cfg.Services) {
 		svc := cfg.Services[name]
@@ -976,6 +1013,7 @@ func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Confi
 			if err := dc.BuildImage(ctx, buildOpts); err != nil {
 				return nil, err
 			}
+			step("build", name)
 			if !docker.BuildPublishesImage(buildOpts) {
 				if err := dc.Push(ctx, tag); err != nil {
 					return nil, err
@@ -986,12 +1024,14 @@ func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Confi
 					}
 				}
 			}
+			step("push", name)
 			imageRef = tag
 		}
 		digestRef, err := dc.ResolveDigest(ctx, imageRef)
 		if err != nil {
 			return nil, err
 		}
+		step("resolve", name)
 		images[name] = digestRef
 	}
 	return images, nil
@@ -1115,6 +1155,19 @@ func hasReleaseCommands(cfg *config.Config) bool {
 }
 
 func runReleaseCommands(ctx context.Context, cfg *config.Config, hosts []scheduler.Host, envName, releaseID string, images map[string]string, secretEnvFiles map[string]string) error {
+	return runReleaseCommandsWithProgress(ctx, cfg, hosts, envName, releaseID, images, secretEnvFiles, nil)
+}
+
+// releaseReporter is the progress hooks for release commands: onDone after each
+// command succeeds, onFail with the command's output when one fails.
+type releaseReporter struct {
+	onDone func(service string, elapsed time.Duration)
+	onFail func(service string, elapsed time.Duration, err error, result agent.CommandResult)
+}
+
+// runReleaseCommandsWithProgress runs release commands and reports each one
+// through reporter (which may be nil).
+func runReleaseCommandsWithProgress(ctx context.Context, cfg *config.Config, hosts []scheduler.Host, envName, releaseID string, images map[string]string, secretEnvFiles map[string]string, reporter *releaseReporter) error {
 	placements, err := scheduler.PlaceServicesOnHosts(cfg, hosts)
 	if err != nil {
 		return err
@@ -1158,8 +1211,16 @@ func runReleaseCommands(ctx context.Context, cfg *config.Config, hosts []schedul
 			TimeoutSeconds: svc.Release.TimeoutSeconds,
 		}
 		var result agent.CommandResult
+		began := deployClock()
 		if err := client.Call(ctx, "run_oneoff_container", params, &result); err != nil {
-			return fmt.Errorf("release command for service %s on %s: %w", serviceName, placement.Host.Name, err)
+			err = fmt.Errorf("release command for service %s on %s: %w", serviceName, placement.Host.Name, err)
+			if reporter != nil && reporter.onFail != nil {
+				reporter.onFail(serviceName, deployClock().Sub(began), err, result)
+			}
+			return err
+		}
+		if reporter != nil && reporter.onDone != nil {
+			reporter.onDone(serviceName, deployClock().Sub(began))
 		}
 	}
 	return nil

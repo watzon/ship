@@ -1141,3 +1141,32 @@ func (f *fakeDocker) ListShipContainers(ctx context.Context) ([]docker.Container
 		Labels: map[string]string{docker.LabelManagedBy: docker.LabelManagedByValue},
 	}}, nil
 }
+
+func TestExecContainerFailureReturnsOutputAndExitCode(t *testing.T) {
+	server := testServer(t)
+	server.CommandRunner = func(ctx context.Context, name string, args ...string) (string, error) {
+		return "", &CommandError{Name: name, Stdout: "partial out\n", Stderr: "boom\n", ExitCode: 7, Message: "docker failed: boom"}
+	}
+	resp := server.Handle(context.Background(), request(t, "exec-fail", "exec_container", ExecContainerParams{Name: "ship_web_1", Command: "false"}))
+	if resp.OK || resp.ErrorCode != ErrorCommandFailed {
+		t.Fatalf("response = %+v", resp)
+	}
+	var result CommandResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Output != "partial out" || result.Stderr != "boom" || result.ExitCode != 7 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestDefaultCommandRunnerReportsOutputAndExitCode(t *testing.T) {
+	_, err := defaultCommandRunner(context.Background(), "sh", "-c", "echo out; echo err >&2; exit 3")
+	var cmdErr *CommandError
+	if !errors.As(err, &cmdErr) {
+		t.Fatalf("err = %v, want CommandError", err)
+	}
+	if cmdErr.ExitCode != 3 || strings.TrimSpace(cmdErr.Stdout) != "out" || strings.TrimSpace(cmdErr.Stderr) != "err" {
+		t.Fatalf("CommandError = %+v", cmdErr)
+	}
+}
