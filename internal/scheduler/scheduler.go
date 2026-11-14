@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/watzon/ship/internal/config"
-	"github.com/watzon/ship/internal/ipaddr"
 )
 
 type Host struct {
@@ -46,7 +45,7 @@ func HostsForEnvironment(env config.Environment) []Host {
 		ssh := mergeSSHConfig(env.SSH, pool.SSH)
 		for _, name := range pool.HostNames(poolName) {
 			host := Host{Name: name, Pool: poolName, User: user}
-			if address := ipaddr.CanonicalOr(pool.Pin[name]); address != "" {
+			if address := strings.TrimSpace(pool.Pin[name]); address != "" {
 				host.PinnedAddress = address
 				host.Contact = address
 			}

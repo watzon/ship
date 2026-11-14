@@ -5,6 +5,10 @@
 // (::ffff:203.0.113.10) are unmapped to plain IPv4, so the two spellings
 // compare equal. Zoned addresses (fe80::1%eth0) stay strict: the zone is kept
 // and must match exactly, and a zoned address is never unmapped.
+//
+// Canonical forms are for comparison only. Ship never rewrites the address it
+// stores in host facts or connects to: SSH known_hosts entries are keyed by
+// the exact spelling, so changing it would break strict host-key checking.
 package ipaddr
 
 import (
@@ -39,15 +43,6 @@ func Canonical(value string) (string, bool) {
 		return "", false
 	}
 	return addr.String(), true
-}
-
-// CanonicalOr returns the canonical spelling of value when it is an IP
-// address, and value with surrounding space trimmed otherwise.
-func CanonicalOr(value string) string {
-	if canonical, ok := Canonical(value); ok {
-		return canonical
-	}
-	return strings.TrimSpace(value)
 }
 
 // Equal reports whether a and b are the same IP address. Values that are not

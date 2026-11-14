@@ -78,7 +78,7 @@ environments:
             web-2: 203.0.113.11
 ```
 
-`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment. Ship compares addresses as IP addresses, not text: `2001:DB8::1` and `2001:db8::0:1` are the same, and an IPv4-mapped address such as `::ffff:203.0.113.10` is the same as `203.0.113.10`. Pins and saved host facts are stored in canonical form. Zoned IPv6 addresses (`fe80::1%eth0`) must match exactly, zone included.
+`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment. Ship compares addresses as IP addresses, not text: `2001:DB8::1` and `2001:db8::0:1` are the same, and an IPv4-mapped address such as `::ffff:203.0.113.10` is the same as `203.0.113.10`. Ship never rewrites an address: it connects to the spelling the provider reports (or, for a pinned host with no host facts, the spelling you wrote), because SSH `known_hosts` entries are keyed by that exact text. Zoned IPv6 addresses (`fe80::1%eth0`) must match exactly, zone included.
 
 A pinned host:
 

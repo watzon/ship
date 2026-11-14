@@ -2284,38 +2284,10 @@ func Load(path string) (*Config, error) {
 	if err := cfg.ResolveUserDataFiles(baseDir); err != nil {
 		return nil, err
 	}
-	cfg.CanonicalizePins()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
-}
-
-// CanonicalizePins rewrites every hosts.pools.<pool>.pin address that is an
-// IP address to its canonical spelling (see package ipaddr), so pins, provider
-// addresses, and host facts compare equal however the address was written.
-// Values that are not IP addresses are left for Validate to reject.
-func (c *Config) CanonicalizePins() {
-	if c == nil {
-		return
-	}
-	for envName, env := range c.Environments {
-		for poolName, pool := range env.Hosts.Pools {
-			if len(pool.Pin) == 0 {
-				continue
-			}
-			pins := make(map[string]string, len(pool.Pin))
-			for name, address := range pool.Pin {
-				if canonical, ok := ipaddr.Canonical(address); ok {
-					address = canonical
-				}
-				pins[name] = address
-			}
-			pool.Pin = pins
-			env.Hosts.Pools[poolName] = pool
-		}
-		c.Environments[envName] = env
-	}
 }
 
 func (c *Config) ResolveUserDataFiles(baseDir string) error {

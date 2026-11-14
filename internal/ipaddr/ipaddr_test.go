@@ -43,7 +43,4 @@ func TestCanonical(t *testing.T) {
 			t.Errorf("Canonical(%q) = %q, %v; want %q, %v", tt.in, got, ok, tt.want, tt.ok)
 		}
 	}
-	if got := CanonicalOr(" host.example "); got != "host.example" {
-		t.Errorf("CanonicalOr = %q", got)
-	}
 }

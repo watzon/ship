@@ -304,12 +304,13 @@ func applyProviderHostToFact(fact *state.HostFact, host provider.Host) {
 	fact.KnownHostsFile = host.KnownHostsFile
 	fact.JumpHost = host.JumpHost
 	fact.SSHOptions = copyStringMap(host.SSHOptions)
-	// Store IP addresses in canonical form (see package ipaddr) so later
-	// pin checks and remote commands see one spelling.
-	fact.PublicAddress = ipaddr.CanonicalOr(host.PublicAddress)
+	// Keep the address exactly as the provider reports it: it is the SSH
+	// target, and known_hosts entries are keyed by that spelling. Equality
+	// checks canonicalize at comparison time through package ipaddr instead.
+	fact.PublicAddress = host.PublicAddress
 	fact.IPv4 = ""
 	if addr, ok := ipaddr.Parse(host.PublicAddress); ok && addr.Is4() {
-		fact.IPv4 = addr.String()
+		fact.IPv4 = host.PublicAddress
 	}
 }
 

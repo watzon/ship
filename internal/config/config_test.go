@@ -3474,14 +3474,17 @@ func TestLoadNegativeCountWithPinReturnsValidationError(t *testing.T) {
 	}
 }
 
-func TestLoadCanonicalizesPinAddresses(t *testing.T) {
+func TestLoadKeepsPinAddressSpelling(t *testing.T) {
+	// Pins are SSH targets when no host facts exist, and known_hosts entries
+	// are keyed by the written spelling, so Load must not rewrite them.
+	// Equivalent spellings are compared with package ipaddr instead.
 	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: 2\n          pin:\n            web-1: 2001:DB8:0::1\n            web-2: \"::ffff:203.0.113.10\"\n", 1)
 	cfg, err := loadConfigText(t, text)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pins := cfg.Environments["production"].Hosts.Pools["web"].Pin
-	if pins["web-1"] != "2001:db8::1" || pins["web-2"] != "203.0.113.10" {
+	if pins["web-1"] != "2001:DB8:0::1" || pins["web-2"] != "::ffff:203.0.113.10" {
 		t.Fatalf("pins = %+v", pins)
 	}
 }
