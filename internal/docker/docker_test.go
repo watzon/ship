@@ -711,6 +711,7 @@ exit 2
 func TestRegistryCredentialsAllowAnonymousTTLWhenHelperHasNoEntry(t *testing.T) {
 	dir := t.TempDir()
 	writeExecutable(t, filepath.Join(dir, "docker-credential-osxkeychain"), `#!/bin/sh
+echo "credentials not found in native keychain"
 exit 1
 `)
 	t.Setenv("PATH", dir)
@@ -908,5 +909,58 @@ echo '{"Username":"chris","Secret":"pw"}'
 	host := newHubLikeRegistry(t, "sha256:abc")
 	if _, err := (Client{}).ResolveDigest(context.Background(), host+"/acme/private:1"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRegistryCredentialsHelperOutcomes(t *testing.T) {
+	const notFound = "credentials not found in native keychain"
+	cases := []struct {
+		name      string
+		script    string
+		cancel    bool
+		anonymous bool
+	}{
+		{name: "not found on stdout", script: "echo '" + notFound + "'\nexit 1", anonymous: true},
+		{name: "not found on stderr", script: "echo '" + notFound + "' >&2\nexit 1", anonymous: true},
+		{name: "locked keychain", script: "echo 'keychain is locked' >&2\nexit 1"},
+		{name: "not found plus other stderr", script: "echo '" + notFound + "'\necho 'keychain is locked' >&2\nexit 1"},
+		{name: "exit 2", script: "echo '" + notFound + "' >&2\nexit 2"},
+		{name: "exit 0 empty stdout", script: "echo 'unexpected diagnostic' >&2\nexit 0"},
+		{name: "silent exit 1", script: "exit 1"},
+		{name: "cancelled context", script: "echo '" + notFound + "'\nexit 1", cancel: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeExecutable(t, filepath.Join(dir, "docker-credential-shiptest"), "#!/bin/sh\n"+tc.script+"\n")
+			t.Setenv("PATH", dir)
+			t.Setenv("DOCKER_AUTH_CONFIG", `{"credsStore":"shiptest"}`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel {
+				cancel()
+			}
+			got, err := Client{}.registryCredentials(ctx, "docker.io")
+			if tc.anonymous {
+				if err != nil || got != (registryCredentials{}) {
+					t.Fatalf("got %+v, %v; want anonymous", got, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("got %+v, want error", got)
+			}
+		})
+	}
+}
+
+func TestRegistryCredentialsHelperErrorKeepsStderrOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "docker-credential-shiptest"), "#!/bin/sh\necho '{\"Username\":\"u\",\"Secret\":\"topsecret\"}'\necho 'keychain is locked' >&2\nexit 1\n")
+	t.Setenv("PATH", dir)
+	t.Setenv("DOCKER_AUTH_CONFIG", `{"credsStore":"shiptest"}`)
+	_, err := Client{}.registryCredentials(context.Background(), "docker.io")
+	if err == nil || !strings.Contains(err.Error(), "keychain is locked") || strings.Contains(err.Error(), "topsecret") {
+		t.Fatalf("err = %v", err)
 	}
 }
