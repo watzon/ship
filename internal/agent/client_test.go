@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,5 +70,25 @@ func TestClientCallSendsRPCPayloadOverSSHStdin(t *testing.T) {
 	}
 	if params.Content != "TOKEN="+secret+"\n" {
 		t.Fatalf("content = %q", params.Content)
+	}
+}
+
+func TestClientCallDecodesResultOfFailedResponse(t *testing.T) {
+	dir := t.TempDir()
+	sshPath := filepath.Join(dir, "ssh")
+	script := "#!/bin/sh\ncat >/dev/null\nprintf '{\"id\":\"req-test\",\"ok\":false,\"error\":\"exec failed\",\"error_code\":\"command_failed\",\"result\":{\"output\":\"o\",\"stderr\":\"e\",\"exit_code\":2}}\\n'\n"
+	if err := os.WriteFile(sshPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	client := Client{SSH: transport.SSH{User: "deploy", Host: "example.com"}, NewRequestID: func() string { return "req-test" }}
+	var result CommandResult
+	err := client.Call(context.Background(), "exec_container", ExecContainerParams{Name: "x", Command: "y"}, &result)
+	var remote RemoteError
+	if !errors.As(err, &remote) || remote.Code != ErrorCommandFailed {
+		t.Fatalf("err = %v", err)
+	}
+	if result.Output != "o" || result.Stderr != "e" || result.ExitCode != 2 {
+		t.Fatalf("result = %+v", result)
 	}
 }

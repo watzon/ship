@@ -225,13 +225,13 @@ func TestAccessoryExecUsesPersistedPlacementAndJSON(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if len(execCalls) != 1 || execCalls[0].Name != containerName || execCalls[0].Command != "psql -c select 1" || execCalls[0].TimeoutSeconds != 15 {
+	if len(execCalls) != 1 || execCalls[0].Name != containerName || execCalls[0].Command != "psql -c 'select 1'" || execCalls[0].TimeoutSeconds != 15 {
 		t.Fatalf("exec calls = %+v", execCalls)
 	}
 	want := []string{
 		"agent:data-a:list_ship_containers",
 		"agent:data-b:list_ship_containers",
-		"agent:data-a:exec:" + containerName + ":psql -c select 1",
+		"agent:data-a:exec:" + containerName + ":psql -c 'select 1'",
 	}
 	if strings.Join(events, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("events = %#v, want %#v", events, want)
