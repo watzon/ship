@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/scheduler"
 )
 
@@ -18,6 +19,10 @@ type Action struct {
 type Plan struct {
 	Environment string   `json:"environment"`
 	Actions     []Action `json:"actions"`
+	// Summary counts actions by kind. Provision plans set it so that "this
+	// will create N servers" is visible without reading every action.
+	Summary map[string]int `json:"summary,omitempty"`
+	Notes   []string       `json:"notes,omitempty"`
 }
 
 func (p Plan) Empty() bool {
@@ -36,6 +41,9 @@ func (p Plan) String() string {
 	}
 	if len(p.Actions) == 0 {
 		b.WriteString("- no changes\n")
+	}
+	for _, note := range p.Notes {
+		fmt.Fprintf(&b, "%s\n", note)
 	}
 	return b.String()
 }
@@ -95,17 +103,155 @@ func DeploymentPlan(cfg *config.Config, envName string) (Plan, error) {
 	return plan, nil
 }
 
-func ProvisionPlan(cfg *config.Config, envName string) (Plan, error) {
-	_, env, err := cfg.ResolveEnvironment(envName)
-	if err != nil {
-		return Plan{}, err
+// Provision action kinds.
+const (
+	// ProvisionCreate: apply creates a new server (this costs money).
+	ProvisionCreate = "create"
+	// ProvisionExists: a server for the host already exists; apply reuses it
+	// and re-runs the idempotent bootstrap.
+	ProvisionExists = "exists"
+	// ProvisionPinned: the host is pinned by address but is not in local host
+	// facts. Apply never creates a pinned host; it fails if the provider has
+	// no server for it.
+	ProvisionPinned = "pinned"
+	// ProvisionConflict: a pin disagrees with known servers. Apply refuses to
+	// run until the pin is fixed.
+	ProvisionConflict = "conflict"
+	// ProvisionExtra: a known server that is not in the config. Apply leaves
+	// it running; decommission is explicit.
+	ProvisionExtra = "extra"
+)
+
+// KnownHost is a server Ship already knows about, from local host facts or
+// from a read-only provider listing.
+type KnownHost struct {
+	Name       string
+	Pool       string
+	Address    string
+	ProviderID string
+}
+
+// ProvisionInput is everything ProvisionPlan needs. It never talks to a
+// provider itself.
+type ProvisionInput struct {
+	// Desired are the hosts the config asks for.
+	Desired []provider.HostPlan
+	// Known are the servers that already exist.
+	Known []KnownHost
+	// Source describes where Known came from, for the plan notes.
+	Source string
+	// Authoritative is true when Known came from the provider itself rather
+	// than from local host facts.
+	Authoritative bool
+	// CreatesServers is false for inventory providers that never create
+	// servers (manual, ssh_config, terraform, pulumi, ansible).
+	CreatesServers bool
+	// Provider is the provider name, for inventory provider details.
+	Provider string
+}
+
+// ProvisionPlan shows, per configured host, whether `ship provision apply`
+// would create a server, reuse an existing one, or refuse because of a pin.
+func ProvisionPlan(envName string, in ProvisionInput) Plan {
+	plan := Plan{Environment: envName, Summary: map[string]int{}}
+	if !in.CreatesServers {
+		for _, desired := range in.Desired {
+			plan.add(Action{Kind: ProvisionExists, Target: desired.Name, Details: fmt.Sprintf("pool=%s inventory=%s", desired.Pool, in.Provider)})
+		}
+		plan.Notes = append(plan.Notes, fmt.Sprintf("provider %s uses existing hosts; apply never creates servers", in.Provider))
+		return plan
 	}
-	hosts := scheduler.HostsForEnvironment(env)
-	plan := Plan{Environment: envName}
-	for _, host := range hosts {
-		plan.Actions = append(plan.Actions, Action{Kind: "provision", Target: host.Name, Details: fmt.Sprintf("pool=%s", host.Pool)})
+
+	// The first known server for a logical name wins; later duplicates (for
+	// example an old server kept by `ship migrate --keep-server`) are extra.
+	known := map[string]int{}
+	byAddress := map[string]KnownHost{}
+	for i, host := range in.Known {
+		if _, ok := known[host.Name]; !ok {
+			known[host.Name] = i
+		}
+		if host.Address != "" {
+			byAddress[host.Address] = host
+		}
 	}
-	return plan, nil
+	used := map[int]bool{}
+	var creates []string
+	for _, desired := range in.Desired {
+		pin := strings.TrimSpace(desired.PinnedAddress)
+		index, found := known[desired.Name]
+		switch {
+		case found:
+			used[index] = true
+			host := in.Known[index]
+			if pin != "" && host.Address != "" && host.Address != pin {
+				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s reports %s; apply refuses until the pin matches", desired.Pool, pin, in.Source, host.Address)})
+				continue
+			}
+			plan.add(Action{Kind: ProvisionExists, Target: desired.Name, Details: knownDetails(desired.Pool, host)})
+		case pin != "":
+			if other, ok := byAddress[pin]; ok {
+				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s, which belongs to host %s; pin that host name instead", desired.Pool, pin, other.Name)})
+				continue
+			}
+			if in.Authoritative {
+				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s has no server for it; apply refuses and never creates a pinned host", desired.Pool, pin, in.Source)})
+				continue
+			}
+			plan.add(Action{Kind: ProvisionPinned, Target: desired.Name, Details: fmt.Sprintf("pool=%s address=%s (not in %s; apply never creates a pinned host)", desired.Pool, pin, in.Source)})
+		default:
+			plan.add(Action{Kind: ProvisionCreate, Target: desired.Name, Details: fmt.Sprintf("pool=%s new server", desired.Pool)})
+			creates = append(creates, desired.Name)
+		}
+	}
+	var extras []KnownHost
+	for i, host := range in.Known {
+		if !used[i] {
+			extras = append(extras, host)
+		}
+	}
+	sort.Slice(extras, func(i, j int) bool {
+		if extras[i].Pool != extras[j].Pool {
+			return extras[i].Pool < extras[j].Pool
+		}
+		return extras[i].Name < extras[j].Name
+	})
+	for _, host := range extras {
+		plan.add(Action{Kind: ProvisionExtra, Target: host.Name, Details: knownDetails(host.Pool, host) + " not in config; apply leaves it running"})
+	}
+
+	switch len(creates) {
+	case 0:
+		plan.Notes = append(plan.Notes, "apply will not create any servers")
+	case 1:
+		plan.Notes = append(plan.Notes, fmt.Sprintf("apply will create 1 server: %s", creates[0]))
+	default:
+		plan.Notes = append(plan.Notes, fmt.Sprintf("apply will create %d servers: %s", len(creates), strings.Join(creates, ", ")))
+	}
+	if plan.Summary[ProvisionConflict] > 0 {
+		plan.Notes = append(plan.Notes, "apply will refuse to run until the conflicts above are fixed in ship.yml")
+	}
+	if in.Source != "" {
+		plan.Notes = append(plan.Notes, "existing servers from "+in.Source)
+	}
+	return plan
+}
+
+func (p *Plan) add(action Action) {
+	p.Actions = append(p.Actions, action)
+	if p.Summary != nil {
+		p.Summary[action.Kind]++
+	}
+}
+
+func knownDetails(pool string, host KnownHost) string {
+	details := "pool=" + pool
+	if host.ProviderID != "" {
+		details += " provider_id=" + host.ProviderID
+	}
+	if host.Address != "" {
+		details += " address=" + host.Address
+	}
+	return details
 }
 
 func imageDescription(registry, serviceName string, svc config.Service) string {

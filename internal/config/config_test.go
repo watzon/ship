@@ -3522,3 +3522,14 @@ func TestValidateHostPins(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderCreatesServers(t *testing.T) {
+	if !(ProviderConfig{Vultr: &VultrConfig{}}).CreatesServers() {
+		t.Fatal("vultr should create servers")
+	}
+	for _, cfg := range []ProviderConfig{{Manual: &ManualConfig{}}, {Terraform: &TerraformConfig{}}, {}} {
+		if cfg.CreatesServers() {
+			t.Fatalf("%q should not create servers", cfg.Name())
+		}
+	}
+}

@@ -1456,6 +1456,17 @@ func (p ProviderConfig) Validate(envName string) []string {
 	return errs
 }
 
+// CreatesServers reports whether `ship provision apply` can create servers
+// for this provider. Inventory-backed providers (manual, ssh_config,
+// terraform, pulumi, ansible) only read existing hosts.
+func (p ProviderConfig) CreatesServers() bool {
+	switch p.Name() {
+	case "", ProviderManual, ProviderSSHConfig, ProviderTerraform, ProviderPulumi, ProviderAnsible:
+		return false
+	}
+	return true
+}
+
 func (p ProviderConfig) ManualHostsRequired() bool {
 	return p.Manual != nil
 }

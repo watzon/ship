@@ -34,9 +34,9 @@ func TestLiveHetznerAcceptanceGate(t *testing.T) {
 	}
 
 	out := runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "plan", "production")
-	assertAcceptanceOutput(t, out, "provision web-1", "provision worker-1")
+	assertAcceptanceOutput(t, out, "create web-1: pool=web new server", "create worker-1: pool=worker new server")
 	out = runAcceptanceCommand(t, provisionCmd(&options{configPath: path, dryRun: true}), "apply", "production")
-	assertAcceptanceOutput(t, out, "would provision web-1 pool=web")
+	assertAcceptanceOutput(t, out, "create web-1: pool=web new server")
 
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -94,7 +94,7 @@ func TestDestructiveLiveHetznerFullCycle(t *testing.T) {
 	})
 
 	out := runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "plan", "production")
-	assertAcceptanceOutput(t, out, "provision web-1", "provision web-2")
+	assertAcceptanceOutput(t, out, "create web-1: pool=web new server", "create web-2: pool=web new server")
 	runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "apply", "production", "--yes")
 	runAcceptanceCommand(t, agentCmd(&options{configPath: path}), "status", "production")
 

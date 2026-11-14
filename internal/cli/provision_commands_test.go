@@ -95,7 +95,7 @@ func TestProvisionApplyDryRunDoesNotRequireYesOrToken(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "would provision web-1 pool=web") {
+	if !strings.Contains(out.String(), "- create web-1: pool=web new server") {
 		t.Fatalf("output = %q", out.String())
 	}
 	if _, err := os.Stat(filepath.Join(dir, config.LocalStateDir, "environments", "production", "hosts.json")); !os.IsNotExist(err) {
@@ -117,7 +117,7 @@ func TestProvisionApplyDryRunUsesConfiguredProvider(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "would provision fake-1 pool=fake") {
+	if !strings.Contains(out.String(), "- create fake-1: pool=fake new server") {
 		t.Fatalf("output = %q", out.String())
 	}
 }
@@ -147,7 +147,7 @@ func TestProvisionPlanJSON(t *testing.T) {
 	}
 	var sawWeb bool
 	for _, action := range view.Actions {
-		if action.Kind == "provision" && action.Target == "web-1" && action.Details == "pool=web" {
+		if action.Kind == "create" && action.Target == "web-1" && action.Details == "pool=web new server" {
 			sawWeb = true
 		}
 	}

@@ -1,10 +1,15 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -22,20 +27,41 @@ var newEnvironmentProvider = providers.ForEnvironment
 
 func provisionCmd(opts *options) *cobra.Command {
 	cmd := &cobra.Command{Use: "provision", Short: "Plan or apply server provisioning"}
-	var planJSON bool
+	var planJSON, planRefresh bool
 	plan := &cobra.Command{
 		Use:   "plan ENV",
 		Short: "Print the provisioning plan",
-		Args:  ui.ExactArgs(ui.Env),
+		Long: "Print which hosts already exist and which servers `ship provision apply` would create.\n\n" +
+			"By default existing servers come from local host facts (.ship/environments/ENV/hosts.json), so the\n" +
+			"plan needs no provider credentials. --refresh lists servers from the provider instead (read-only).",
+		Args: ui.ExactArgs(ui.Env),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(opts.configPath)
 			if err != nil {
 				return err
 			}
-			plan, err := planner.ProvisionPlan(cfg, args[0])
+			resolved, env, err := cfg.ResolveEnvironment(args[0])
 			if err != nil {
 				return err
 			}
+			cfg = resolved
+			var input planner.ProvisionInput
+			if planRefresh {
+				prov, err := newEnvironmentProvider(env, true)
+				if err != nil {
+					return err
+				}
+				input, err = providerProvisionInput(cmd.Context(), prov, cfg.Project, args[0], env)
+				if err != nil {
+					return err
+				}
+			} else {
+				input, err = localProvisionInput(opts.configPath, args[0], env, provider.HostPlans(cfg.Project, args[0], env, provider.HostPlanOptions{}))
+				if err != nil {
+					return err
+				}
+			}
+			plan := planner.ProvisionPlan(args[0], input)
 			if planJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(plan)
 			}
@@ -44,6 +70,7 @@ func provisionCmd(opts *options) *cobra.Command {
 		},
 	}
 	plan.Flags().BoolVar(&planJSON, "json", false, "print the provisioning plan as JSON")
+	plan.Flags().BoolVar(&planRefresh, "refresh", false, "list existing servers from the provider (read-only) instead of local host facts")
 	cmd.AddCommand(plan)
 	var yes bool
 	apply := &cobra.Command{
@@ -73,9 +100,12 @@ func provisionCmd(opts *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				for _, host := range plans {
-					fmt.Fprintf(cmd.OutOrStdout(), "would provision %s pool=%s\n", host.Name, host.Pool)
+				input, err := localProvisionInput(opts.configPath, args[0], env, plans)
+				if err != nil {
+					return err
 				}
+				input.Provider = prov.Name()
+				fmt.Fprint(cmd.OutOrStdout(), planner.ProvisionPlan(args[0], input).String())
 				return nil
 			}
 			stateDir, err := localStateDirForConfig(opts.configPath)
@@ -278,4 +308,78 @@ func applyProviderHostToFact(fact *state.HostFact, host provider.Host) {
 	if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
 		fact.IPv4 = host.PublicAddress
 	}
+}
+
+// localProvisionInput builds a provision plan input from the local host facts.
+// It never contacts the provider, so it works without credentials.
+func localProvisionInput(configPath, envName string, env config.Environment, desired []provider.HostPlan) (planner.ProvisionInput, error) {
+	input := planner.ProvisionInput{
+		Desired:        desired,
+		CreatesServers: env.Provider.CreatesServers(),
+		Provider:       env.Provider.Name(),
+	}
+	stateDir, err := localStateDirForConfig(configPath)
+	if err != nil {
+		return input, err
+	}
+	factsPath := filepath.Join(config.LocalStateDir, "environments", envName, "hosts.json")
+	facts, err := state.NewStore(stateDir).ReadHostFacts(envName)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		input.Source = fmt.Sprintf("local host facts (%s not found; run with --refresh to list servers from the provider)", factsPath)
+		return input, nil
+	case err != nil:
+		return input, err
+	}
+	input.Source = fmt.Sprintf("local host facts (%s; run with --refresh to list servers from the provider)", factsPath)
+	for _, fact := range facts {
+		input.Known = append(input.Known, planner.KnownHost{
+			Name:       strings.TrimSpace(fact.Name),
+			Pool:       strings.TrimSpace(fact.Pool),
+			Address:    hostFactContact(fact),
+			ProviderID: fact.ProviderID,
+		})
+	}
+	return input, nil
+}
+
+// providerProvisionInput builds a provision plan input from a read-only
+// provider listing. It never creates, changes, or deletes servers.
+func providerProvisionInput(ctx context.Context, prov provider.Provider, project, envName string, env config.Environment) (planner.ProvisionInput, error) {
+	desired, err := prov.PlanHosts(project, envName, env)
+	if err != nil {
+		return planner.ProvisionInput{}, err
+	}
+	input := planner.ProvisionInput{
+		Desired:        desired,
+		CreatesServers: env.Provider.CreatesServers(),
+		Provider:       prov.Name(),
+		Source:         fmt.Sprintf("provider %s (read-only list)", prov.Name()),
+		Authoritative:  true,
+	}
+	if !input.CreatesServers {
+		return input, nil
+	}
+	hosts, err := prov.List(ctx, project, envName)
+	if err != nil {
+		return planner.ProvisionInput{}, fmt.Errorf("list servers from provider %s: %w", prov.Name(), err)
+	}
+	// Prefer the server whose provider name matches its logical host, like
+	// reconciliation does, so a kept migrate original shows as extra.
+	sort.SliceStable(hosts, func(i, j int) bool {
+		return hosts[i].Name == provider.LogicalName(hosts[i]) && hosts[j].Name != provider.LogicalName(hosts[j])
+	})
+	for _, host := range hosts {
+		pool := host.Pool
+		if pool == "" {
+			pool = host.Labels[provider.LabelPool]
+		}
+		input.Known = append(input.Known, planner.KnownHost{
+			Name:       provider.LogicalName(host),
+			Pool:       pool,
+			Address:    strings.TrimSpace(host.PublicAddress),
+			ProviderID: host.ID,
+		})
+	}
+	return input, nil
 }
