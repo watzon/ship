@@ -191,13 +191,64 @@ func TestReconcileHostsPropagatesBackendErrors(t *testing.T) {
 	}
 }
 
+func TestReconcileHostsPinMatchesEquivalentAddressForms(t *testing.T) {
+	backend := &fakeBackend{existing: []Host{
+		{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "2001:db8::0:1"},
+	}}
+	desired := []HostPlan{{Name: "web-1", Pool: "web", PinnedAddress: "2001:DB8::1"}}
+	if _, err := ReconcileHosts(context.Background(), "demo", "production", desired, backend); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileHostsCreatesExistingServerNamedLikeAnAddress(t *testing.T) {
+	// A server that already carries an address-like logical name is matched,
+	// not refused; only creating one is.
+	backend := &fakeBackend{existing: []Host{{ID: "1", Name: "10.0.0.5", Pool: "web", PublicAddress: "10.0.0.5"}}}
+	desired := []HostPlan{{Name: "10.0.0.5", Pool: "web"}}
+	result, err := ReconcileHosts(context.Background(), "demo", "production", desired, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Existing) != 1 || len(backend.created) != 0 {
+		t.Fatalf("result = %+v created = %+v", result, backend.created)
+	}
+}
+
+func TestPreflightHostsListsOnlyAndRefusesBadPins(t *testing.T) {
+	backend := &fakeBackend{existing: []Host{{ID: "1", Name: "web-1", Pool: "web"}}}
+	desired := []HostPlan{
+		{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"},
+		{Name: "web-2", Pool: "web"},
+	}
+	err := PreflightHosts(context.Background(), backend, "demo", "production", desired)
+	if err == nil || !strings.Contains(err.Error(), "pin cannot be verified") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("err = %v", err)
+	}
+	if backend.lists != 1 || len(backend.created) != 0 {
+		t.Fatalf("lists = %d created = %+v", backend.lists, backend.created)
+	}
+
+	listErr := errors.New("boom")
+	err = PreflightHosts(context.Background(), &fakeBackend{listErr: listErr}, "demo", "production", desired)
+	if !errors.Is(err, listErr) {
+		t.Fatalf("err = %v", err)
+	}
+
+	if err := PreflightHosts(context.Background(), &fakeBackend{existing: []Host{{Name: "web-1", Pool: "web", PublicAddress: "203.0.113.10"}}}, "demo", "production", desired); err != nil {
+		t.Fatalf("valid pin refused: %v", err)
+	}
+}
+
 type fakeBackend struct {
+	lists    int
 	existing []Host
 	created  []string
 	listErr  error
 }
 
 func (f *fakeBackend) List(context.Context, string, string) ([]Host, error) {
+	f.lists++
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -272,6 +323,39 @@ func TestReconcileHostsRefusesBadPinsBeforeCreatingAnything(t *testing.T) {
 			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "198.51.100.7"}},
 			desired:  []HostPlan{{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"}},
 			want:     []string{"pinned to 203.0.113.10 but the provider reports 198.51.100.7; update hosts.pools.web.pin.web-1"},
+		},
+		{
+			// Thorn QA: the provider lists the pinned host with no address, so
+			// the pin cannot be verified. Fail closed; web-2 must not be created.
+			name:     "pinned host has no provider address",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web"}},
+			desired: []HostPlan{
+				{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"},
+				{Name: "web-2", Pool: "web"},
+			},
+			want: []string{"host web-1 pool=web is pinned to 203.0.113.10 but the provider reports no address for it, so the pin cannot be verified"},
+		},
+		{
+			name:     "pinned host has an address that cannot be compared",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "not-an-ip"}},
+			desired: []HostPlan{
+				{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"},
+				{Name: "web-2", Pool: "web"},
+			},
+			want: []string{"host web-1 pool=web is pinned to 203.0.113.10 but the provider reports address \"not-an-ip\", which is not an IP address, so the pin cannot be verified"},
+		},
+		{
+			// Thorn QA: local host facts say web-1 is 203.0.113.10 but the
+			// provider now reports .11, so the live listing has no server at
+			// the listed address. A host named after an IP must still never be
+			// created, and nothing else may be created either.
+			name:     "address listed as a host name with no matching server",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "203.0.113.11"}},
+			desired: []HostPlan{
+				{Name: "aaa-new", Pool: "web"},
+				{Name: "203.0.113.10", Pool: "web"},
+			},
+			want: []string{"host 203.0.113.10 pool=web is an IP address, and apply would create a new server named after it", "hosts.pools.web.pin.<host>: 203.0.113.10"},
 		},
 	}
 	for _, tt := range tests {

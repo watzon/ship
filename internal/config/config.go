@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1926,6 +1927,10 @@ func (p Pool) HostNames(poolName string) []string {
 		names := append([]string(nil), p.Hosts...)
 		sort.Strings(names)
 		return names
+	}
+	if p.Count <= 0 {
+		// A negative count is a validation error; never size a slice from it.
+		return nil
 	}
 	names := make([]string, 0, p.Count)
 	for i := 1; i <= p.Count; i++ {
@@ -4133,11 +4138,16 @@ func validateHostPins(envName string, pools map[string]Pool) []string {
 				errs = append(errs, scope+" address cannot contain whitespace")
 				continue
 			}
-			if previous, ok := pinnedBy[address]; ok {
+			parsed, err := netip.ParseAddr(address)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s address %q must be an IP address (Ship compares it with the address the provider reports)", scope, address))
+				continue
+			}
+			if previous, ok := pinnedBy[parsed.Unmap().String()]; ok {
 				errs = append(errs, fmt.Sprintf("%s address %s is already pinned to %s", scope, address, previous))
 				continue
 			}
-			pinnedBy[address] = fmt.Sprintf("%s in pool %q", name, poolName)
+			pinnedBy[parsed.Unmap().String()] = fmt.Sprintf("%s in pool %q", name, poolName)
 		}
 	}
 	return errs

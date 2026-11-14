@@ -3465,6 +3465,21 @@ func TestLoadParsesPoolHostPins(t *testing.T) {
 	}
 }
 
+func TestLoadNegativeCountWithPinReturnsValidationError(t *testing.T) {
+	// Thorn QA: count: -1 plus a pin panicked with "makeslice: cap out of range".
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: -1\n          pin:\n            web-1: 203.0.113.10\n", 1)
+	_, err := loadConfigText(t, text)
+	if err == nil || !strings.Contains(err.Error(), `pool "web" count cannot be negative`) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPoolHostNamesNegativeCount(t *testing.T) {
+	if names := (Pool{Count: -1}).HostNames("web"); len(names) != 0 {
+		t.Fatalf("names = %v", names)
+	}
+}
+
 func TestValidateHostPins(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -3496,6 +3511,24 @@ func TestValidateHostPins(t *testing.T) {
 				"worker": {Count: 1, Pin: map[string]string{"worker-1": "203.0.113.10"}},
 			},
 			want: []string{`pool "worker" pin "worker-1" address 203.0.113.10 is already pinned to web-1 in pool "web"`},
+		},
+		{
+			name: "duplicate address in another spelling",
+			pools: map[string]Pool{
+				"web":    {Count: 1, Pin: map[string]string{"web-1": "2001:db8::1"}},
+				"worker": {Count: 1, Pin: map[string]string{"worker-1": "2001:DB8:0::1"}},
+			},
+			want: []string{`pool "worker" pin "worker-1" address 2001:DB8:0::1 is already pinned to web-1 in pool "web"`},
+		},
+		{
+			name:  "address is not an IP",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-1": "web-1.example.com"}}},
+			want:  []string{`pool "web" pin "web-1" address "web-1.example.com" must be an IP address`},
+		},
+		{
+			name:  "negative count with pin",
+			pools: map[string]Pool{"web": {Count: -1, Pin: map[string]string{"web-1": "203.0.113.10"}}},
+			want:  []string{`pool "web" count cannot be negative`},
 		},
 	}
 	for _, tt := range tests {

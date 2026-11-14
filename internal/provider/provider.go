@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -228,19 +229,52 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 	return result, nil
 }
 
+// HostLister lists the servers a provider already has for an environment. It
+// must be read-only.
+type HostLister interface {
+	List(ctx context.Context, project, environment string) ([]Host, error)
+}
+
+// PreflightHosts lists the provider's servers (read-only) and runs
+// CheckBeforeCreate against them. Providers call it from Reconcile before any
+// provider-side setup (networks, firewalls, tags, keys), so a bad pin or host
+// name leaves nothing behind. ReconcileHosts checks again right before it
+// creates servers.
+func PreflightHosts(ctx context.Context, lister HostLister, project, environment string, desired []HostPlan) error {
+	existing, err := lister.List(ctx, project, environment)
+	if err != nil {
+		return err
+	}
+	if problems := checkHosts(desired, existing); len(problems) > 0 {
+		return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed (checked with a read-only server listing before any provider changes)", environment, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
 // CheckBeforeCreate verifies the desired hosts against the servers the
 // provider reports, before reconciliation creates anything:
 //
 //   - A pinned host must already exist at its pinned address. It is an error
-//     for it to be missing (reconciliation would otherwise create a new server)
-//     or to be reported at a different address.
-//   - An unpinned host whose name is the address of an existing server is a
-//     config mistake (hosts: [<ip>] for a provider-created server); creating a
-//     server named after that address would duplicate the existing one.
+//     for it to be missing (reconciliation would otherwise create a new server),
+//     to be reported at a different address, or to be reported without an
+//     address that can be compared with the pin (the pin cannot be verified,
+//     so Ship fails closed).
+//   - An unpinned host whose name is an IP address must already exist under
+//     that name. Creating a server named after an address is always a config
+//     mistake (hosts: [<ip>] for a provider-created server), whether or not
+//     the provider still reports a server at that address.
 //
-// Because the check runs before any server is created, a bad config never
-// leaves a partial apply behind.
+// Any problem refuses the whole apply: no server is created, including hosts
+// that are fine on their own.
 func CheckBeforeCreate(environment string, desired []HostPlan, existing []Host) error {
+	problems := checkHosts(desired, existing)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and no servers were created", environment, strings.Join(problems, "; "))
+}
+
+func checkHosts(desired []HostPlan, existing []Host) []string {
 	byLogical := map[string]Host{}
 	for _, host := range existing {
 		logical := LogicalName(host)
@@ -249,42 +283,70 @@ func CheckBeforeCreate(environment string, desired []HostPlan, existing []Host) 
 		}
 		byLogical[logical] = host
 	}
+	serverAt := func(address string) (Host, bool) {
+		for _, other := range existing {
+			if SameAddress(other.PublicAddress, address) {
+				return other, true
+			}
+		}
+		return Host{}, false
+	}
 	var problems []string
 	for _, plan := range desired {
 		pin := strings.TrimSpace(plan.PinnedAddress)
 		host, ok := byLogical[plan.Name]
 		if pin == "" {
-			if ok {
+			if ok || !IsIPAddress(plan.Name) {
 				continue
 			}
-			for _, other := range existing {
-				if strings.TrimSpace(other.PublicAddress) == plan.Name {
-					problems = append(problems, fmt.Sprintf("host %s pool=%s is the address of existing server %s (host %s), and apply would create a second server for it; list host %s in the pool and set hosts.pools.%s.pin.%s: %s instead", plan.Name, plan.Pool, other.Name, LogicalName(other), LogicalName(other), plan.Pool, LogicalName(other), plan.Name))
-					break
-				}
+			if other, found := serverAt(plan.Name); found {
+				problems = append(problems, fmt.Sprintf("host %s pool=%s is the address of existing server %s (host %s), and apply would create a second server for it; list host %s in the pool and set hosts.pools.%s.pin.%s: %s instead", plan.Name, plan.Pool, other.Name, LogicalName(other), LogicalName(other), plan.Pool, LogicalName(other), plan.Name))
+				continue
 			}
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is an IP address, and apply would create a new server named after it; if it is an existing server, list its host name in the pool and set hosts.pools.%s.pin.<host>: %s instead", plan.Name, plan.Pool, plan.Pool, plan.Name))
 			continue
 		}
 		if !ok {
 			problem := fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no server for it", plan.Name, plan.Pool, pin)
-			for _, other := range existing {
-				if strings.TrimSpace(other.PublicAddress) == pin {
-					problem += fmt.Sprintf("; %s belongs to server %s (host %s), so pin that host name instead", pin, other.Name, LogicalName(other))
-					break
-				}
+			if other, found := serverAt(pin); found {
+				problem += fmt.Sprintf("; %s belongs to server %s (host %s), so pin that host name instead", pin, other.Name, LogicalName(other))
 			}
 			problems = append(problems, problem)
 			continue
 		}
-		if address := strings.TrimSpace(host.PublicAddress); address != "" && address != pin {
+		address := strings.TrimSpace(host.PublicAddress)
+		switch {
+		case address == "":
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no address for it, so the pin cannot be verified", plan.Name, plan.Pool, pin))
+		case !IsIPAddress(address):
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports address %q, which is not an IP address, so the pin cannot be verified", plan.Name, plan.Pool, pin, address))
+		case !SameAddress(address, pin):
 			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports %s; update hosts.pools.%s.pin.%s in ship.yml", plan.Name, plan.Pool, pin, address, plan.Pool, plan.Name))
 		}
 	}
-	if len(problems) == 0 {
-		return nil
-	}
 	sort.Strings(problems)
-	return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed", environment, strings.Join(problems, "; "))
+	return problems
+}
+
+// IsIPAddress reports whether value is an IPv4 or IPv6 address.
+func IsIPAddress(value string) bool {
+	_, err := netip.ParseAddr(strings.TrimSpace(value))
+	return err == nil
+}
+
+// SameAddress reports whether a and b are the same IP address, comparing
+// parsed addresses so equivalent forms (such as IPv6 spellings) match. Values
+// that are not IP addresses never match.
+func SameAddress(a, b string) bool {
+	left, err := netip.ParseAddr(strings.TrimSpace(a))
+	if err != nil {
+		return false
+	}
+	right, err := netip.ParseAddr(strings.TrimSpace(b))
+	if err != nil {
+		return false
+	}
+	return left.Unmap() == right.Unmap()
 }
 
 func sortHosts(hosts []Host) {
