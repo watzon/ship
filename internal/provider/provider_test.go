@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/watzon/ship/internal/config"
@@ -206,4 +207,85 @@ func (f *fakeBackend) List(context.Context, string, string) ([]Host, error) {
 func (f *fakeBackend) Create(_ context.Context, plan HostPlan) (Host, error) {
 	f.created = append(f.created, plan.Name)
 	return Host{ID: "new-" + plan.Name, Name: plan.Name, Pool: plan.Pool, PublicAddress: "192.0.2.10"}, nil
+}
+
+func TestHostPlansCarryPinnedAddress(t *testing.T) {
+	env := config.Environment{Hosts: config.HostsConfig{Pools: map[string]config.Pool{
+		"web": {Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}},
+	}}}
+	plans := HostPlans("demo", "production", env, HostPlanOptions{})
+	if len(plans) != 2 || plans[0].PinnedAddress != "203.0.113.10" || plans[1].PinnedAddress != "" {
+		t.Fatalf("plans = %+v", plans)
+	}
+}
+
+func TestReconcileHostsMatchesPinnedHostWithoutCreating(t *testing.T) {
+	backend := &fakeBackend{existing: []Host{
+		{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "203.0.113.10"},
+	}}
+	desired := []HostPlan{
+		{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"},
+		{Name: "web-2", Pool: "web"},
+	}
+	result, err := ReconcileHosts(context.Background(), "demo", "production", desired, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Existing) != 1 || result.Existing[0].Name != "web-1" {
+		t.Fatalf("existing = %+v", result.Existing)
+	}
+	if got := backend.created; !reflect.DeepEqual(got, []string{"web-2"}) {
+		t.Fatalf("created requests = %+v", got)
+	}
+}
+
+func TestReconcileHostsRefusesBadPinsBeforeCreatingAnything(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []Host
+		desired  []HostPlan
+		want     []string
+	}{
+		{
+			name:     "pinned host missing",
+			existing: nil,
+			desired: []HostPlan{
+				{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"},
+				{Name: "web-2", Pool: "web"},
+			},
+			want: []string{"host web-1 pool=web is pinned to 203.0.113.10 but the provider reports no server for it", "never creates or replaces a pinned host"},
+		},
+		{
+			name:     "pinned address belongs to another host",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "203.0.113.10"}},
+			desired:  []HostPlan{{Name: "edge", Pool: "web", PinnedAddress: "203.0.113.10"}},
+			want:     []string{"203.0.113.10 belongs to server web-1 (host web-1), so pin that host name instead"},
+		},
+		{
+			name:     "pinned address differs",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "198.51.100.7"}},
+			desired:  []HostPlan{{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"}},
+			want:     []string{"pinned to 203.0.113.10 but the provider reports 198.51.100.7; update hosts.pools.web.pin.web-1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := &fakeBackend{existing: tt.existing}
+			_, err := ReconcileHosts(context.Background(), "demo", "production", tt.desired, backend)
+			if err == nil {
+				t.Fatal("expected pinned host error")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error missing %q: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), "provision apply") {
+				t.Fatalf("error must not suggest provision apply: %v", err)
+			}
+			if len(backend.created) != 0 {
+				t.Fatalf("created servers despite bad pin: %+v", backend.created)
+			}
+		})
+	}
 }

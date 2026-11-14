@@ -32,6 +32,9 @@ type HostPlan struct {
 	Image       string
 	UserData    string
 	Labels      map[string]string
+	// PinnedAddress is set when the host is pinned by address in
+	// hosts.pools.<pool>.pin. Reconciliation never creates a pinned host.
+	PinnedAddress string
 }
 
 type Host struct {
@@ -131,6 +134,8 @@ func HostPlans(project, environment string, env config.Environment, opts HostPla
 			Image:       hostOpts.Image,
 			UserData:    hostOpts.UserData,
 			Labels:      labels,
+
+			PinnedAddress: host.PinnedAddress,
 		})
 	}
 	return plans
@@ -193,6 +198,10 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 		existingByLogical[logical] = i
 	}
 
+	if err := CheckPinnedHosts(environment, desired, existing); err != nil {
+		return ReconcileResult{}, err
+	}
+
 	matched := map[int]bool{}
 	for _, plan := range desired {
 		if i, ok := existingByLogical[plan.Name]; ok {
@@ -217,6 +226,49 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 	sortHosts(result.Created)
 	sortHosts(result.Extra)
 	return result, nil
+}
+
+// CheckPinnedHosts verifies every pinned host plan against the servers the
+// provider reports. A pinned host must already exist at its pinned address: it
+// is an error for it to be missing (reconciliation would otherwise create a new
+// server) or to be reported at a different address. The check runs before any
+// server is created, so a bad pin never leaves a partial apply behind.
+func CheckPinnedHosts(environment string, desired []HostPlan, existing []Host) error {
+	byLogical := map[string]Host{}
+	for _, host := range existing {
+		logical := LogicalName(host)
+		if current, ok := byLogical[logical]; ok && current.Name == logical {
+			continue
+		}
+		byLogical[logical] = host
+	}
+	var problems []string
+	for _, plan := range desired {
+		pin := strings.TrimSpace(plan.PinnedAddress)
+		if pin == "" {
+			continue
+		}
+		host, ok := byLogical[plan.Name]
+		if !ok {
+			problem := fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no server for it", plan.Name, plan.Pool, pin)
+			for _, other := range existing {
+				if strings.TrimSpace(other.PublicAddress) == pin {
+					problem += fmt.Sprintf("; %s belongs to server %s (host %s), so pin that host name instead", pin, other.Name, LogicalName(other))
+					break
+				}
+			}
+			problems = append(problems, problem)
+			continue
+		}
+		if address := strings.TrimSpace(host.PublicAddress); address != "" && address != pin {
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports %s; update hosts.pools.%s.pin.%s in ship.yml", plan.Name, plan.Pool, pin, address, plan.Pool, plan.Name))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return fmt.Errorf("pinned hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed", environment, strings.Join(problems, "; "))
 }
 
 func sortHosts(hosts []Host) {
