@@ -39,7 +39,7 @@ Environment-scoped `ship secrets verify`, `render`, and `diff` use the encrypted
 
 `ship hosts ENV` shows the resolved host inventory and SSH contact targets Ship will use. Before provisioning it reports config-derived hosts; after `ship provision apply`, it uses saved provider host facts such as public addresses, SSH ports, jump hosts, and identity files.
 
-`ship provision plan ENV` shows what `ship provision apply` would do to each configured host, and ends with a line such as `apply will create 2 servers: web-2, worker-1` or `apply will not create any servers`:
+`ship provision plan ENV` shows what `ship provision apply` would do to each configured host, and ends with a summary of the servers apply would create. With `--refresh` the plan lists servers from the provider (read-only), and the summary is definite: `apply will create 2 servers: web-2, worker-1`, `apply will not create any servers`, or `apply will refuse to run and will not create any servers until the conflicts above are fixed in ship.yml`:
 
 ```text
 production
@@ -47,15 +47,17 @@ production
 - create web-2: pool=web new server
 - extra web-9: pool=web provider_id=77 address=203.0.113.19 not in config; apply leaves it running
 apply will create 1 server: web-2
-existing servers from local host facts (.ship/environments/production/hosts.json; run with --refresh to list servers from the provider)
+existing servers from provider hetzner (read-only list)
 ```
+
+Without `--refresh` the plan reads local host facts, which can be stale (a server deleted or re-addressed at the provider). Its summary is an estimate and says so, for example `based on local host facts, apply would not create any servers; not confirmed against the provider, so run with --refresh before apply`. Run `--refresh` before a real apply.
 
 | Action | Meaning |
 | --- | --- |
 | `create` | Apply creates a new server. This is the only action that starts billing. |
 | `exists` | A server for the host already exists. Apply reuses it and re-runs the idempotent bootstrap. |
-| `pinned` | The host is [pinned by address](#pinning-hosts-by-address) but is not in local host facts. Apply never creates it. |
-| `conflict` | A pin disagrees with the known servers. Apply refuses to run until the pin is fixed. |
+| `pinned` | The host is [pinned by address](#pinning-hosts-by-address) but local host facts cannot confirm it (no record, or no address). Apply never creates it, and refuses if the provider cannot confirm the pin. |
+| `conflict` | A pin disagrees with the known servers, a pinned server has no address to compare, or a host is named after an IP address. Apply creates nothing until it is fixed. |
 | `extra` | A known server that is not in the config. Apply leaves it running; deleting it is an explicit `ship provision decommission`. |
 
 By default the plan reads local host facts, so it needs no provider credentials. A machine without `.ship/environments/ENV/hosts.json` sees every unpinned host as `create`; run `ship provision plan ENV --refresh` to list servers from the provider instead (a read-only call). `ship --dry-run provision apply ENV` prints the same plan from local host facts. Inventory providers (manual, Terraform, Pulumi, Ansible, OpenSSH config) show every host as `exists`, because they never create servers.
@@ -76,15 +78,15 @@ environments:
             web-2: 203.0.113.11
 ```
 
-`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, and an address can be pinned to only one host per environment.
+`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment.
 
 A pinned host:
 
 - is used at its pinned address by deploys, `ship hosts`, `ship doctor`, and the other remote commands, also when there are no local host facts;
-- is never created or replaced by `ship provision apply`. Before it creates anything, apply checks every pinned host against the servers the provider reports. If a pinned host has no server, or the provider reports a different address, apply stops without changing anything;
+- is never created or replaced by `ship provision apply`. Before any provider change (networks, firewalls, tags, servers), apply lists the provider's servers (read-only) and checks every pinned host. If a pinned host has no server, the provider reports a different address, or it reports no address that can be compared, apply stops without changing anything. Other hosts are not created either;
 - must agree with local host facts when they exist. If a server's address changes (for example after `ship migrate`), update the pin.
 
-Do not put the address itself in `hosts:` (`hosts: [203.0.113.10]`) for a provider-created server. Ship would treat `203.0.113.10` as a new logical host, and apply would create a server for it. When Ship sees that mistake, the error names the host to pin instead.
+Do not put the address itself in `hosts:` (`hosts: [203.0.113.10]`) for a provider-created server. Ship would treat `203.0.113.10` as a new logical host. Apply refuses to create a server named after an IP address, so the whole apply stops, and the error names the host to pin instead when the provider has a server at that address.
 
 ## Providers
 
