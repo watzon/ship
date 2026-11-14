@@ -50,7 +50,7 @@ apply will create 1 server: web-2
 existing servers from provider hetzner (read-only list)
 ```
 
-Without `--refresh` the plan reads local host facts, which can be stale (a server deleted or re-addressed at the provider). Its summary is an estimate and says so, for example `based on local host facts, apply would not create any servers; not confirmed against the provider, so run with --refresh before apply`. Run `--refresh` before a real apply.
+Without `--refresh` the plan reads local host facts, which can be stale (a server deleted or re-addressed at the provider). Its summary is an estimate and says so, for example `based on local host facts, apply would not create any servers; not confirmed against the provider, so run with --refresh before apply`. Run `--refresh` before a real apply. `--refresh` lists servers exactly the way apply does, with the same scope and filters (for Latitude.sh, `provider.latitude.project`).
 
 | Action | Meaning |
 | --- | --- |
@@ -78,7 +78,7 @@ environments:
             web-2: 203.0.113.11
 ```
 
-`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment.
+`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment. Ship compares addresses as IP addresses, not text: `2001:DB8::1` and `2001:db8::0:1` are the same, and an IPv4-mapped address such as `::ffff:203.0.113.10` is the same as `203.0.113.10`. Pins and saved host facts are stored in canonical form. Zoned IPv6 addresses (`fe80::1%eth0`) must match exactly, zone included.
 
 A pinned host:
 
