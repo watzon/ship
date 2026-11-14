@@ -18,3 +18,4 @@ require (
 )
 
 retract v0.4.0 // tagged without published release assets (agent installs 404); use v0.4.1 or later
+retract v0.7.0 // tag failed the release docs-pin test before any assets were published; use v0.7.1 or later

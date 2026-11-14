@@ -19,7 +19,11 @@ installs it.
 1. **Bump the dev sentinel** — edit `devVersion` in `internal/agent/rpc.go`
    to the *next* version with a `-dev` suffix (e.g. releasing `v0.5.0` →
    set `devVersion = "0.6.0-dev"`). Do NOT touch `AgentVersion`; it stays
-   empty in source and is stamped by the release workflow.
+   empty in source and is stamped by the release workflow. In the same
+   commit, update the pinned release in `README.md`, `docs/quickstart.md`,
+   `docs/airgap.md` and `skills/ship/SKILL.md` to the new tag; the release
+   workflow's `TestPinnedReleaseDocsUseCurrentOrNextReleaseTag` fails
+   otherwise (`SHIP_DOCS_VERSION_TAG=vX.Y.Z go test .` checks it locally).
 2. **Commit and push to `main`.** CI must be green.
 3. **Tag and push the tag:**
 
