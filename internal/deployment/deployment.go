@@ -110,6 +110,25 @@ type RolloutOptions struct {
 	SecretEnvFiles map[string]string
 	AgentFor       AgentFactory
 	Sleep          func(time.Duration)
+	// Observe, when set, is called as each start, health check, and ingress
+	// reload finishes (and once more with Err set if an action fails), so a
+	// caller can report progress while the rollout is still running.
+	Observe func(StepEvent)
+	// Now returns the current time for StepEvent durations. Default: time.Now.
+	Now func() time.Time
+}
+
+// StepEvent describes one finished (or failed) rollout operation.
+type StepEvent struct {
+	Kind    ActionKind
+	Service string
+	Replica int
+	Host    string
+	// Checks is the number of health-check attempts made (health events).
+	Checks  int
+	Elapsed time.Duration
+	// Err is set when the operation failed; Elapsed is how long it ran.
+	Err error
 }
 
 // CleanupWarning reports a preserved container that could not be removed after commit.
@@ -167,7 +186,7 @@ func RolloutWithResult(ctx context.Context, opts RolloutOptions) (RolloutResult,
 	if err != nil {
 		return RolloutResult{}, err
 	}
-	execution, err := ExecuteActionsWithResult(ctx, actions, opts.AgentFor, opts.Sleep)
+	execution, err := ExecuteActionsObserved(ctx, actions, opts.AgentFor, opts.Sleep, opts.Observe, opts.Now)
 	result := RolloutResult{Actions: actions, CleanupWarnings: execution.CleanupWarnings}
 	if err != nil {
 		return result, err
@@ -489,20 +508,41 @@ func ExecuteActions(ctx context.Context, actions []Action, agentFor AgentFactory
 
 // ExecuteActionsWithResult executes actions transactionally through the ingress commit point.
 func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor AgentFactory, sleep func(time.Duration)) (ExecutionResult, error) {
+	return ExecuteActionsObserved(ctx, actions, agentFor, sleep, nil, nil)
+}
+
+// ExecuteActionsObserved is ExecuteActionsWithResult plus an observer that is
+// called as each start, health, and ingress operation finishes or fails.
+func ExecuteActionsObserved(ctx context.Context, actions []Action, agentFor AgentFactory, sleep func(time.Duration), observe func(StepEvent), now func() time.Time) (ExecutionResult, error) {
 	if agentFor == nil {
 		return ExecutionResult{}, errors.New("agent factory is required")
 	}
 	if sleep == nil {
 		sleep = time.Sleep
 	}
+	if now == nil {
+		now = time.Now
+	}
+	emit := func(event StepEvent) {
+		if observe != nil {
+			observe(event)
+		}
+	}
 	var started []Action
 	var preserved []Action
 	var cleanup []Action
 	ensuredNetworks := map[string]struct{}{}
+	var current Action
+	var currentBegan time.Time
 	fail := func(primary error) (ExecutionResult, error) {
+		switch current.Kind {
+		case ActionStart, ActionHealth, ActionIngress:
+			emit(StepEvent{Kind: current.Kind, Service: current.Service, Replica: current.Replica, Host: current.Host.Name, Elapsed: now().Sub(currentBegan), Err: primary})
+		}
 		return ExecutionResult{}, compensateActions(ctx, primary, started, preserved, agentFor)
 	}
 	for _, action := range actions {
+		current, currentBegan = action, now()
 		switch action.Kind {
 		case ActionPull:
 			client := agentFor(action.Host)
@@ -527,12 +567,18 @@ func ExecuteActionsWithResult(ctx context.Context, actions []Action, agentFor Ag
 				return fail(fmt.Errorf("start %s on %s: %w", action.ContainerName, action.Host.Name, err))
 			}
 			started = append(started, action)
+			emit(StepEvent{Kind: ActionStart, Service: action.Service, Replica: action.Replica, Host: action.Host.Name, Elapsed: now().Sub(currentBegan)})
 		case ActionHealth:
-			if err := executeHealthAction(ctx, action, agentFor, sleep); err != nil {
+			checks, err := executeHealthAction(ctx, action, agentFor, sleep)
+			if err != nil {
 				return fail(err)
 			}
+			emit(StepEvent{Kind: ActionHealth, Service: action.Service, Replica: action.Replica, Host: action.Host.Name, Checks: checks, Elapsed: now().Sub(currentBegan)})
 		case ActionIngress:
-			if err := executeIngressAction(ctx, action, agentFor, ensuredNetworks); err != nil {
+			reloaded := func(host scheduler.Host, elapsed time.Duration) {
+				emit(StepEvent{Kind: ActionIngress, Service: action.Service, Host: host.Name, Elapsed: elapsed})
+			}
+			if err := executeIngressAction(ctx, action, agentFor, ensuredNetworks, reloaded, now); err != nil {
 				return fail(err)
 			}
 		case ActionDrain:
@@ -590,7 +636,7 @@ func compensateActions(ctx context.Context, primary error, started, preserved []
 	return fmt.Errorf("%w; additionally failed to compensate: %s", primary, strings.Join(failures, "; "))
 }
 
-func executeHealthAction(ctx context.Context, action Action, agentFor AgentFactory, sleep func(time.Duration)) error {
+func executeHealthAction(ctx context.Context, action Action, agentFor AgentFactory, sleep func(time.Duration)) (int, error) {
 	attempts := action.HealthRetries + 1
 	if attempts < 1 {
 		attempts = 1
@@ -601,7 +647,7 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 		var result agent.HealthCheckResult
 		err := client.Call(ctx, "health_check", action.Health, &result)
 		if err == nil && result.OK {
-			return nil
+			return attempt, nil
 		}
 		if err != nil {
 			lastErr = fmt.Errorf("health %s on %s: %w", action.ContainerName, action.Host.Name, err)
@@ -612,7 +658,7 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 			sleep(action.HealthInterval)
 		}
 	}
-	return lastErr
+	return attempts, lastErr
 }
 
 // executeIngressAction applies the desired Caddyfile to every ingress host,
@@ -621,7 +667,7 @@ func executeHealthAction(ctx context.Context, action Action, agentFor AgentFacto
 // running. The snapshot is read live from the host, not from local .ship/
 // state: a CI runner's checkout never carries state from prior deploys, so
 // sourcing "previous" locally silently turned rollback into a no-op there.
-func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}) error {
+func executeIngressAction(ctx context.Context, action Action, agentFor AgentFactory, ensuredNetworks map[string]struct{}, reloadedHost func(scheduler.Host, time.Duration), now func() time.Time) error {
 	remotePath := remoteCaddyfilePath(action.IngressPath)
 	previous := map[string]ingressSnapshot{}
 	for _, host := range action.IngressHosts {
@@ -630,6 +676,7 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 
 	var reloaded []scheduler.Host
 	for _, host := range action.IngressHosts {
+		began := now()
 		if err := applyCaddyContainer(ctx, host, action, agentFor, ensuredNetworks); err != nil {
 			if rollbackErr := rollbackIngressHosts(ctx, reloaded, previous, action, agentFor, ensuredNetworks); rollbackErr != nil {
 				return fmt.Errorf("reload ingress on %s: %w; additionally failed to roll back ingress: %v", host.Name, err, rollbackErr)
@@ -637,6 +684,7 @@ func executeIngressAction(ctx context.Context, action Action, agentFor AgentFact
 			return fmt.Errorf("reload ingress on %s: %w", host.Name, err)
 		}
 		reloaded = append(reloaded, host)
+		reloadedHost(host, now().Sub(began))
 	}
 
 	if err := os.MkdirAll(filepath.Dir(action.IngressPath), 0o755); err != nil {
