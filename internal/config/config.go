@@ -3,13 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/watzon/ship/internal/ipaddr"
 	"gopkg.in/yaml.v3"
 )
 
@@ -2284,10 +2284,38 @@ func Load(path string) (*Config, error) {
 	if err := cfg.ResolveUserDataFiles(baseDir); err != nil {
 		return nil, err
 	}
+	cfg.CanonicalizePins()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// CanonicalizePins rewrites every hosts.pools.<pool>.pin address that is an
+// IP address to its canonical spelling (see package ipaddr), so pins, provider
+// addresses, and host facts compare equal however the address was written.
+// Values that are not IP addresses are left for Validate to reject.
+func (c *Config) CanonicalizePins() {
+	if c == nil {
+		return
+	}
+	for envName, env := range c.Environments {
+		for poolName, pool := range env.Hosts.Pools {
+			if len(pool.Pin) == 0 {
+				continue
+			}
+			pins := make(map[string]string, len(pool.Pin))
+			for name, address := range pool.Pin {
+				if canonical, ok := ipaddr.Canonical(address); ok {
+					address = canonical
+				}
+				pins[name] = address
+			}
+			pool.Pin = pins
+			env.Hosts.Pools[poolName] = pool
+		}
+		c.Environments[envName] = env
+	}
 }
 
 func (c *Config) ResolveUserDataFiles(baseDir string) error {
@@ -4138,16 +4166,16 @@ func validateHostPins(envName string, pools map[string]Pool) []string {
 				errs = append(errs, scope+" address cannot contain whitespace")
 				continue
 			}
-			parsed, err := netip.ParseAddr(address)
-			if err != nil {
+			canonical, ok := ipaddr.Canonical(address)
+			if !ok {
 				errs = append(errs, fmt.Sprintf("%s address %q must be an IP address (Ship compares it with the address the provider reports)", scope, address))
 				continue
 			}
-			if previous, ok := pinnedBy[parsed.Unmap().String()]; ok {
+			if previous, ok := pinnedBy[canonical]; ok {
 				errs = append(errs, fmt.Sprintf("%s address %s is already pinned to %s", scope, address, previous))
 				continue
 			}
-			pinnedBy[parsed.Unmap().String()] = fmt.Sprintf("%s in pool %q", name, poolName)
+			pinnedBy[canonical] = fmt.Sprintf("%s in pool %q", name, poolName)
 		}
 	}
 	return errs

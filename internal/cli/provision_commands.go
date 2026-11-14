@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/ipaddr"
 	"github.com/watzon/ship/internal/planner"
 	"github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/provider/providers"
@@ -303,10 +304,12 @@ func applyProviderHostToFact(fact *state.HostFact, host provider.Host) {
 	fact.KnownHostsFile = host.KnownHostsFile
 	fact.JumpHost = host.JumpHost
 	fact.SSHOptions = copyStringMap(host.SSHOptions)
-	fact.PublicAddress = host.PublicAddress
+	// Store IP addresses in canonical form (see package ipaddr) so later
+	// pin checks and remote commands see one spelling.
+	fact.PublicAddress = ipaddr.CanonicalOr(host.PublicAddress)
 	fact.IPv4 = ""
-	if ip := net.ParseIP(host.PublicAddress); ip != nil && ip.To4() != nil {
-		fact.IPv4 = host.PublicAddress
+	if addr, ok := ipaddr.Parse(host.PublicAddress); ok && addr.Is4() {
+		fact.IPv4 = addr.String()
 	}
 }
 

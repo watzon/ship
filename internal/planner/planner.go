@@ -2,11 +2,11 @@ package planner
 
 import (
 	"fmt"
-	"net/netip"
 	"sort"
 	"strings"
 
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/ipaddr"
 	"github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/scheduler"
 )
@@ -210,10 +210,10 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 			if pin != "" {
 				address := strings.TrimSpace(host.Address)
 				switch {
-				case address != "" && provider.IsIPAddress(address) && !provider.SameAddress(address, pin):
+				case address != "" && ipaddr.Is(address) && !ipaddr.Equal(address, pin):
 					plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s reports %s; apply refuses until the pin matches", desired.Pool, pin, in.Source, host.Address)})
 					continue
-				case address == "" || !provider.IsIPAddress(address):
+				case address == "" || !ipaddr.Is(address):
 					reported := "no address"
 					if address != "" {
 						reported = fmt.Sprintf("address %q, which is not an IP address", address)
@@ -244,7 +244,7 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 				used[known[other.Name]] = true
 				continue
 			}
-			if provider.IsIPAddress(desired.Name) {
+			if ipaddr.Is(desired.Name) {
 				// Apply never creates a server named after an address, whether
 				// or not a known server has that address.
 				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s is an IP address; apply refuses to create a server named after it (for an existing server, list its host name and set hosts.pools.%s.pin.<host>: %s)", desired.Pool, desired.Pool, desired.Name)})
@@ -311,13 +311,9 @@ func serverCount(names []string) string {
 	return fmt.Sprintf("%d servers: %s", len(names), strings.Join(names, ", "))
 }
 
-// addressKey normalizes an IP address so equivalent spellings match.
+// addressKey canonicalizes an IP address so equivalent spellings match.
 func addressKey(value string) (string, bool) {
-	addr, err := netip.ParseAddr(strings.TrimSpace(value))
-	if err != nil {
-		return "", false
-	}
-	return addr.Unmap().String(), true
+	return ipaddr.Canonical(value)
 }
 
 func lookupAddress(byAddress map[string]KnownHost, value string) (KnownHost, bool) {

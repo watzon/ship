@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/watzon/ship/internal/ipaddr"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/state"
 )
@@ -57,7 +58,7 @@ func MatchHosts(envName string, hosts []scheduler.Host, facts []state.HostFact) 
 		if ok {
 			matched[k] = struct{}{}
 			if pin := strings.TrimSpace(host.PinnedAddress); pin != "" {
-				if recorded := Contact(fact); recorded != "" && recorded != pin {
+				if recorded := Contact(fact); recorded != "" && !ipaddr.Equal(recorded, pin) {
 					pinConflicts = append(pinConflicts, fmt.Sprintf("host %s pool=%s is pinned to %s but host facts record %s", host.Name, host.Pool, pin, recorded))
 				}
 			}
@@ -96,7 +97,7 @@ func mismatchError(envName string, missingHosts []scheduler.Host, extraFacts []s
 			if strings.TrimSpace(fact.Pool) != host.Pool {
 				continue
 			}
-			if address := Contact(fact); address != "" && address == host.Name {
+			if address := Contact(fact); address != "" && ipaddr.Equal(address, host.Name) {
 				hints = append(hints, fmt.Sprintf("%s is the address of provisioned host %s; to pin that server, keep host %s in pool %s (count or hosts) and set hosts.pools.%s.pin.%s: %s", address, fact.Name, fact.Name, host.Pool, host.Pool, fact.Name, address))
 			}
 		}

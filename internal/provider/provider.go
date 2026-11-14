@@ -3,11 +3,11 @@ package provider
 import (
 	"context"
 	"fmt"
-	"net/netip"
 	"sort"
 	"strings"
 
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/ipaddr"
 	"github.com/watzon/ship/internal/scheduler"
 )
 
@@ -285,7 +285,7 @@ func checkHosts(desired []HostPlan, existing []Host) []string {
 	}
 	serverAt := func(address string) (Host, bool) {
 		for _, other := range existing {
-			if SameAddress(other.PublicAddress, address) {
+			if ipaddr.Equal(other.PublicAddress, address) {
 				return other, true
 			}
 		}
@@ -296,7 +296,7 @@ func checkHosts(desired []HostPlan, existing []Host) []string {
 		pin := strings.TrimSpace(plan.PinnedAddress)
 		host, ok := byLogical[plan.Name]
 		if pin == "" {
-			if ok || !IsIPAddress(plan.Name) {
+			if ok || !ipaddr.Is(plan.Name) {
 				continue
 			}
 			if other, found := serverAt(plan.Name); found {
@@ -318,35 +318,14 @@ func checkHosts(desired []HostPlan, existing []Host) []string {
 		switch {
 		case address == "":
 			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no address for it, so the pin cannot be verified", plan.Name, plan.Pool, pin))
-		case !IsIPAddress(address):
+		case !ipaddr.Is(address):
 			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports address %q, which is not an IP address, so the pin cannot be verified", plan.Name, plan.Pool, pin, address))
-		case !SameAddress(address, pin):
+		case !ipaddr.Equal(address, pin):
 			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports %s; update hosts.pools.%s.pin.%s in ship.yml", plan.Name, plan.Pool, pin, address, plan.Pool, plan.Name))
 		}
 	}
 	sort.Strings(problems)
 	return problems
-}
-
-// IsIPAddress reports whether value is an IPv4 or IPv6 address.
-func IsIPAddress(value string) bool {
-	_, err := netip.ParseAddr(strings.TrimSpace(value))
-	return err == nil
-}
-
-// SameAddress reports whether a and b are the same IP address, comparing
-// parsed addresses so equivalent forms (such as IPv6 spellings) match. Values
-// that are not IP addresses never match.
-func SameAddress(a, b string) bool {
-	left, err := netip.ParseAddr(strings.TrimSpace(a))
-	if err != nil {
-		return false
-	}
-	right, err := netip.ParseAddr(strings.TrimSpace(b))
-	if err != nil {
-		return false
-	}
-	return left.Unmap() == right.Unmap()
 }
 
 func sortHosts(hosts []Host) {
