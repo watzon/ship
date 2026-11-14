@@ -321,6 +321,35 @@ func TestReconcileRefusesBadPinBeforeCreatingTagsOrFirewall(t *testing.T) {
 	}
 }
 
+func TestListIsScopedToConfiguredProject(t *testing.T) {
+	// Refresh (Client.List) must use the same project filter as apply.
+	var filters []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/tags":
+			writeJSON(t, w, http.StatusOK, tagsResponse{})
+		case r.Method == http.MethodGet && r.URL.Path == "/servers":
+			filters = append(filters, r.URL.Query().Get("filter[project]"))
+			writeJSON(t, w, http.StatusOK, serversResponse{Meta: pageMeta{CurrentPage: 1, TotalPages: 1}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer api.Close()
+	client := NewFromEnv(false, config.LatitudeConfig{Project: "proj-b"})
+	if client.Project != "proj-b" {
+		t.Fatalf("NewFromEnv project = %q", client.Project)
+	}
+	client.Token, client.BaseURL, client.HTTP = "token", api.URL, api.Client()
+	if _, err := client.List(context.Background(), "demo", "production"); err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 1 || filters[0] != "proj-b" {
+		t.Fatalf("filters = %v", filters)
+	}
+}
+
 func TestEnsureFirewallCreatesManagedRules(t *testing.T) {
 	var createBody map[string]any
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

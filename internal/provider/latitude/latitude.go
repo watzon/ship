@@ -35,9 +35,15 @@ var nonHostnameChars = regexp.MustCompile(`[^a-z0-9-]+`)
 type Client struct {
 	Token        string
 	DeleteReason string
-	DryRun       bool
-	HTTP         *http.Client
-	BaseURL      string
+	// Project is the Latitude project ID (provider.latitude.project) that
+	// scopes server listings. List, the reconcile preflight, the reconcile
+	// backend, and decommission all list through Client.List with this
+	// filter, so `provision plan --refresh` and `provision apply` see the same
+	// servers.
+	Project string
+	DryRun  bool
+	HTTP    *http.Client
+	BaseURL string
 }
 
 type ServerPlan = provider.HostPlan
@@ -153,7 +159,7 @@ func NewFromEnv(dryRun bool, configs ...config.LatitudeConfig) Client {
 	if token == "" {
 		token = os.Getenv("LATITUDESH_BEARER")
 	}
-	return Client{Token: token, DeleteReason: cfg.DeleteReason, DryRun: dryRun, HTTP: http.DefaultClient}
+	return Client{Token: token, DeleteReason: cfg.DeleteReason, Project: cfg.Project, DryRun: dryRun, HTTP: http.DefaultClient}
 }
 
 func (c Client) Name() string {
@@ -210,13 +216,14 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 	if strings.TrimSpace(environment) == "" {
 		return provider.ReconcileResult{}, fmt.Errorf("environment is required")
 	}
+	c = c.forEnvironment(env)
 	desired := DesiredServersFor(project, environment, env)
 	result := provider.ReconcileResult{Desired: desired}
 	if c.DryRun {
 		return result, nil
 	}
 
-	if err := provider.PreflightHosts(ctx, projectLister{client: c, latitudeProject: env.Provider.Latitude.Project}, project, environment, desired); err != nil {
+	if err := provider.PreflightHosts(ctx, c, project, environment, desired); err != nil {
 		return provider.ReconcileResult{}, err
 	}
 	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
@@ -249,9 +256,9 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 // reconcile backend shared by Reconcile and CreateHost so both create servers
 // identically.
 func (c Client) reconcileBackendFor(ctx context.Context, project, environment string, env config.Environment) (reconcileBackend, error) {
+	c = c.forEnvironment(env)
 	latitude := *env.Provider.Latitude
-	ownershipTagIDs, err := c.EnsureTags(ctx, provider.ShipLabels(project, environment, ""))
-	if err != nil {
+	if _, err := c.EnsureTags(ctx, provider.ShipLabels(project, environment, "")); err != nil {
 		return reconcileBackend{}, err
 	}
 	userDataID := latitude.UserDataID
@@ -263,11 +270,18 @@ func (c Client) reconcileBackendFor(ctx context.Context, project, environment st
 		userDataID = userData.ID
 	}
 	return reconcileBackend{
-		client:          c,
-		latitude:        latitude,
-		userDataID:      userDataID,
-		ownershipTagIDs: ownershipTagIDs,
+		client:     c,
+		latitude:   latitude,
+		userDataID: userDataID,
 	}, nil
+}
+
+// forEnvironment scopes the client to the environment's Latitude project.
+func (c Client) forEnvironment(env config.Environment) Client {
+	if env.Provider.Latitude != nil {
+		c.Project = env.Provider.Latitude.Project
+	}
+	return c
 }
 
 // CreateHost provisions a single server using the backend Reconcile would
@@ -277,6 +291,7 @@ func (c Client) CreateHost(ctx context.Context, project, environment string, env
 	if env.Provider.Latitude == nil {
 		return provider.Host{}, fmt.Errorf("environment %q must define provider.latitude", environment)
 	}
+	c = c.forEnvironment(env)
 	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
 	if err != nil {
 		return provider.Host{}, err
@@ -305,22 +320,13 @@ func (c Client) CreateHost(ctx context.Context, project, environment string, env
 var _ provider.HostCreator = Client{}
 
 type reconcileBackend struct {
-	client          Client
-	latitude        config.LatitudeConfig
-	userDataID      string
-	ownershipTagIDs []string
+	client     Client
+	latitude   config.LatitudeConfig
+	userDataID string
 }
 
 func (b reconcileBackend) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
-	servers, err := b.client.ListServers(ctx, project, environment, b.latitude.Project, b.ownershipTagIDs)
-	if err != nil {
-		return nil, err
-	}
-	hosts := make([]provider.Host, 0, len(servers))
-	for _, server := range servers {
-		hosts = append(hosts, hostFromServer(server, project, environment))
-	}
-	return hosts, nil
+	return b.client.List(ctx, project, environment)
 }
 
 func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (provider.Host, error) {
@@ -341,27 +347,14 @@ func (b reconcileBackend) Create(ctx context.Context, plan provider.HostPlan) (p
 	return hostFromServer(server, plan.Project, plan.Environment), nil
 }
 
+// List lists the environment's servers read-only, scoped to c.Project. It
+// never creates tags; Reconcile ensures them after its preflight.
 func (c Client) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
-	return c.listIn(ctx, project, environment, "")
-}
-
-// projectLister lists servers read-only with the same Latitude project filter
-// the reconcile backend uses, without creating the ownership tags first.
-type projectLister struct {
-	client          Client
-	latitudeProject string
-}
-
-func (l projectLister) List(ctx context.Context, project, environment string) ([]provider.Host, error) {
-	return l.client.listIn(ctx, project, environment, l.latitudeProject)
-}
-
-func (c Client) listIn(ctx context.Context, project, environment, latitudeProject string) ([]provider.Host, error) {
 	tagIDs, err := c.FindTagIDs(ctx, provider.ShipLabels(project, environment, ""))
 	if err != nil {
 		return nil, err
 	}
-	servers, err := c.ListServers(ctx, project, environment, latitudeProject, tagIDs)
+	servers, err := c.ListServers(ctx, project, environment, c.Project, tagIDs)
 	if err != nil {
 		return nil, err
 	}

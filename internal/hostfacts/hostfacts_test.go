@@ -121,3 +121,21 @@ func TestMatchHostsRejectsInvalidFacts(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestMatchHostsComparesPinsAsIPAddresses(t *testing.T) {
+	tests := []struct{ pin, recorded string }{
+		{"2001:DB8::1", "2001:db8::0:1"},
+		{"203.0.113.10", "::ffff:203.0.113.10"},
+		{"::ffff:203.0.113.10", "203.0.113.10"},
+	}
+	for _, tt := range tests {
+		fact := state.HostFact{Name: "web-1", Pool: "web", User: "root", PublicAddress: tt.recorded}
+		if _, err := MatchHosts("production", hostsFor(config.Pool{Count: 1, Pin: map[string]string{"web-1": tt.pin}}), []state.HostFact{fact}); err != nil {
+			t.Errorf("pin %s vs fact %s: %v", tt.pin, tt.recorded, err)
+		}
+	}
+	fact := state.HostFact{Name: "web-1", Pool: "web", User: "root", PublicAddress: "fe80::1%eth1"}
+	if _, err := MatchHosts("production", hostsFor(config.Pool{Count: 1, Pin: map[string]string{"web-1": "fe80::1%eth0"}}), []state.HostFact{fact}); err == nil {
+		t.Error("zones must match exactly")
+	}
+}

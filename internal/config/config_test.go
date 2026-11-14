@@ -3474,6 +3474,18 @@ func TestLoadNegativeCountWithPinReturnsValidationError(t *testing.T) {
 	}
 }
 
+func TestLoadCanonicalizesPinAddresses(t *testing.T) {
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: 2\n          pin:\n            web-1: 2001:DB8:0::1\n            web-2: \"::ffff:203.0.113.10\"\n", 1)
+	cfg, err := loadConfigText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := cfg.Environments["production"].Hosts.Pools["web"].Pin
+	if pins["web-1"] != "2001:db8::1" || pins["web-2"] != "203.0.113.10" {
+		t.Fatalf("pins = %+v", pins)
+	}
+}
+
 func TestPoolHostNamesNegativeCount(t *testing.T) {
 	if names := (Pool{Count: -1}).HostNames("web"); len(names) != 0 {
 		t.Fatalf("names = %v", names)
