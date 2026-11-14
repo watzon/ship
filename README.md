@@ -18,7 +18,7 @@ The model is Kamal-like: you define host pools, services, and accessories in YAM
 
 ## Install
 
-Requires [Go](https://go.dev/dl/) 1.26.6+ and Docker for deploys.
+Requires [Go](https://go.dev/dl/) 1.26.11+ and Docker for deploys.
 
 Install the CLI with `go install`, pinned to a released version:
 
