@@ -42,10 +42,10 @@ func TestAcceptanceDryRunFlowFromBlankProject(t *testing.T) {
 	}
 
 	out = runAcceptanceCommand(t, provisionCmd(&options{configPath: path}), "plan", "production")
-	assertAcceptanceOutput(t, out, "provision web-1", "provision ingress-1")
+	assertAcceptanceOutput(t, out, "create web-1: pool=web new server", "create ingress-1: pool=ingress new server")
 
 	out = runAcceptanceCommand(t, provisionCmd(&options{configPath: path, dryRun: true}), "apply", "production")
-	assertAcceptanceOutput(t, out, "would provision web-1 pool=web", "would provision worker-1 pool=worker")
+	assertAcceptanceOutput(t, out, "create web-1: pool=web new server", "create worker-1: pool=worker new server")
 	if _, err := os.Stat(filepath.Join(dir, config.LocalStateDir, "environments", "production", "hosts.json")); !os.IsNotExist(err) {
 		t.Fatalf("dry-run provision wrote host facts: %v", err)
 	}

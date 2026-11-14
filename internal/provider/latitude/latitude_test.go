@@ -273,6 +273,83 @@ func TestReconcileCreatesAndAttachesShipTags(t *testing.T) {
 	}
 }
 
+func TestReconcileRefusesBadPinBeforeCreatingTagsOrFirewall(t *testing.T) {
+	// Thorn QA: ownership tags, user data, and the firewall were created
+	// before pin validation, so a bad pin left them behind.
+	var mutations []string
+	var serverProjectFilter string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.Method != http.MethodGet {
+			mutations = append(mutations, r.Method+" "+r.URL.Path)
+			http.Error(w, "unexpected write", http.StatusTeapot)
+			return
+		}
+		switch r.URL.Path {
+		case "/tags":
+			writeJSON(t, w, http.StatusOK, tagsResponse{})
+		case "/servers":
+			serverProjectFilter = r.URL.Query().Get("filter[project]")
+			writeJSON(t, w, http.StatusOK, serversResponse{Meta: pageMeta{CurrentPage: 1, TotalPages: 1}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer api.Close()
+
+	env := config.Environment{
+		Provider: config.ProviderConfig{Latitude: &config.LatitudeConfig{
+			Project:         "proj-demo",
+			Site:            "ASH",
+			Plan:            "c2-small-x86",
+			OperatingSystem: "ubuntu_24_04_x64_lts",
+			UserData:        "#cloud-config\n",
+		}},
+		Hosts: config.HostsConfig{Pools: map[string]config.Pool{
+			"web": {Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}},
+		}},
+	}
+	_, err := testClient(api).Reconcile(context.Background(), "demo", "production", env)
+	if err == nil || !strings.Contains(err.Error(), "host web-1 pool=web is pinned to 203.0.113.10 but the provider reports no server for it") || !strings.Contains(err.Error(), "nothing was changed") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(mutations) != 0 {
+		t.Fatalf("provider changes before refusal: %v", mutations)
+	}
+	if serverProjectFilter != "proj-demo" {
+		t.Fatalf("preflight listed servers without the project filter: %q", serverProjectFilter)
+	}
+}
+
+func TestListIsScopedToConfiguredProject(t *testing.T) {
+	// Refresh (Client.List) must use the same project filter as apply.
+	var filters []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/tags":
+			writeJSON(t, w, http.StatusOK, tagsResponse{})
+		case r.Method == http.MethodGet && r.URL.Path == "/servers":
+			filters = append(filters, r.URL.Query().Get("filter[project]"))
+			writeJSON(t, w, http.StatusOK, serversResponse{Meta: pageMeta{CurrentPage: 1, TotalPages: 1}})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer api.Close()
+	client := NewFromEnv(false, config.LatitudeConfig{Project: "proj-b"})
+	if client.Project != "proj-b" {
+		t.Fatalf("NewFromEnv project = %q", client.Project)
+	}
+	client.Token, client.BaseURL, client.HTTP = "token", api.URL, api.Client()
+	if _, err := client.List(context.Background(), "demo", "production"); err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 1 || filters[0] != "proj-b" {
+		t.Fatalf("filters = %v", filters)
+	}
+}
+
 func TestEnsureFirewallCreatesManagedRules(t *testing.T) {
 	var createBody map[string]any
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

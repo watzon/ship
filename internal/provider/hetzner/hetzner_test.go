@@ -206,6 +206,50 @@ func TestReconcileCreatesOnlyMissingAndReportsExtra(t *testing.T) {
 	}
 }
 
+func TestReconcileRefusesBadHostsBeforeAnyProviderChange(t *testing.T) {
+	// Thorn QA: network and firewall setup ran before pin validation, so a bad
+	// pin left a network and a firewall behind.
+	tests := []struct {
+		name     string
+		existing []Server
+		pool     config.Pool
+		want     string
+	}{
+		{
+			name: "pinned host missing",
+			pool: config.Pool{Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}},
+			want: "host web-1 pool=web is pinned to 203.0.113.10 but the provider reports no server for it",
+		},
+		{
+			name:     "pinned host without address",
+			existing: []Server{{ID: 10, Name: "web-1", Labels: shipLabels("demo", "production", "web")}},
+			pool:     config.Pool{Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}},
+			want:     "the pin cannot be verified",
+		},
+		{
+			name: "address listed as a host name",
+			existing: []Server{{ID: 10, Name: "web-1", Labels: shipLabels("demo", "production", "web"),
+				PublicNet: PublicNet{IPv4: PublicIPv4{IP: "203.0.113.11"}}}},
+			pool: config.Pool{Hosts: []string{"aaa-new", "203.0.113.10"}},
+			want: "host 203.0.113.10 pool=web is an IP address",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := testEnvironment(0)
+			env.Hosts.Pools["web"] = tt.pool
+			api := newFakeHetznerAPI(t, tt.existing)
+			_, err := api.client().Reconcile(context.Background(), "demo", "production", env)
+			if err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "nothing was changed") {
+				t.Fatalf("err = %v", err)
+			}
+			if len(api.mutations) != 0 {
+				t.Fatalf("provider changes before refusal: %v", api.mutations)
+			}
+		})
+	}
+}
+
 func TestWaitActionPollsUntilSuccess(t *testing.T) {
 	polls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -331,6 +375,7 @@ type fakeHetznerAPI struct {
 	networkAttachments   []string
 	firewallApplications []string
 	deletes              []string
+	mutations            []string
 	selector             string
 	nextID               int64
 }
@@ -378,6 +423,9 @@ func newFakeHetznerAPI(t *testing.T, existing []Server) *fakeHetznerAPI {
 	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if r.Method != http.MethodGet {
+			api.mutations = append(api.mutations, r.Method+" "+r.URL.Path)
 		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/networks":

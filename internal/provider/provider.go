@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/watzon/ship/internal/config"
+	"github.com/watzon/ship/internal/ipaddr"
 	"github.com/watzon/ship/internal/scheduler"
 )
 
@@ -32,6 +33,9 @@ type HostPlan struct {
 	Image       string
 	UserData    string
 	Labels      map[string]string
+	// PinnedAddress is set when the host is pinned by address in
+	// hosts.pools.<pool>.pin. Reconciliation never creates a pinned host.
+	PinnedAddress string
 }
 
 type Host struct {
@@ -131,6 +135,8 @@ func HostPlans(project, environment string, env config.Environment, opts HostPla
 			Image:       hostOpts.Image,
 			UserData:    hostOpts.UserData,
 			Labels:      labels,
+
+			PinnedAddress: host.PinnedAddress,
 		})
 	}
 	return plans
@@ -193,6 +199,10 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 		existingByLogical[logical] = i
 	}
 
+	if err := CheckBeforeCreate(environment, desired, existing); err != nil {
+		return ReconcileResult{}, err
+	}
+
 	matched := map[int]bool{}
 	for _, plan := range desired {
 		if i, ok := existingByLogical[plan.Name]; ok {
@@ -217,6 +227,105 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 	sortHosts(result.Created)
 	sortHosts(result.Extra)
 	return result, nil
+}
+
+// HostLister lists the servers a provider already has for an environment. It
+// must be read-only.
+type HostLister interface {
+	List(ctx context.Context, project, environment string) ([]Host, error)
+}
+
+// PreflightHosts lists the provider's servers (read-only) and runs
+// CheckBeforeCreate against them. Providers call it from Reconcile before any
+// provider-side setup (networks, firewalls, tags, keys), so a bad pin or host
+// name leaves nothing behind. ReconcileHosts checks again right before it
+// creates servers.
+func PreflightHosts(ctx context.Context, lister HostLister, project, environment string, desired []HostPlan) error {
+	existing, err := lister.List(ctx, project, environment)
+	if err != nil {
+		return err
+	}
+	if problems := checkHosts(desired, existing); len(problems) > 0 {
+		return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed (checked with a read-only server listing before any provider changes)", environment, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// CheckBeforeCreate verifies the desired hosts against the servers the
+// provider reports, before reconciliation creates anything:
+//
+//   - A pinned host must already exist at its pinned address. It is an error
+//     for it to be missing (reconciliation would otherwise create a new server),
+//     to be reported at a different address, or to be reported without an
+//     address that can be compared with the pin (the pin cannot be verified,
+//     so Ship fails closed).
+//   - An unpinned host whose name is an IP address must already exist under
+//     that name. Creating a server named after an address is always a config
+//     mistake (hosts: [<ip>] for a provider-created server), whether or not
+//     the provider still reports a server at that address.
+//
+// Any problem refuses the whole apply: no server is created, including hosts
+// that are fine on their own.
+func CheckBeforeCreate(environment string, desired []HostPlan, existing []Host) error {
+	problems := checkHosts(desired, existing)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and no servers were created", environment, strings.Join(problems, "; "))
+}
+
+func checkHosts(desired []HostPlan, existing []Host) []string {
+	byLogical := map[string]Host{}
+	for _, host := range existing {
+		logical := LogicalName(host)
+		if current, ok := byLogical[logical]; ok && current.Name == logical {
+			continue
+		}
+		byLogical[logical] = host
+	}
+	serverAt := func(address string) (Host, bool) {
+		for _, other := range existing {
+			if ipaddr.Equal(other.PublicAddress, address) {
+				return other, true
+			}
+		}
+		return Host{}, false
+	}
+	var problems []string
+	for _, plan := range desired {
+		pin := strings.TrimSpace(plan.PinnedAddress)
+		host, ok := byLogical[plan.Name]
+		if pin == "" {
+			if ok || !ipaddr.Is(plan.Name) {
+				continue
+			}
+			if other, found := serverAt(plan.Name); found {
+				problems = append(problems, fmt.Sprintf("host %s pool=%s is the address of existing server %s (host %s), and apply would create a second server for it; list host %s in the pool and set hosts.pools.%s.pin.%s: %s instead", plan.Name, plan.Pool, other.Name, LogicalName(other), LogicalName(other), plan.Pool, LogicalName(other), plan.Name))
+				continue
+			}
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is an IP address, and apply would create a new server named after it; if it is an existing server, list its host name in the pool and set hosts.pools.%s.pin.<host>: %s instead", plan.Name, plan.Pool, plan.Pool, plan.Name))
+			continue
+		}
+		if !ok {
+			problem := fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no server for it", plan.Name, plan.Pool, pin)
+			if other, found := serverAt(pin); found {
+				problem += fmt.Sprintf("; %s belongs to server %s (host %s), so pin that host name instead", pin, other.Name, LogicalName(other))
+			}
+			problems = append(problems, problem)
+			continue
+		}
+		address := strings.TrimSpace(host.PublicAddress)
+		switch {
+		case address == "":
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no address for it, so the pin cannot be verified", plan.Name, plan.Pool, pin))
+		case !ipaddr.Is(address):
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports address %q, which is not an IP address, so the pin cannot be verified", plan.Name, plan.Pool, pin, address))
+		case !ipaddr.Equal(address, pin):
+			problems = append(problems, fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports %s; update hosts.pools.%s.pin.%s in ship.yml", plan.Name, plan.Pool, pin, address, plan.Pool, plan.Name))
+		}
+	}
+	sort.Strings(problems)
+	return problems
 }
 
 func sortHosts(hosts []Host) {

@@ -3453,3 +3453,131 @@ services:
     scale: 1
 `
 }
+
+func TestLoadParsesPoolHostPins(t *testing.T) {
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: 1\n          pin:\n            web-1: 203.0.113.10\n", 1)
+	cfg, err := loadConfigText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Environments["production"].Hosts.Pools["web"].Pin["web-1"]; got != "203.0.113.10" {
+		t.Fatalf("pin = %q", got)
+	}
+}
+
+func TestLoadNegativeCountWithPinReturnsValidationError(t *testing.T) {
+	// Thorn QA: count: -1 plus a pin panicked with "makeslice: cap out of range".
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: -1\n          pin:\n            web-1: 203.0.113.10\n", 1)
+	_, err := loadConfigText(t, text)
+	if err == nil || !strings.Contains(err.Error(), `pool "web" count cannot be negative`) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestLoadKeepsPinAddressSpelling(t *testing.T) {
+	// Pins are SSH targets when no host facts exist, and known_hosts entries
+	// are keyed by the written spelling, so Load must not rewrite them.
+	// Equivalent spellings are compared with package ipaddr instead.
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: 2\n          pin:\n            web-1: 2001:DB8:0::1\n            web-2: \"::ffff:203.0.113.10\"\n", 1)
+	cfg, err := loadConfigText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins := cfg.Environments["production"].Hosts.Pools["web"].Pin
+	if pins["web-1"] != "2001:DB8:0::1" || pins["web-2"] != "::ffff:203.0.113.10" {
+		t.Fatalf("pins = %+v", pins)
+	}
+}
+
+func TestPoolHostNamesNegativeCount(t *testing.T) {
+	if names := (Pool{Count: -1}).HostNames("web"); len(names) != 0 {
+		t.Fatalf("names = %v", names)
+	}
+}
+
+func TestValidateHostPins(t *testing.T) {
+	tests := []struct {
+		name  string
+		pools map[string]Pool
+		want  []string
+	}{
+		{
+			name:  "count host pinned",
+			pools: map[string]Pool{"web": {Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}}},
+		},
+		{
+			name:  "explicit host pinned",
+			pools: map[string]Pool{"web": {Hosts: []string{"edge"}, Pin: map[string]string{"edge": "203.0.113.10"}}},
+		},
+		{
+			name:  "unknown host",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-2": "203.0.113.10"}}},
+			want:  []string{`pool "web" pin "web-2" does not name a host in the pool (hosts: web-1)`},
+		},
+		{
+			name:  "empty address",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-1": " "}}},
+			want:  []string{`pool "web" pin "web-1" must set an address`},
+		},
+		{
+			name: "duplicate address",
+			pools: map[string]Pool{
+				"web":    {Count: 1, Pin: map[string]string{"web-1": "203.0.113.10"}},
+				"worker": {Count: 1, Pin: map[string]string{"worker-1": "203.0.113.10"}},
+			},
+			want: []string{`pool "worker" pin "worker-1" address 203.0.113.10 is already pinned to web-1 in pool "web"`},
+		},
+		{
+			name: "duplicate address in another spelling",
+			pools: map[string]Pool{
+				"web":    {Count: 1, Pin: map[string]string{"web-1": "2001:db8::1"}},
+				"worker": {Count: 1, Pin: map[string]string{"worker-1": "2001:DB8:0::1"}},
+			},
+			want: []string{`pool "worker" pin "worker-1" address 2001:DB8:0::1 is already pinned to web-1 in pool "web"`},
+		},
+		{
+			name:  "address is not an IP",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-1": "web-1.example.com"}}},
+			want:  []string{`pool "web" pin "web-1" address "web-1.example.com" must be an IP address`},
+		},
+		{
+			name:  "negative count with pin",
+			pools: map[string]Pool{"web": {Count: -1, Pin: map[string]string{"web-1": "203.0.113.10"}}},
+			want:  []string{`pool "web" count cannot be negative`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			env := cfg.Environments["production"]
+			env.Hosts.Pools = tt.pools
+			cfg.Environments["production"] = env
+			err := cfg.Validate()
+			if len(tt.want) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error missing %q:\n%v", want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestProviderCreatesServers(t *testing.T) {
+	if !(ProviderConfig{Vultr: &VultrConfig{}}).CreatesServers() {
+		t.Fatal("vultr should create servers")
+	}
+	for _, cfg := range []ProviderConfig{{Manual: &ManualConfig{}}, {Terraform: &TerraformConfig{}}, {}} {
+		if cfg.CreatesServers() {
+			t.Fatalf("%q should not create servers", cfg.Name())
+		}
+	}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/docker"
+	"github.com/watzon/ship/internal/hostfacts"
 	"github.com/watzon/ship/internal/provider"
 	"github.com/watzon/ship/internal/provider/providers"
 	"github.com/watzon/ship/internal/scheduler"
@@ -404,84 +405,45 @@ func explicitHostsForEnvironment(envName string, env config.Environment) []remot
 	sort.Strings(poolNames)
 	for _, poolName := range poolNames {
 		pool := env.Hosts.Pools[poolName]
-		if len(pool.Hosts) == 0 {
+		if len(pool.Hosts) == 0 && len(pool.Pin) == 0 {
 			continue
 		}
 		user := pool.User
 		if user == "" {
 			user = "root"
 		}
-		names := append([]string(nil), pool.Hosts...)
-		sort.Strings(names)
-		for _, name := range names {
-			hosts = append(hosts, remoteHost{
-				Environment: envName,
-				Host:        scheduler.Host{Name: name, Pool: poolName, User: user},
-			})
+		for _, name := range pool.HostNames(poolName) {
+			host := scheduler.Host{Name: name, Pool: poolName, User: user}
+			if address := strings.TrimSpace(pool.Pin[name]); address != "" {
+				// A pinned host is reachable at its pinned address even
+				// without local host facts.
+				host.PinnedAddress = address
+				host.Contact = address
+			} else if len(pool.Hosts) == 0 {
+				continue
+			}
+			hosts = append(hosts, remoteHost{Environment: envName, Host: host})
 		}
 	}
 	return hosts
 }
 
-type hostFactKey struct {
-	name string
-	pool string
-}
-
 func applyHostFacts(envName string, hosts []scheduler.Host, facts []state.HostFact) ([]scheduler.Host, error) {
-	factsByKey := map[hostFactKey]state.HostFact{}
-	for _, fact := range facts {
-		key := hostFactKey{name: strings.TrimSpace(fact.Name), pool: strings.TrimSpace(fact.Pool)}
-		if key.name == "" || key.pool == "" {
-			return nil, fmt.Errorf("host facts for %s contain a host without name or pool", envName)
-		}
-		if _, exists := factsByKey[key]; exists {
-			return nil, fmt.Errorf("host facts for %s contain duplicate host %s in pool %s", envName, key.name, key.pool)
-		}
-		factsByKey[key] = fact
+	matches, err := hostfacts.MatchHosts(envName, hosts, facts)
+	if err != nil {
+		return nil, err
 	}
-
-	resolved := append([]scheduler.Host(nil), hosts...)
-	matched := map[hostFactKey]struct{}{}
-	var missing []string
-	for i, host := range resolved {
-		key := hostFactKey{name: host.Name, pool: host.Pool}
-		fact, ok := factsByKey[key]
-		if !ok {
-			missing = append(missing, fmt.Sprintf("%s pool=%s", host.Name, host.Pool))
-			continue
+	resolved := make([]scheduler.Host, 0, len(matches))
+	for _, match := range matches {
+		host := match.Host
+		if match.HasFact {
+			if contact := hostfacts.Contact(match.Fact); contact != "" || host.PinnedAddress == "" {
+				host.Contact = contact
+			}
 		}
-		resolved[i].Contact = hostFactContact(fact)
-		matched[key] = struct{}{}
-	}
-
-	var extra []string
-	for key := range factsByKey {
-		if _, ok := matched[key]; ok {
-			continue
-		}
-		extra = append(extra, fmt.Sprintf("%s pool=%s", key.name, key.pool))
-	}
-	if len(missing) > 0 || len(extra) > 0 {
-		sort.Strings(missing)
-		sort.Strings(extra)
-		parts := []string{}
-		if len(missing) > 0 {
-			parts = append(parts, "missing "+strings.Join(missing, ", "))
-		}
-		if len(extra) > 0 {
-			parts = append(parts, "extra "+strings.Join(extra, ", "))
-		}
-		return nil, fmt.Errorf("host facts for %s do not match configured hosts: %s; run ship provision apply %s --yes", envName, strings.Join(parts, "; "), envName)
+		resolved = append(resolved, host)
 	}
 	return resolved, nil
-}
-
-func hostFactContact(fact state.HostFact) string {
-	if contact := strings.TrimSpace(fact.PublicAddress); contact != "" {
-		return contact
-	}
-	return strings.TrimSpace(fact.IPv4)
 }
 
 func localStateDir(configPath string) string {

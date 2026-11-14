@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/watzon/ship/internal/ipaddr"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1456,6 +1457,17 @@ func (p ProviderConfig) Validate(envName string) []string {
 	return errs
 }
 
+// CreatesServers reports whether `ship provision apply` can create servers
+// for this provider. Inventory-backed providers (manual, ssh_config,
+// terraform, pulumi, ansible) only read existing hosts.
+func (p ProviderConfig) CreatesServers() bool {
+	switch p.Name() {
+	case "", ProviderManual, ProviderSSHConfig, ProviderTerraform, ProviderPulumi, ProviderAnsible:
+		return false
+	}
+	return true
+}
+
 func (p ProviderConfig) ManualHostsRequired() bool {
 	return p.Manual != nil
 }
@@ -1901,6 +1913,30 @@ type Pool struct {
 	UserData     string            `yaml:"user_data"`
 	UserDataFile string            `yaml:"user_data_file"`
 	Labels       map[string]string `yaml:"labels"`
+	// Pin maps a logical host name in this pool to the public address of the
+	// server that already fulfills it. A pinned host is used at that address
+	// without local host facts, and `ship provision apply` never creates a
+	// server for it.
+	Pin map[string]string `yaml:"pin"`
+}
+
+// HostNames returns the logical host names of the pool: the explicit hosts
+// list when set, otherwise <pool>-1 through <pool>-<count>.
+func (p Pool) HostNames(poolName string) []string {
+	if len(p.Hosts) > 0 {
+		names := append([]string(nil), p.Hosts...)
+		sort.Strings(names)
+		return names
+	}
+	if p.Count <= 0 {
+		// A negative count is a validation error; never size a slice from it.
+		return nil
+	}
+	names := make([]string, 0, p.Count)
+	for i := 1; i <= p.Count; i++ {
+		names = append(names, fmt.Sprintf("%s-%d", poolName, i))
+	}
+	return names
 }
 
 type Service struct {
@@ -2515,6 +2551,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, validateUserDataConfig(fmt.Sprintf("environment %q pool %q", envName, poolName), pool.UserData, pool.UserDataFile)...)
 			errs = append(errs, validateCustomHostLabels(fmt.Sprintf("environment %q pool %q labels", envName, poolName), pool.Labels)...)
 		}
+		errs = append(errs, validateHostPins(envName, env.Hosts.Pools)...)
 	}
 	errs = append(errs, validateServices("", c.Services)...)
 	errs = append(errs, validateAccessories("", c.Accessories)...)
@@ -4063,6 +4100,57 @@ func validateUserDataConfig(scope, userData, userDataFile string) []string {
 		return []string{fmt.Sprintf("%s cannot define both user_data and user_data_file", scope)}
 	}
 	return nil
+}
+
+func validateHostPins(envName string, pools map[string]Pool) []string {
+	var errs []string
+	poolNames := make([]string, 0, len(pools))
+	for poolName := range pools {
+		poolNames = append(poolNames, poolName)
+	}
+	sort.Strings(poolNames)
+	pinnedBy := map[string]string{}
+	for _, poolName := range poolNames {
+		pool := pools[poolName]
+		if len(pool.Pin) == 0 {
+			continue
+		}
+		known := map[string]bool{}
+		for _, name := range pool.HostNames(poolName) {
+			known[name] = true
+		}
+		hostNames := make([]string, 0, len(pool.Pin))
+		for name := range pool.Pin {
+			hostNames = append(hostNames, name)
+		}
+		sort.Strings(hostNames)
+		for _, name := range hostNames {
+			address := strings.TrimSpace(pool.Pin[name])
+			scope := fmt.Sprintf("environment %q pool %q pin %q", envName, poolName, name)
+			if !known[name] {
+				errs = append(errs, fmt.Sprintf("%s does not name a host in the pool (hosts: %s)", scope, strings.Join(pool.HostNames(poolName), ", ")))
+			}
+			if address == "" {
+				errs = append(errs, scope+" must set an address")
+				continue
+			}
+			if strings.ContainsAny(address, " \t\r\n") {
+				errs = append(errs, scope+" address cannot contain whitespace")
+				continue
+			}
+			canonical, ok := ipaddr.Canonical(address)
+			if !ok {
+				errs = append(errs, fmt.Sprintf("%s address %q must be an IP address (Ship compares it with the address the provider reports)", scope, address))
+				continue
+			}
+			if previous, ok := pinnedBy[canonical]; ok {
+				errs = append(errs, fmt.Sprintf("%s address %s is already pinned to %s", scope, address, previous))
+				continue
+			}
+			pinnedBy[canonical] = fmt.Sprintf("%s in pool %q", name, poolName)
+		}
+	}
+	return errs
 }
 
 func validateSSHConfig(scope string, ssh SSHConfig) []string {

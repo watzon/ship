@@ -126,6 +126,9 @@ func (c Client) Reconcile(ctx context.Context, project, environment string, env 
 		return result, nil
 	}
 
+	if err := provider.PreflightHosts(ctx, c, project, environment, desired); err != nil {
+		return provider.ReconcileResult{}, err
+	}
 	backend, err := c.reconcileBackendFor(ctx, project, environment, env)
 	if err != nil {
 		return provider.ReconcileResult{}, err

@@ -21,6 +21,7 @@ ship hosts production
 ship hosts production --json
 ship provision plan production
 ship provision plan production --json
+ship provision plan production --refresh
 ship plan production
 ship plan production --json
 ship plan production --observed
@@ -37,6 +38,55 @@ Environment-scoped `ship secrets verify`, `render`, and `diff` use the encrypted
 `ship plan ENV --observed` contacts every resolved host agent, compares the current release to observed Ship-managed containers, and shows the typed rollout actions Ship would use to converge from the real remote state. Use `--json` for pre-deploy gates that need drift summaries and planned pull/start/health/ingress/drain/stop actions.
 
 `ship hosts ENV` shows the resolved host inventory and SSH contact targets Ship will use. Before provisioning it reports config-derived hosts; after `ship provision apply`, it uses saved provider host facts such as public addresses, SSH ports, jump hosts, and identity files.
+
+`ship provision plan ENV` shows what `ship provision apply` would do to each configured host, and ends with a summary of the servers apply would create. With `--refresh` the plan lists servers from the provider (read-only), and the summary is definite: `apply will create 2 servers: web-2, worker-1`, `apply will not create any servers`, or `apply will refuse to run and will not create any servers until the conflicts above are fixed in ship.yml`:
+
+```text
+production
+- exists web-1: pool=web provider_id=42 address=203.0.113.10
+- create web-2: pool=web new server
+- extra web-9: pool=web provider_id=77 address=203.0.113.19 not in config; apply leaves it running
+apply will create 1 server: web-2
+existing servers from provider hetzner (read-only list)
+```
+
+Without `--refresh` the plan reads local host facts, which can be stale (a server deleted or re-addressed at the provider). Its summary is an estimate and says so, for example `based on local host facts, apply would not create any servers; not confirmed against the provider, so run with --refresh before apply`. Run `--refresh` before a real apply. `--refresh` lists servers exactly the way apply does, with the same scope and filters (for Latitude.sh, `provider.latitude.project`).
+
+| Action | Meaning |
+| --- | --- |
+| `create` | Apply creates a new server. This is the only action that starts billing. |
+| `exists` | A server for the host already exists. Apply reuses it and re-runs the idempotent bootstrap. |
+| `pinned` | The host is [pinned by address](#pinning-hosts-by-address) but local host facts cannot confirm it (no record, or no address). Apply never creates it, and refuses if the provider cannot confirm the pin. |
+| `conflict` | A pin disagrees with the known servers, a pinned server has no address to compare, or a host is named after an IP address. Apply creates nothing until it is fixed. |
+| `extra` | A known server that is not in the config. Apply leaves it running; deleting it is an explicit `ship provision decommission`. |
+
+By default the plan reads local host facts, so it needs no provider credentials. A machine without `.ship/environments/ENV/hosts.json` sees every unpinned host as `create`; run `ship provision plan ENV --refresh` to list servers from the provider instead (a read-only call). `ship --dry-run provision apply ENV` prints the same plan from local host facts. Inventory providers (manual, Terraform, Pulumi, Ansible, OpenSSH config) show every host as `exists`, because they never create servers.
+
+## Pinning hosts by address
+
+Host facts live only on the machine that ran `ship provision apply`. To deploy from another machine (a laptop, CI) without copying `hosts.json`, pin each existing server to its address with `hosts.pools.<pool>.pin`. Keep the logical host name Ship created the server for (`web-1`), and map it to the address `provision apply` printed:
+
+```yaml
+environments:
+  production:
+    hosts:
+      pools:
+        web:
+          count: 2
+          pin:
+            web-1: 203.0.113.10
+            web-2: 203.0.113.11
+```
+
+`pin` works with `count` (hosts `<pool>-1` to `<pool>-N`) and with an explicit `hosts` list. Each key must name a host of the pool, each value must be an IP address (IPv4 or IPv6; Ship compares it with the address the provider reports), and an address can be pinned to only one host per environment. Ship compares addresses as IP addresses, not text: `2001:DB8::1` and `2001:db8::0:1` are the same, and an IPv4-mapped address such as `::ffff:203.0.113.10` is the same as `203.0.113.10`. Ship never rewrites an address: it connects to the spelling the provider reports (or, for a pinned host with no host facts, the spelling you wrote), because SSH `known_hosts` entries are keyed by that exact text. Zoned IPv6 addresses (`fe80::1%eth0`) must match exactly, zone included.
+
+A pinned host:
+
+- is used at its pinned address by deploys, `ship hosts`, `ship doctor`, and the other remote commands, also when there are no local host facts;
+- is never created or replaced by `ship provision apply`. Before any provider change (networks, firewalls, tags, servers), apply lists the provider's servers (read-only) and checks every pinned host. If a pinned host has no server, the provider reports a different address, or it reports no address that can be compared, apply stops without changing anything. Other hosts are not created either;
+- must agree with local host facts when they exist. If a server's address changes (for example after `ship migrate`), update the pin.
+
+Do not put the address itself in `hosts:` (`hosts: [203.0.113.10]`) for a provider-created server. Ship would treat `203.0.113.10` as a new logical host. Apply refuses to create a server named after an IP address, so the whole apply stops, and the error names the host to pin instead when the provider has a server at that address.
 
 ## Providers
 

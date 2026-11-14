@@ -717,3 +717,53 @@ func restoreEnv(t *testing.T, name string) {
 		_ = os.Unsetenv(name)
 	})
 }
+
+func TestRunMismatchedHostFactsHintNeverSuggestsProvisionApply(t *testing.T) {
+	// Issue #5: count: 1 replaced by hosts: [<ipv4 of web-1>].
+	cfg, configPath := testConfig(t, []string{"203.0.113.10"})
+	t.Setenv("HCLOUD_TOKEN", "token")
+	store := state.NewStore(filepath.Join(filepath.Dir(configPath), config.LocalStateDir))
+	if err := store.SaveHostFacts("production", []state.HostFact{{Name: "web-1", Pool: "web", User: "deployer", IPv4: "203.0.113.10"}}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{outputs: map[string]string{"uname -s": "Linux\n"}, errors: map[string]error{}}
+
+	report := Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+		Remote:       remote,
+	})
+
+	check := assertCheck(t, report, "remote hosts:production", StatusFail, "set hosts.pools.web.pin.web-1: 203.0.113.10")
+	if strings.Contains(check.Message, "provision apply") {
+		t.Fatalf("hint suggests provision apply: %q", check.Message)
+	}
+}
+
+func TestRunChecksPinnedHostAtPinnedAddressWithoutHostFacts(t *testing.T) {
+	cfg, configPath := testConfig(t, nil)
+	env := cfg.Environments["production"]
+	pool := env.Hosts.Pools["web"]
+	pool.Pin = map[string]string{"web-1": "203.0.113.10"}
+	env.Hosts.Pools["web"] = pool
+	cfg.Environments["production"] = env
+	t.Setenv("HCLOUD_TOKEN", "token")
+	remote := &fakeRemote{outputs: map[string]string{"uname -s": "Linux\n"}, errors: map[string]error{}}
+
+	Run(context.Background(), cfg, Options{
+		ConfigPath:   configPath,
+		Docker:       fakeDocker{},
+		SSHAvailable: func(context.Context) error { return nil },
+		Remote:       remote,
+	})
+
+	if len(remote.hosts) == 0 {
+		t.Fatal("expected remote checks for the pinned host")
+	}
+	for _, host := range remote.hosts {
+		if host.Name != "web-1" || host.ContactTarget() != "203.0.113.10" {
+			t.Fatalf("remote check used wrong host: %+v", host)
+		}
+	}
+}
