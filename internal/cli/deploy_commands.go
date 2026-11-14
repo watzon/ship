@@ -353,6 +353,7 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			fmt.Fprint(cmd.OutOrStdout(), plan.String())
+			progress := newDeployProgress(cmd.OutOrStdout(), plan)
 			secretOpts, err := secretSourceOptions(opts, envName)
 			if err != nil {
 				return err
@@ -426,7 +427,7 @@ func deployCmd(opts *options) *cobra.Command {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
 			}
-			images, err := prepareDeployImages(ctx, deployClient, cfg, releaseID)
+			images, err := prepareDeployImagesWithProgress(ctx, deployClient, cfg, releaseID, progress.done)
 			if err != nil {
 				recordEvent(store, state.Event{Environment: envName, Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 				return err
@@ -474,6 +475,9 @@ func deployCmd(opts *options) *cobra.Command {
 					}
 					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "failed", Release: releaseID, Message: err.Error()})
 					return err
+				}
+				for _, name := range accessoryNames {
+					progress.done("accessory", name)
 				}
 				changed := countChangedAccessories(results)
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_accessory_ensure", Status: "succeeded", Release: releaseID, Message: fmt.Sprintf("changed=%d", changed)})
@@ -537,7 +541,7 @@ func deployCmd(opts *options) *cobra.Command {
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_registry_auth", Status: "succeeded", Release: releaseID, Message: fmt.Sprintf("images=%d hosts=%d", len(registryImages), len(hosts))})
 			if hasReleaseCommands(cfg) {
 				recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "started", Release: releaseID})
-				if err := runReleaseCommands(ctx, cfg, hosts, args[0], releaseID, images, secretEnvFiles); err != nil {
+				if err := runReleaseCommandsWithProgress(ctx, cfg, hosts, args[0], releaseID, images, secretEnvFiles, func(service string) { progress.done("release", service) }); err != nil {
 					recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_release_command", Status: "failed", Release: releaseID, Message: err.Error()})
 					failedRelease, markErr := store.MarkReleaseFailed(releaseID, err.Error(), deployNow())
 					if markErr != nil {
@@ -583,6 +587,8 @@ func deployCmd(opts *options) *cobra.Command {
 			}
 			actions := rollout.Actions
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy_rollout", Status: "succeeded", Release: releaseID})
+			progress.doneKind("start")
+			progress.doneKind("ingress")
 			recordRolloutCleanupWarnings(cmd.OutOrStdout(), store, args[0], "deploy_cleanup", releaseID, rollout.CleanupWarnings)
 			recordIngressEvents(store, args[0], releaseID, actions)
 			if err := preserveMaintenanceIngress(ctx, cfg, args[0], stateDir, hosts, store); err != nil {
@@ -644,6 +650,7 @@ func deployCmd(opts *options) *cobra.Command {
 				return err
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "succeeded", Release: releaseID})
+			fmt.Fprintf(cmd.OutOrStdout(), "release %s is current\n", releaseID)
 			runNotifications(ctx, store, cfg, envName, "deploy", "succeeded", releaseID, "", images)
 			return nil
 		},
@@ -928,6 +935,18 @@ func failPromotedRelease(ctx context.Context, store state.Store, envName, releas
 }
 
 func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Config, releaseID string) (map[string]string, error) {
+	return prepareDeployImagesWithProgress(ctx, dc, cfg, releaseID, nil)
+}
+
+// prepareDeployImagesWithProgress builds, pushes, and resolves service images.
+// onStep, when set, is called with the plan kind (build, push, resolve) and the
+// service name after each step finishes.
+func prepareDeployImagesWithProgress(ctx context.Context, dc deployDocker, cfg *config.Config, releaseID string, onStep func(kind, target string)) (map[string]string, error) {
+	step := func(kind, target string) {
+		if onStep != nil {
+			onStep(kind, target)
+		}
+	}
 	images := map[string]string{}
 	for _, name := range sortedServiceNames(cfg.Services) {
 		svc := cfg.Services[name]
@@ -976,6 +995,7 @@ func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Confi
 			if err := dc.BuildImage(ctx, buildOpts); err != nil {
 				return nil, err
 			}
+			step("build", name)
 			if !docker.BuildPublishesImage(buildOpts) {
 				if err := dc.Push(ctx, tag); err != nil {
 					return nil, err
@@ -986,12 +1006,14 @@ func prepareDeployImages(ctx context.Context, dc deployDocker, cfg *config.Confi
 					}
 				}
 			}
+			step("push", name)
 			imageRef = tag
 		}
 		digestRef, err := dc.ResolveDigest(ctx, imageRef)
 		if err != nil {
 			return nil, err
 		}
+		step("resolve", name)
 		images[name] = digestRef
 	}
 	return images, nil
@@ -1115,6 +1137,12 @@ func hasReleaseCommands(cfg *config.Config) bool {
 }
 
 func runReleaseCommands(ctx context.Context, cfg *config.Config, hosts []scheduler.Host, envName, releaseID string, images map[string]string, secretEnvFiles map[string]string) error {
+	return runReleaseCommandsWithProgress(ctx, cfg, hosts, envName, releaseID, images, secretEnvFiles, nil)
+}
+
+// runReleaseCommandsWithProgress runs release commands and calls onDone with the
+// service name after each one succeeds.
+func runReleaseCommandsWithProgress(ctx context.Context, cfg *config.Config, hosts []scheduler.Host, envName, releaseID string, images map[string]string, secretEnvFiles map[string]string, onDone func(service string)) error {
 	placements, err := scheduler.PlaceServicesOnHosts(cfg, hosts)
 	if err != nil {
 		return err
@@ -1160,6 +1188,9 @@ func runReleaseCommands(ctx context.Context, cfg *config.Config, hosts []schedul
 		var result agent.CommandResult
 		if err := client.Call(ctx, "run_oneoff_container", params, &result); err != nil {
 			return fmt.Errorf("release command for service %s on %s: %w", serviceName, placement.Host.Name, err)
+		}
+		if onDone != nil {
+			onDone(serviceName)
 		}
 	}
 	return nil
