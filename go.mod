@@ -1,6 +1,6 @@
 module github.com/watzon/ship
 
-go 1.26.6
+go 1.26.11
 
 require (
 	filippo.io/age v1.3.1
