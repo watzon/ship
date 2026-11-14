@@ -75,6 +75,8 @@ Set your provider credentials, run `ship provision apply` and `ship agent instal
 > [!TIP]
 > Run mutating commands with `--dry-run` first. Start with `ship doctor` and `ship provision plan` before touching real infrastructure.
 
+`ship provision plan` marks each host `create`, `exists`, `pinned`, `conflict`, or `extra` and says how many servers `apply` would create. To deploy existing servers from a second machine (a laptop, CI) without copying `.ship/` host facts, [pin them by address](docs/configuration/README.md#pinning-hosts-by-address) with `hosts.pools.<pool>.pin`; `provision apply` never creates or replaces a pinned host.
+
 ## Documentation
 
 | Guide | What it covers |

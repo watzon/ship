@@ -1,11 +1,12 @@
 # Deploy and operate
 
 
-Provisioning reconciles provider servers by Ship ownership metadata, writes local host facts, waits for SSH, installs Docker prerequisites, uploads the local `ship` binary, and enables the Ship agent service. It does not delete extra servers during apply; cleanup is an explicit decommission command.
+Provisioning reconciles provider servers by Ship ownership metadata, writes local host facts, waits for SSH, installs Docker prerequisites, uploads the local `ship` binary, and enables the Ship agent service. It does not delete extra servers during apply; cleanup is an explicit decommission command. Run `ship provision plan ENV` first: it lists each host as `create`, `exists`, `pinned`, `conflict`, or `extra` and says how many servers apply would create. Apply never creates or replaces a host [pinned by address](configuration/README.md#pinning-hosts-by-address).
 
 The `ship-agent` systemd unit is an install marker, not a daemon: agent RPC is served on demand by execing `ship agent rpc` over each SSH session, so the unit is `Type=oneshot` and shows `active (exited)`. Hosts set up before v0.5.0 have an older unit that restart-loops (`ship agent run` exits immediately by design); rerun `ship agent install ENV` to rewrite and re-enable it.
 
 ```bash
+ship provision plan production
 ship provision apply production --yes
 ship --dry-run agent install production
 ship agent install production
@@ -37,6 +38,7 @@ Replacement servers get a unique provider-level name (`web-1-m<timestamp>`) plus
 - Service volume data is not migrated; only accessory data moves via backup/restore.
 - Ship manages no DNS. If the host serves ingress, point DNS records at the replacement address printed at the end.
 - `--keep-server` stops workloads on the old server but leaves it in your provider account; `ship provision apply` reports it as extra until you delete it.
+- If the host is [pinned by address](configuration/README.md#pinning-hosts-by-address), update `hosts.pools.<pool>.pin` to the replacement address after the migration. Ship reports a pin that disagrees with the host facts and refuses to provision until it matches.
 
 Deploy builds or resolves service images, writes release state, ensures configured accessories are running, rolls services through the SSH-framed agent, runs health checks, and promotes only healthy releases. Accessory ensure is conservative: an already-running accessory is left in place, while a missing or stopped accessory is created before release commands and service rollout. If an accessory is created or explicitly redeployed, Ship restarts current-release service containers so database or Redis clients reconnect to the current container address.
 

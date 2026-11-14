@@ -263,6 +263,8 @@ Co-located ingress (app and Caddy on the same host, shared Docker network) uses 
 
 Fix validation errors before any `--dry-run provision apply` or `--dry-run deploy`.
 
+Before a real `ship provision apply`, run `ship provision plan ENV` (add `--refresh` to ask the provider) and check the `apply will create N servers` line. To use servers Ship already created from another machine, pin them by address with `hosts.pools.<pool>.pin` (`web-1: 203.0.113.10`) instead of listing the address under `hosts:`; apply never creates or replaces a pinned host.
+
 ## Private container access
 
 `ship accessory proxy ENV NAME LOCAL:REMOTE` forwards a local TCP port to one running accessory. `ship proxy ENV SERVICE LOCAL:REMOTE` selects a service replica. Replica 1 is the default; `--replica N` and `service.N` select another replica.
