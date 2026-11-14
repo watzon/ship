@@ -663,6 +663,9 @@ func deployCmd(opts *options) *cobra.Command {
 			}
 			recordEvent(store, state.Event{Environment: args[0], Kind: "deploy", Status: "succeeded", Release: releaseID})
 			fmt.Fprintf(cmd.OutOrStdout(), "release %s is current\n", releaseID)
+			if err := progress.Err(); err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(), "warning: %v\n", err)
+			}
 			runNotifications(ctx, store, cfg, envName, "deploy", "succeeded", releaseID, "", images)
 			return nil
 		},
