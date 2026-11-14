@@ -18,6 +18,9 @@ type Host struct {
 	KnownHostsFile string
 	JumpHost       string
 	SSHOptions     map[string]string
+	// PinnedAddress is the address from hosts.pools.<pool>.pin. A pinned host
+	// already exists at this address; Ship must never create a server for it.
+	PinnedAddress string
 }
 
 type Placement struct {
@@ -40,16 +43,13 @@ func HostsForEnvironment(env config.Environment) []Host {
 			user = "root"
 		}
 		ssh := mergeSSHConfig(env.SSH, pool.SSH)
-		if len(pool.Hosts) > 0 {
-			names := append([]string(nil), pool.Hosts...)
-			sort.Strings(names)
-			for _, name := range names {
-				hosts = append(hosts, hostWithSSH(Host{Name: name, Pool: poolName, User: user}, ssh))
+		for _, name := range pool.HostNames(poolName) {
+			host := Host{Name: name, Pool: poolName, User: user}
+			if address := strings.TrimSpace(pool.Pin[name]); address != "" {
+				host.PinnedAddress = address
+				host.Contact = address
 			}
-			continue
-		}
-		for i := 1; i <= pool.Count; i++ {
-			hosts = append(hosts, hostWithSSH(Host{Name: fmt.Sprintf("%s-%d", poolName, i), Pool: poolName, User: user}, ssh))
+			hosts = append(hosts, hostWithSSH(host, ssh))
 		}
 	}
 	return hosts

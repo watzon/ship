@@ -3453,3 +3453,72 @@ services:
     scale: 1
 `
 }
+
+func TestLoadParsesPoolHostPins(t *testing.T) {
+	text := strings.Replace(minimalConfigYAML(), "          count: 1\n", "          count: 1\n          pin:\n            web-1: 203.0.113.10\n", 1)
+	cfg, err := loadConfigText(t, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Environments["production"].Hosts.Pools["web"].Pin["web-1"]; got != "203.0.113.10" {
+		t.Fatalf("pin = %q", got)
+	}
+}
+
+func TestValidateHostPins(t *testing.T) {
+	tests := []struct {
+		name  string
+		pools map[string]Pool
+		want  []string
+	}{
+		{
+			name:  "count host pinned",
+			pools: map[string]Pool{"web": {Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}}},
+		},
+		{
+			name:  "explicit host pinned",
+			pools: map[string]Pool{"web": {Hosts: []string{"edge"}, Pin: map[string]string{"edge": "203.0.113.10"}}},
+		},
+		{
+			name:  "unknown host",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-2": "203.0.113.10"}}},
+			want:  []string{`pool "web" pin "web-2" does not name a host in the pool (hosts: web-1)`},
+		},
+		{
+			name:  "empty address",
+			pools: map[string]Pool{"web": {Count: 1, Pin: map[string]string{"web-1": " "}}},
+			want:  []string{`pool "web" pin "web-1" must set an address`},
+		},
+		{
+			name: "duplicate address",
+			pools: map[string]Pool{
+				"web":    {Count: 1, Pin: map[string]string{"web-1": "203.0.113.10"}},
+				"worker": {Count: 1, Pin: map[string]string{"worker-1": "203.0.113.10"}},
+			},
+			want: []string{`pool "worker" pin "worker-1" address 203.0.113.10 is already pinned to web-1 in pool "web"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := minimalValidConfig()
+			env := cfg.Environments["production"]
+			env.Hosts.Pools = tt.pools
+			cfg.Environments["production"] = env
+			err := cfg.Validate()
+			if len(tt.want) == 0 {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error missing %q:\n%v", want, err)
+				}
+			}
+		})
+	}
+}

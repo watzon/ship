@@ -64,3 +64,19 @@ func TestHostsForEnvironmentAppliesSSHConfigCascade(t *testing.T) {
 		t.Fatalf("host ssh options = %+v", host.SSHOptions)
 	}
 }
+
+func TestHostsForEnvironmentUsesPinnedAddressAsContact(t *testing.T) {
+	env := config.Environment{Hosts: config.HostsConfig{Pools: map[string]config.Pool{
+		"web": {Count: 2, Pin: map[string]string{"web-1": "203.0.113.10"}},
+	}}}
+	hosts := HostsForEnvironment(env)
+	if len(hosts) != 2 {
+		t.Fatalf("hosts = %+v", hosts)
+	}
+	if hosts[0].Name != "web-1" || hosts[0].PinnedAddress != "203.0.113.10" || hosts[0].ContactTarget() != "203.0.113.10" {
+		t.Fatalf("pinned host = %+v", hosts[0])
+	}
+	if hosts[1].Name != "web-2" || hosts[1].PinnedAddress != "" || hosts[1].ContactTarget() != "web-2" {
+		t.Fatalf("unpinned host = %+v", hosts[1])
+	}
+}
