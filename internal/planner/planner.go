@@ -138,8 +138,10 @@ type ProvisionInput struct {
 	Desired []provider.HostPlan
 	// Known are the servers that already exist.
 	Known []KnownHost
-	// Source describes where Known came from, for the plan notes.
+	// Source names where Known came from, such as "local host facts".
 	Source string
+	// SourceNote, when set, replaces Source in the closing plan note.
+	SourceNote string
 	// Authoritative is true when Known came from the provider itself rather
 	// than from local host facts.
 	Authoritative bool
@@ -199,6 +201,12 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 			}
 			plan.add(Action{Kind: ProvisionPinned, Target: desired.Name, Details: fmt.Sprintf("pool=%s address=%s (not in %s; apply never creates a pinned host)", desired.Pool, pin, in.Source)})
 		default:
+			if other, ok := byAddress[desired.Name]; ok {
+				// hosts: [<ip>] for a provider-created server.
+				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s is the address of existing host %s; list host %s and pin it with hosts.pools.%s.pin.%s: %s instead (apply refuses to create a second server)", desired.Pool, other.Name, other.Name, desired.Pool, other.Name, desired.Name)})
+				used[known[other.Name]] = true
+				continue
+			}
 			plan.add(Action{Kind: ProvisionCreate, Target: desired.Name, Details: fmt.Sprintf("pool=%s new server", desired.Pool)})
 			creates = append(creates, desired.Name)
 		}
@@ -230,7 +238,9 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 	if plan.Summary[ProvisionConflict] > 0 {
 		plan.Notes = append(plan.Notes, "apply will refuse to run until the conflicts above are fixed in ship.yml")
 	}
-	if in.Source != "" {
+	if in.SourceNote != "" {
+		plan.Notes = append(plan.Notes, "existing servers from "+in.SourceNote)
+	} else if in.Source != "" {
 		plan.Notes = append(plan.Notes, "existing servers from "+in.Source)
 	}
 	return plan

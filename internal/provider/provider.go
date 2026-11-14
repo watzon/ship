@@ -198,7 +198,7 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 		existingByLogical[logical] = i
 	}
 
-	if err := CheckPinnedHosts(environment, desired, existing); err != nil {
+	if err := CheckBeforeCreate(environment, desired, existing); err != nil {
 		return ReconcileResult{}, err
 	}
 
@@ -228,12 +228,19 @@ func ReconcileHosts(ctx context.Context, project, environment string, desired []
 	return result, nil
 }
 
-// CheckPinnedHosts verifies every pinned host plan against the servers the
-// provider reports. A pinned host must already exist at its pinned address: it
-// is an error for it to be missing (reconciliation would otherwise create a new
-// server) or to be reported at a different address. The check runs before any
-// server is created, so a bad pin never leaves a partial apply behind.
-func CheckPinnedHosts(environment string, desired []HostPlan, existing []Host) error {
+// CheckBeforeCreate verifies the desired hosts against the servers the
+// provider reports, before reconciliation creates anything:
+//
+//   - A pinned host must already exist at its pinned address. It is an error
+//     for it to be missing (reconciliation would otherwise create a new server)
+//     or to be reported at a different address.
+//   - An unpinned host whose name is the address of an existing server is a
+//     config mistake (hosts: [<ip>] for a provider-created server); creating a
+//     server named after that address would duplicate the existing one.
+//
+// Because the check runs before any server is created, a bad config never
+// leaves a partial apply behind.
+func CheckBeforeCreate(environment string, desired []HostPlan, existing []Host) error {
 	byLogical := map[string]Host{}
 	for _, host := range existing {
 		logical := LogicalName(host)
@@ -245,10 +252,19 @@ func CheckPinnedHosts(environment string, desired []HostPlan, existing []Host) e
 	var problems []string
 	for _, plan := range desired {
 		pin := strings.TrimSpace(plan.PinnedAddress)
+		host, ok := byLogical[plan.Name]
 		if pin == "" {
+			if ok {
+				continue
+			}
+			for _, other := range existing {
+				if strings.TrimSpace(other.PublicAddress) == plan.Name {
+					problems = append(problems, fmt.Sprintf("host %s pool=%s is the address of existing server %s (host %s), and apply would create a second server for it; list host %s in the pool and set hosts.pools.%s.pin.%s: %s instead", plan.Name, plan.Pool, other.Name, LogicalName(other), LogicalName(other), plan.Pool, LogicalName(other), plan.Name))
+					break
+				}
+			}
 			continue
 		}
-		host, ok := byLogical[plan.Name]
 		if !ok {
 			problem := fmt.Sprintf("host %s pool=%s is pinned to %s but the provider reports no server for it", plan.Name, plan.Pool, pin)
 			for _, other := range existing {
@@ -268,7 +284,7 @@ func CheckPinnedHosts(environment string, desired []HostPlan, existing []Host) e
 		return nil
 	}
 	sort.Strings(problems)
-	return fmt.Errorf("pinned hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed", environment, strings.Join(problems, "; "))
+	return fmt.Errorf("configured hosts for %s do not match provider servers: %s; Ship never creates or replaces a pinned host, and nothing was changed", environment, strings.Join(problems, "; "))
 }
 
 func sortHosts(hosts []Host) {

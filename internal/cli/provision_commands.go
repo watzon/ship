@@ -323,15 +323,16 @@ func localProvisionInput(configPath, envName string, env config.Environment, des
 		return input, err
 	}
 	factsPath := filepath.Join(config.LocalStateDir, "environments", envName, "hosts.json")
+	input.Source = "local host facts"
 	facts, err := state.NewStore(stateDir).ReadHostFacts(envName)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		input.Source = fmt.Sprintf("local host facts (%s not found; run with --refresh to list servers from the provider)", factsPath)
+		input.SourceNote = fmt.Sprintf("local host facts (%s not found; run with --refresh to list servers from the provider)", factsPath)
 		return input, nil
 	case err != nil:
 		return input, err
 	}
-	input.Source = fmt.Sprintf("local host facts (%s; run with --refresh to list servers from the provider)", factsPath)
+	input.SourceNote = fmt.Sprintf("local host facts (%s; run with --refresh to list servers from the provider)", factsPath)
 	for _, fact := range facts {
 		input.Known = append(input.Known, planner.KnownHost{
 			Name:       strings.TrimSpace(fact.Name),
@@ -354,7 +355,8 @@ func providerProvisionInput(ctx context.Context, prov provider.Provider, project
 		Desired:        desired,
 		CreatesServers: env.Provider.CreatesServers(),
 		Provider:       prov.Name(),
-		Source:         fmt.Sprintf("provider %s (read-only list)", prov.Name()),
+		Source:         fmt.Sprintf("provider %s", prov.Name()),
+		SourceNote:     fmt.Sprintf("provider %s (read-only list)", prov.Name()),
 		Authoritative:  true,
 	}
 	if !input.CreatesServers {

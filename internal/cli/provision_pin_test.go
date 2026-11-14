@@ -231,4 +231,28 @@ func TestResolvedHostsMismatchHintPointsAtPinning(t *testing.T) {
 	if strings.Contains(err.Error(), "provision apply") || strings.Contains(err.Error(), "--yes") {
 		t.Fatalf("hint must not suggest provision apply: %v", err)
 	}
+
+	// The plan must not read as "create a server for this address".
+	plan, err := runProvision(t, &options{configPath: path}, "plan", "production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "- conflict 203.0.113.10: pool=web is the address of existing host web-1") || strings.Contains(plan, "- create") {
+		t.Fatalf("plan:\n%s", plan)
+	}
+
+	// And apply refuses before creating anything.
+	var events []string
+	installBootstrapHooks(t, &events)
+	prov := &reconcilingProvider{existing: []providerpkg.Host{{
+		ID: "abc", Name: "web-1", Pool: "web", PublicAddress: "203.0.113.10",
+		Labels: map[string]string{providerpkg.LabelHost: "web-1", providerpkg.LabelPool: "web"},
+	}}}
+	installProviderHook(t, prov)
+	if _, err := runProvision(t, &options{configPath: path}, "apply", "production", "--yes"); err == nil || !strings.Contains(err.Error(), "is the address of existing server web-1") {
+		t.Fatalf("apply err = %v", err)
+	}
+	if len(prov.created) != 0 || len(events) != 0 {
+		t.Fatalf("apply created %v / bootstrapped %v", prov.created, events)
+	}
 }

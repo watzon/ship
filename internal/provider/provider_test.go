@@ -262,6 +262,12 @@ func TestReconcileHostsRefusesBadPinsBeforeCreatingAnything(t *testing.T) {
 			want:     []string{"203.0.113.10 belongs to server web-1 (host web-1), so pin that host name instead"},
 		},
 		{
+			name:     "address listed as a host name",
+			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "203.0.113.10"}},
+			desired:  []HostPlan{{Name: "203.0.113.10", Pool: "web"}},
+			want:     []string{"host 203.0.113.10 pool=web is the address of existing server web-1 (host web-1)", "set hosts.pools.web.pin.web-1: 203.0.113.10 instead"},
+		},
+		{
 			name:     "pinned address differs",
 			existing: []Host{{ID: "1", Name: "web-1", Pool: "web", PublicAddress: "198.51.100.7"}},
 			desired:  []HostPlan{{Name: "web-1", Pool: "web", PinnedAddress: "203.0.113.10"}},

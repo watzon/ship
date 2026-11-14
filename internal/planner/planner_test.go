@@ -184,3 +184,22 @@ func TestProvisionPlanInventoryProviderNeverCreates(t *testing.T) {
 		t.Fatalf("plan = %s", plan.String())
 	}
 }
+
+func TestProvisionPlanFlagsAddressListedAsHostName(t *testing.T) {
+	// Issue #5: count: 1 replaced by hosts: [<ipv4 of web-1>].
+	plan := ProvisionPlan("production", ProvisionInput{
+		Desired:        []provider.HostPlan{{Name: "203.0.113.10", Pool: "web"}},
+		Known:          []KnownHost{{Name: "web-1", Pool: "web", Address: "203.0.113.10"}},
+		Source:         "local host facts",
+		CreatesServers: true,
+	})
+	if len(plan.Actions) != 1 || plan.Actions[0].Kind != ProvisionConflict {
+		t.Fatalf("actions = %+v", plan.Actions)
+	}
+	if !strings.Contains(plan.Actions[0].Details, "pin it with hosts.pools.web.pin.web-1: 203.0.113.10") {
+		t.Fatalf("details = %q", plan.Actions[0].Details)
+	}
+	if plan.Summary[ProvisionCreate] != 0 || !strings.Contains(plan.String(), "apply will not create any servers") {
+		t.Fatalf("plan = %s", plan.String())
+	}
+}
