@@ -20,6 +20,7 @@ import (
 	"github.com/watzon/ship/internal/cli/ui"
 	"github.com/watzon/ship/internal/config"
 	"github.com/watzon/ship/internal/deployment"
+	"github.com/watzon/ship/internal/hostfacts"
 	"github.com/watzon/ship/internal/scheduler"
 	"github.com/watzon/ship/internal/secrets"
 	"github.com/watzon/ship/internal/shipbinary"
@@ -142,11 +143,6 @@ func secretSourceOptions(opts *options, envName string) (secrets.SourceOptions, 
 	}, nil
 }
 
-type hostFactKey struct {
-	name string
-	pool string
-}
-
 func resolvedHostsForEnvironment(store state.Store, envName string, env config.Environment) ([]scheduler.Host, error) {
 	hosts := scheduler.HostsForEnvironment(env)
 	facts, err := store.ReadHostFacts(envName)
@@ -181,77 +177,46 @@ func dedupeHosts(hosts []scheduler.Host) []scheduler.Host {
 }
 
 func applyHostFacts(envName string, hosts []scheduler.Host, facts []state.HostFact) ([]scheduler.Host, error) {
-	factsByKey := map[hostFactKey]state.HostFact{}
-	for _, fact := range facts {
-		key := hostFactKey{name: strings.TrimSpace(fact.Name), pool: strings.TrimSpace(fact.Pool)}
-		if key.name == "" || key.pool == "" {
-			return nil, fmt.Errorf("host facts for %s contain a host without name or pool", envName)
-		}
-		if _, exists := factsByKey[key]; exists {
-			return nil, fmt.Errorf("host facts for %s contain duplicate host %s in pool %s", envName, key.name, key.pool)
-		}
-		factsByKey[key] = fact
+	matches, err := hostfacts.MatchHosts(envName, hosts, facts)
+	if err != nil {
+		return nil, err
 	}
-
-	resolved := append([]scheduler.Host(nil), hosts...)
-	matched := map[hostFactKey]struct{}{}
-	var missing []string
-	for i, host := range resolved {
-		key := hostFactKey{name: host.Name, pool: host.Pool}
-		fact, ok := factsByKey[key]
-		if !ok {
-			missing = append(missing, fmt.Sprintf("%s pool=%s", host.Name, host.Pool))
+	resolved := make([]scheduler.Host, 0, len(matches))
+	for _, match := range matches {
+		host := match.Host
+		if !match.HasFact {
+			resolved = append(resolved, host)
 			continue
 		}
+		fact := match.Fact
 		if user := strings.TrimSpace(fact.User); user != "" {
-			resolved[i].User = user
+			host.User = user
 		}
 		if fact.SSHPort > 0 {
-			resolved[i].SSHPort = fact.SSHPort
+			host.SSHPort = fact.SSHPort
 		}
 		if strings.TrimSpace(fact.IdentityFile) != "" {
-			resolved[i].IdentityFile = fact.IdentityFile
+			host.IdentityFile = fact.IdentityFile
 		}
 		if strings.TrimSpace(fact.KnownHostsFile) != "" {
-			resolved[i].KnownHostsFile = fact.KnownHostsFile
+			host.KnownHostsFile = fact.KnownHostsFile
 		}
 		if strings.TrimSpace(fact.JumpHost) != "" {
-			resolved[i].JumpHost = fact.JumpHost
+			host.JumpHost = fact.JumpHost
 		}
 		if len(fact.SSHOptions) > 0 {
-			resolved[i].SSHOptions = mergeStringMap(resolved[i].SSHOptions, fact.SSHOptions)
+			host.SSHOptions = mergeStringMap(host.SSHOptions, fact.SSHOptions)
 		}
-		resolved[i].Contact = hostFactContact(fact)
-		matched[key] = struct{}{}
-	}
-
-	var extra []string
-	for key := range factsByKey {
-		if _, ok := matched[key]; ok {
-			continue
+		if contact := hostFactContact(fact); contact != "" || host.PinnedAddress == "" {
+			host.Contact = contact
 		}
-		extra = append(extra, fmt.Sprintf("%s pool=%s", key.name, key.pool))
-	}
-	if len(missing) > 0 || len(extra) > 0 {
-		sort.Strings(missing)
-		sort.Strings(extra)
-		parts := []string{}
-		if len(missing) > 0 {
-			parts = append(parts, "missing "+strings.Join(missing, ", "))
-		}
-		if len(extra) > 0 {
-			parts = append(parts, "extra "+strings.Join(extra, ", "))
-		}
-		return nil, fmt.Errorf("host facts for %s do not match configured hosts: %s; run ship provision apply %s --yes", envName, strings.Join(parts, "; "), envName)
+		resolved = append(resolved, host)
 	}
 	return resolved, nil
 }
 
 func hostFactContact(fact state.HostFact) string {
-	if contact := strings.TrimSpace(fact.PublicAddress); contact != "" {
-		return contact
-	}
-	return strings.TrimSpace(fact.IPv4)
+	return hostfacts.Contact(fact)
 }
 
 func copyStringMap(values map[string]string) map[string]string {
