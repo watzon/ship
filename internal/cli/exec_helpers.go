@@ -87,5 +87,5 @@ const execLongHelp = `Run a command inside a deployed container.
 
 Arguments after -- are passed to the command unchanged: each one is shell-quoted,
 so spaces, quotes and $ survive. A single argument is treated as a shell string,
-so 'cd /app && ls' works. The command's stdout and stderr are printed, and ship
-exits with the command's exit code.`
+so 'cd /app && ls' works. If the command fails, its stdout and stderr are printed
+and ship exits with its exit code; on success only stdout is shown.`
