@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -191,8 +192,10 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 		if _, ok := known[host.Name]; !ok {
 			known[host.Name] = i
 		}
-		if host.Address != "" {
-			byAddress[host.Address] = host
+		if address, ok := addressKey(host.Address); ok {
+			if _, taken := byAddress[address]; !taken {
+				byAddress[address] = host
+			}
 		}
 	}
 	used := map[int]bool{}
@@ -204,13 +207,28 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 		case found:
 			used[index] = true
 			host := in.Known[index]
-			if pin != "" && host.Address != "" && host.Address != pin {
-				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s reports %s; apply refuses until the pin matches", desired.Pool, pin, in.Source, host.Address)})
-				continue
+			if pin != "" {
+				address := strings.TrimSpace(host.Address)
+				switch {
+				case address != "" && provider.IsIPAddress(address) && !provider.SameAddress(address, pin):
+					plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s reports %s; apply refuses until the pin matches", desired.Pool, pin, in.Source, host.Address)})
+					continue
+				case address == "" || !provider.IsIPAddress(address):
+					reported := "no address"
+					if address != "" {
+						reported = fmt.Sprintf("address %q, which is not an IP address", address)
+					}
+					if in.Authoritative {
+						plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s but %s reports %s, so the pin cannot be verified; apply refuses", desired.Pool, pin, in.Source, reported)})
+						continue
+					}
+					plan.add(Action{Kind: ProvisionPinned, Target: desired.Name, Details: fmt.Sprintf("pool=%s address=%s (%s has %s for it; apply verifies the pin against the provider and refuses if it cannot)", desired.Pool, pin, in.Source, reported)})
+					continue
+				}
 			}
 			plan.add(Action{Kind: ProvisionExists, Target: desired.Name, Details: knownDetails(desired.Pool, host)})
 		case pin != "":
-			if other, ok := byAddress[pin]; ok {
+			if other, ok := lookupAddress(byAddress, pin); ok {
 				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s pinned to %s, which belongs to host %s; pin that host name instead", desired.Pool, pin, other.Name)})
 				continue
 			}
@@ -220,10 +238,16 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 			}
 			plan.add(Action{Kind: ProvisionPinned, Target: desired.Name, Details: fmt.Sprintf("pool=%s address=%s (not in %s; apply never creates a pinned host)", desired.Pool, pin, in.Source)})
 		default:
-			if other, ok := byAddress[desired.Name]; ok {
+			if other, ok := lookupAddress(byAddress, desired.Name); ok {
 				// hosts: [<ip>] for a provider-created server.
 				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s is the address of existing host %s; list host %s and pin it with hosts.pools.%s.pin.%s: %s instead (apply refuses to create a second server)", desired.Pool, other.Name, other.Name, desired.Pool, other.Name, desired.Name)})
 				used[known[other.Name]] = true
+				continue
+			}
+			if provider.IsIPAddress(desired.Name) {
+				// Apply never creates a server named after an address, whether
+				// or not a known server has that address.
+				plan.add(Action{Kind: ProvisionConflict, Target: desired.Name, Details: fmt.Sprintf("pool=%s is an IP address; apply refuses to create a server named after it (for an existing server, list its host name and set hosts.pools.%s.pin.<host>: %s)", desired.Pool, desired.Pool, desired.Name)})
 				continue
 			}
 			plan.add(Action{Kind: ProvisionCreate, Target: desired.Name, Details: fmt.Sprintf("pool=%s new server", desired.Pool)})
@@ -246,16 +270,31 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 		plan.add(Action{Kind: ProvisionExtra, Target: host.Name, Details: knownDetails(host.Pool, host) + " not in config; apply leaves it running"})
 	}
 
-	switch len(creates) {
-	case 0:
-		plan.Notes = append(plan.Notes, "apply will not create any servers")
-	case 1:
-		plan.Notes = append(plan.Notes, fmt.Sprintf("apply will create 1 server: %s", creates[0]))
-	default:
-		plan.Notes = append(plan.Notes, fmt.Sprintf("apply will create %d servers: %s", len(creates), strings.Join(creates, ", ")))
-	}
-	if plan.Summary[ProvisionConflict] > 0 {
-		plan.Notes = append(plan.Notes, "apply will refuse to run until the conflicts above are fixed in ship.yml")
+	conflicts := plan.Summary[ProvisionConflict] > 0
+	if in.Authoritative {
+		switch {
+		case conflicts:
+			plan.Notes = append(plan.Notes, "apply will refuse to run and will not create any servers until the conflicts above are fixed in ship.yml")
+		case len(creates) == 0:
+			plan.Notes = append(plan.Notes, "apply will not create any servers")
+		default:
+			plan.Notes = append(plan.Notes, "apply will create "+serverCount(creates))
+		}
+	} else {
+		// Local host facts can be stale: a server may have been deleted or
+		// re-addressed at the provider. Never promise what apply will do.
+		source := in.Source
+		if source == "" {
+			source = "local host facts"
+		}
+		switch {
+		case conflicts:
+			plan.Notes = append(plan.Notes, fmt.Sprintf("based on %s, apply would refuse to run because of the conflicts above; apply re-checks pins and host names against the provider before changing anything and creates nothing while any conflict remains there (run with --refresh to see the provider's view)", source))
+		case len(creates) == 0:
+			plan.Notes = append(plan.Notes, fmt.Sprintf("based on %s, apply would not create any servers; not confirmed against the provider, so run with --refresh before apply", source))
+		default:
+			plan.Notes = append(plan.Notes, fmt.Sprintf("based on %s, apply would create %s; run with --refresh to confirm against the provider", source, serverCount(creates)))
+		}
 	}
 	if in.SourceNote != "" {
 		plan.Notes = append(plan.Notes, "existing servers from "+in.SourceNote)
@@ -263,6 +302,31 @@ func ProvisionPlan(envName string, in ProvisionInput) Plan {
 		plan.Notes = append(plan.Notes, "existing servers from "+in.Source)
 	}
 	return plan
+}
+
+func serverCount(names []string) string {
+	if len(names) == 1 {
+		return "1 server: " + names[0]
+	}
+	return fmt.Sprintf("%d servers: %s", len(names), strings.Join(names, ", "))
+}
+
+// addressKey normalizes an IP address so equivalent spellings match.
+func addressKey(value string) (string, bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return "", false
+	}
+	return addr.Unmap().String(), true
+}
+
+func lookupAddress(byAddress map[string]KnownHost, value string) (KnownHost, bool) {
+	key, ok := addressKey(value)
+	if !ok {
+		return KnownHost{}, false
+	}
+	host, ok := byAddress[key]
+	return host, ok
 }
 
 func (p *Plan) add(action Action) {
