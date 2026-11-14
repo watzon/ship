@@ -992,8 +992,15 @@ func credentialHelper(cfg configFile, candidates []string) string {
 	return cfg.CredsStore
 }
 
+// errCredentialHelperNoEntry marks a credential helper that ran and exited
+// non-zero for every candidate key, which is how helpers report "no stored
+// credentials". A helper that is missing or returns unparsable output is a
+// different failure and does not wrap this error.
+var errCredentialHelperNoEntry = errors.New("credential helper has no entry")
+
 func (c Client) helperCredentials(ctx context.Context, helper string, candidates []string) (registryCredentials, error) {
 	var lastErr error
+	noEntry := true
 	for _, candidate := range candidates {
 		cmd := exec.CommandContext(ctx, "docker-credential-"+helper, "get")
 		cmd.Stdin = strings.NewReader(candidate)
@@ -1007,6 +1014,7 @@ func (c Client) helperCredentials(ctx context.Context, helper string, candidates
 			}
 			if err := json.Unmarshal(out, &entry); err != nil {
 				lastErr = fmt.Errorf("parse credential helper output")
+				noEntry = false
 				continue
 			}
 			if entry.Username == "<token>" && entry.Secret != "" {
@@ -1015,6 +1023,10 @@ func (c Client) helperCredentials(ctx context.Context, helper string, candidates
 			if entry.Username != "" || entry.Secret != "" {
 				return registryCredentials{username: entry.Username, password: entry.Secret}, nil
 			}
+		}
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			noEntry = false
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" && err != nil {
@@ -1025,6 +1037,9 @@ func (c Client) helperCredentials(ctx context.Context, helper string, candidates
 		}
 	}
 	if lastErr != nil {
+		if noEntry {
+			return registryCredentials{}, fmt.Errorf("%w: %w", errCredentialHelperNoEntry, lastErr)
+		}
 		return registryCredentials{}, lastErr
 	}
 	return registryCredentials{}, fmt.Errorf("credential helper returned no credentials")
@@ -1048,7 +1063,9 @@ func (c Client) registryCredentials(ctx context.Context, host string) (registryC
 	if helper := credentialHelper(cfg, candidates); helper != "" {
 		credentials, err := c.helperCredentials(ctx, helper, candidates)
 		if err != nil {
-			if anonymousRegistryHost(host) {
+			// No stored entry means anonymous access; a private image then
+			// fails at the registry with an auth error.
+			if anonymousRegistryHost(host) || errors.Is(err, errCredentialHelperNoEntry) {
 				return registryCredentials{}, nil
 			}
 			return registryCredentials{}, fmt.Errorf("docker credentials for %s unavailable through docker-credential-%s: %w", host, helper, err)
@@ -1298,6 +1315,9 @@ func (c Client) registryBearerToken(ctx context.Context, challenge map[string]st
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, res.Body)
+		if (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) && credentials == (registryCredentials{}) {
+			return "", fmt.Errorf("registry token service returned HTTP %d for an anonymous request; the image may be private, so run docker login for this registry", res.StatusCode)
+		}
 		return "", fmt.Errorf("registry token service returned HTTP %d", res.StatusCode)
 	}
 	var tokenResponse struct {
